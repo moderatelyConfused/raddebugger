@@ -110,6 +110,48 @@ directory when nothing has been stored yet.
 `task_for_pid` requires the `com.apple.security.cs.debugger` entitlement
 (`mac/raddbg.entitlements`); `build.sh` applies it with an ad-hoc signature.
 
+## Status and open issues (2026-10-25)
+
+Confirmed on an Apple Silicon Mac with a Zig 0.16 target (`generator`):
+building, launching, Retina scaling, breakpoints, single steps and line
+stepping in debug builds. Fixed from that testing: zero-length line ranges
+at every file change in the DWARF converter, frame skipping when unwinding
+at function entry / in epilogues, a `brk` left in the program when a step
+trap shared an address with a user breakpoint (seen as SIGTRAP), and
+non-statement line rows beginning lines (one stop per row in optimized code).
+
+Still reported as "erratic" after those fixes: line stepping, mostly in
+release builds. Not yet reproduced; nothing in this port has been exercised
+by its author on hardware. Where to look, on the Mac:
+
+* `~/Library/Logs/raddbg/logs/ctrl_thread.raddbg_log` records every step:
+  the line and voff/vaddr range the trap net was built from (`line:`,
+  `vaddr_range:`), `sp_check_value`, each demon event (`get_next_event`),
+  and which trap flags fired. Compare the stop locations against
+  `radbin --dump --only:line_tables <exe>.rdi` (delete the stale `.rdi` next
+  to the executable after converter changes; `dbg_info` regenerates it only
+  when it is older than the debug info or the encoding version changed).
+* `d_ctrl_thread__run` accepts a trap-net hit only when `sp` equals the
+  value saved at the step's start (`D_TrapFlag_IgnoreStackPointerCheck`
+  aside). Any sp-changing instruction the arm64 disassembler does not flag
+  with `DASM_InstFlag_ChangesStackPointer` (so no `SaveStackPointerAfter`
+  single step is scheduled) makes the line's end trap be ignored, and the
+  thread runs on to the next breakpoint. `sub/add sp`, pre/post-indexed
+  `stp/ldp` are flagged; check `mov sp, xN`, single-register `str/ldr`
+  with writeback, and anything optimized code emits.
+* Step-into stops at a call's destination even without line info (shared
+  cache functions have no symbols here); a step from there is an
+  instruction step. Step-over of a call relies on the callee returning to
+  the same `sp`, which recursion handles via the check above.
+* Optimized line tables: non-statement rows are merged into the preceding
+  statement (see `rdi_from_dwarf.c`); line 0 rows are merged too. If a stop
+  lands on an unexpected line, dump the DWARF rows of the object file
+  (`.zig-cache/o/<hash>/generator_zcu.o`, referenced by the executable's
+  `N_OSO` stab) and compare with the converted ranges.
+* A headless driver would help: the demon (`dmn_ctrl_launch`, `dmn_ctrl_run`
+  with a trap at `main`, `single_step_thread`) can be exercised from a small
+  console program the way `torture` does, without the UI.
+
 ## Known gaps / follow-ups
 
 * Rendering uses one shared `NSOpenGLContext` that is re-targeted with
