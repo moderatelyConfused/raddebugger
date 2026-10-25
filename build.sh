@@ -1,4 +1,5 @@
 #!/bin/bash
+# NOTE: must stay compatible with bash 3.2 (the /bin/bash shipped with macOS)
 set -eu
 cd "$(dirname "$0")"
 
@@ -77,7 +78,7 @@ fi
 oodle_flags=()
 if [[ "$host_os" == "Darwin" ]]; then
   compile() {
-    $compile "${oodle_flags[@]}" "$@" blake3.a
+    $compile ${oodle_flags[@]+"${oodle_flags[@]}"} "$@" blake3.a
   }
   # ad-hoc code signing with the debugger entitlement, required for task_for_pid()
   # (see src/mac/raddbg.entitlements and the README)
@@ -88,7 +89,7 @@ if [[ "$host_os" == "Darwin" ]]; then
   }
 else
   compile() {
-    $compile "${oodle_flags[@]}" -Wl,--start-group "$@" blake3.a -latomic -Wl,--end-group
+    $compile ${oodle_flags[@]+"${oodle_flags[@]}"} -Wl,--start-group "$@" blake3.a -latomic -Wl,--end-group
   }
   sign() { :; }
 fi
@@ -103,7 +104,7 @@ if [[ "${meta:-0}" == "1" ]]; then
   echo "[building metagen]"
   $compiler $cc_debug ../src/metagen/metagen_main.c $cc_link -o metagen
 fi
-if [[ ! -v no_meta ]]; then
+if [[ -z "${no_meta+x}" ]]; then
   ./metagen
 fi
 cd ..
@@ -187,6 +188,6 @@ if [[ "${didbuild:-0}" == "0" ]]; then
 fi
 
 # --- Warn On Debug Builds (if debug not explicitly specified) ----------------
-if [[ ! -v debug && ! -v release ]]; then
+if [[ -z "${debug+x}" && -z "${release+x}" ]]; then
   echo "[INFO] Debug build complete. For a faster build, call this script with the \`release\` argument (this will take significantly longer than a debug build)."
 fi
