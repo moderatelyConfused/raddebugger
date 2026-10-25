@@ -38,6 +38,20 @@ struct UWND_ModuleInfo
 };
 
 ////////////////////////////////
+//~ rjf: arm64 Prologue / Epilogue Analysis
+
+#if defined(ARM64_H)
+typedef enum UWND_ARM64_CodeState
+{
+  UWND_ARM64_CodeState_Body,     // the function's frame is established; the regular unwind rule applies
+  UWND_ARM64_CodeState_Prologue, // before the frame is set up: lr holds the return address, fp the caller's fp
+  UWND_ARM64_CodeState_Epilogue, // after the frame record was restored: lr holds the return address, fp the caller's fp
+}
+UWND_ARM64_CodeState;
+internal UWND_ARM64_CodeState uwnd_arm64_code_state_from_pc(MemoryMap *memory_map, U64 function_vaddr, U64 pc, U64 sp, U64 *cfa_out);
+#endif
+
+////////////////////////////////
 //~ rjf: Moduleless Unwinder
 
 internal UWND_StepResult uwnd_step_moduleless(Arch arch, MemoryMap *memory_map, void *regs);

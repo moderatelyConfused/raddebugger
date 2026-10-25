@@ -98,7 +98,7 @@ struct MACHO_UWND_ModuleUnwindInfo
 ////////////////////////////////
 //~ rjf: Lookups
 
-internal B32 macho_uwnd_encoding_from_voff(MACHO_UWND_ModuleUnwindInfo *info, U64 voff, U32 *encoding_out);
+internal B32 macho_uwnd_encoding_from_voff(MACHO_UWND_ModuleUnwindInfo *info, U64 voff, U32 *encoding_out, U64 *function_voff_out);
 
 ////////////////////////////////
 //~ rjf: Unwinding Abstraction Implementation

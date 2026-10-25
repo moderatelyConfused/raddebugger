@@ -766,8 +766,19 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
           src_file = unit_src_file_maps[unit_idx].v[vm_regs.file_index];
         }
         
-        //- rjf: sequence ended explicitly, or file change, or end of stream? -> push to line table
-        if(line_seq_src_file != 0 && (vm_regs.end_sequence || (src_file != line_seq_src_file && first_line_seq_chunk != 0) || off >= unit_line_table_data.size))
+        //- rjf: sequence ended explicitly, or a line is being emitted for a different
+        // file, or end of stream? -> push to line table
+        //
+        // NOTE(rjf): the file change must only be applied when a row is actually being
+        // emitted. compilers set the file (DW_LNS_set_file) *before* the opcode which
+        // advances the address & emits the row, so splitting when the register changes
+        // would terminate the previous sequence at the previous row's address, leaving
+        // its last line as a zero-length range, and the code up to the next row without
+        // any line info. rows with line 0 (no source) never split nor emit, so that
+        // their code stays attributed to the preceding line.
+        //
+        B32 emitting_row_in_new_file = (emit_line && vm_regs.line != 0 && src_file != line_seq_src_file && first_line_seq_chunk != 0);
+        if(line_seq_src_file != 0 && (vm_regs.end_sequence || emitting_row_in_new_file || off >= unit_line_table_data.size))
         {
           // rjf: combine voffs/lines/cols
           U64 seq_line_count = total_line_seq_count;
@@ -834,11 +845,11 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
           }
         }
         
-        //- rjf: emit lines
-        if(emit_line && vm_regs.address != 0 && vm_regs.line != 0)
+        //- rjf: emit lines (rows with no address, or with line 0, are consumed but not emitted)
+        B32 emit_row = (emit_line && vm_regs.address != 0 && vm_regs.line != 0);
+        emit_line = 0;
+        if(emit_row)
         {
-          emit_line = 0;
-          
           // rjf: grab the last emitted line info
           U32 last_line = 0;
           U16 last_col = 0;

@@ -65,6 +65,25 @@ bundled with Zig: `zig cc -target aarch64-macos -fsyntax-only ...`).
   an image (`*(TPIDRRO_EL0 + 8*key)`, key from the image's first TLV
   descriptor).
 
+## Unwinding
+
+* `macho_uwnd_step` looks the pc up in `__unwind_info`: DWARF-mode entries go
+  through their `__eh_frame` FDE, frame / frameless entries are decoded
+  directly, and anything else falls back to the frame-pointer chain.
+* None of those rules hold while a prologue is still building the frame, or
+  after an epilogue has restored the frame record (compact entries describe
+  the frame only once it is set up, and LLVM emits little or no epilogue CFI),
+  yet stepping stops at exactly such places: the first instruction after
+  stepping into a call, or a `ret`. `uwnd_arm64_code_state_from_pc`
+  (`unwind/unwind.c`) replays the prologue instructions from the function
+  start (or, without a known start, recognizes a frame setup ahead of pc) and
+  scans ahead for a return through the remaining stack pops; in those states
+  the return address is `lr`, the caller's `fp` is still in `fp`, and only
+  the entry stack pointer is computed from the code. In DWARF mode the CFI row
+  is evaluated with `fp` pointed back at the intact frame record, so that the
+  callee-saved registers are restored from their slots as usual. Verified on a
+  Linux host against the prologues and epilogues of a Zig-built arm64 binary.
+
 ## Display scaling
 
 `wm_dpi_from_window` / `wm_dpi_from_monitor` report 96 × the backing scale

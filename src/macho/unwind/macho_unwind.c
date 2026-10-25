@@ -5,10 +5,11 @@
 //~ rjf: Lookups
 
 internal B32
-macho_uwnd_encoding_from_voff(MACHO_UWND_ModuleUnwindInfo *info, U64 voff, U32 *encoding_out)
+macho_uwnd_encoding_from_voff(MACHO_UWND_ModuleUnwindInfo *info, U64 voff, U32 *encoding_out, U64 *function_voff_out)
 {
   B32 found = 0;
   U32 encoding = 0;
+  U64 function_voff = 0;
   String8 data = info->unwind_info_data;
   MACHO_UWND_SectionHeader hdr = {0};
   if(data.size >= sizeof(hdr))
@@ -69,6 +70,7 @@ macho_uwnd_encoding_from_voff(MACHO_UWND_ModuleUnwindInfo *info, U64 voff, U32 *
             if(entry.function_offset <= voff)
             {
               encoding = entry.encoding;
+              function_voff = entry.function_offset;
               found = 1;
             }
           }
@@ -99,6 +101,7 @@ macho_uwnd_encoding_from_voff(MACHO_UWND_ModuleUnwindInfo *info, U64 voff, U32 *
             U64 function_off = (U64)index_entry.function_offset + MACHO_UWND_COMPRESSED_ENTRY_FUNC_OFFSET(entry);
             if(function_off <= voff)
             {
+              function_voff = function_off;
               U32 encoding_idx = MACHO_UWND_COMPRESSED_ENTRY_ENCODING_INDEX(entry);
               if(encoding_idx < hdr.common_encodings_array_count)
               {
@@ -129,6 +132,10 @@ macho_uwnd_encoding_from_voff(MACHO_UWND_ModuleUnwindInfo *info, U64 voff, U32 *
   {
     encoding_out[0] = encoding;
   }
+  if(function_voff_out != 0)
+  {
+    function_voff_out[0] = found ? function_voff : 0;
+  }
   return found;
 }
 
@@ -150,7 +157,8 @@ macho_uwnd_step(Arch arch, MemoryMap *memory_map, UWND_ModuleInfo *module_info, 
   
   //- rjf: look up the compact encoding for this pc
   U32 encoding = 0;
-  B32 found = macho_uwnd_encoding_from_voff(info, voff, &encoding);
+  U64 function_voff = 0;
+  B32 found = macho_uwnd_encoding_from_voff(info, voff, &encoding, &function_voff);
   U32 mode = encoding & MACHO_UWND_ARM64_MODE_MASK;
   
   //- rjf: DWARF mode -> use the FDE referenced from the encoding
@@ -160,8 +168,41 @@ macho_uwnd_step(Arch arch, MemoryMap *memory_map, UWND_ModuleInfo *module_info, 
     U64 fde_vaddr = info->eh_frame_vaddr_range.min + (encoding & MACHO_UWND_ARM64_DWARF_SECTION_OFFSET);
     if(contains_1u64(info->eh_frame_vaddr_range, fde_vaddr))
     {
-      result = eh_uwnd_step_from_fde_vaddr(arch, memory_map, &info->ptr_ctx, fde_vaddr, tls_vaddr, regs, cfa_out);
+      // rjf: the CFI describes the prologue precisely, but not the epilogue: once
+      // the frame record has been restored, the row at pc still derives the CFA
+      // from fp, which already holds the caller's fp. In that state the function's
+      // code gives the entry stack pointer; evaluating the row with fp pointed back
+      // at the (still intact) frame record then restores everything correctly. If
+      // the row is not fp-based after all, fall back to the code's answer.
+      U64 code_cfa = 0;
+      B32 in_epilogue = (uwnd_arm64_code_state_from_pc(memory_map, module_info->base_vaddr + function_voff, pc, r->sp, &code_cfa) == UWND_ARM64_CodeState_Epilogue);
+      ARM64_RegBlock entry_regs = *r;
+      if(in_epilogue)
+      {
+        r->fp = code_cfa - 16;
+      }
+      U64 cfi_cfa = 0;
+      result = eh_uwnd_step_from_fde_vaddr(arch, memory_map, &info->ptr_ctx, fde_vaddr, tls_vaddr, regs, &cfi_cfa);
       done = (result.status != UWND_StepStatus_Error);
+      if(done && in_epilogue && (result.status != UWND_StepStatus_Good || cfi_cfa != code_cfa))
+      {
+        *r = entry_regs;
+        r->pc = r->lr;
+        r->sp = code_cfa;
+        cfi_cfa = code_cfa;
+        result.status = UWND_StepStatus_Good;
+        MemoryZeroStruct(&result.missed_read_vaddr_range);
+      }
+      else if(done && in_epilogue && r->fp == code_cfa - 16)
+      {
+        // rjf: the row did describe the epilogue (sp-based CFA, fp "same value"):
+        // fp already held the caller's fp at entry
+        r->fp = entry_regs.fp;
+      }
+      if(done && cfa_out)
+      {
+        cfa_out[0] = cfi_cfa;
+      }
     }
   }
   
@@ -194,9 +235,30 @@ macho_uwnd_step(Arch arch, MemoryMap *memory_map, UWND_ModuleInfo *module_info, 
     // FRAMELESS: cfa = sp + stack_size, return address in lr, callee-saved pairs
     //            at the top of the frame (x19 at cfa-8, x20 at cfa-16, ...)
     //
+    // Neither applies while the prologue is still setting the frame up, nor
+    // once the epilogue has torn it down (restored the frame record); there, the
+    // return address is in lr, the caller's fp is in fp, and the entry stack
+    // pointer comes from the function's code. In an epilogue the callee-saved
+    // registers are restored from their entry-relative slots; in a prologue they
+    // have not been modified yet.
+    //
     U64 cfa = 0;
     U64 saved_top = 0;
-    if(mode == MACHO_UWND_ARM64_MODE_FRAME)
+    B32 restore_saved_regs = 1;
+    B32 unwind_via_frame_record = 0;
+    U64 code_cfa = 0;
+    UWND_ARM64_CodeState code_state = uwnd_arm64_code_state_from_pc(memory_map, module_info->base_vaddr + function_voff, pc, r->sp, &code_cfa);
+    if(code_state == UWND_ARM64_CodeState_Prologue)
+    {
+      cfa = code_cfa;
+      restore_saved_regs = 0;
+    }
+    else if(code_state == UWND_ARM64_CodeState_Epilogue)
+    {
+      cfa = code_cfa;
+      saved_top = (mode == MACHO_UWND_ARM64_MODE_FRAME) ? cfa - 16 : cfa;
+    }
+    else if(mode == MACHO_UWND_ARM64_MODE_FRAME)
     {
       U64 fp = r->fp;
       if(fp == 0)
@@ -205,6 +267,7 @@ macho_uwnd_step(Arch arch, MemoryMap *memory_map, UWND_ModuleInfo *module_info, 
       }
       cfa = fp + 16;
       saved_top = fp;
+      unwind_via_frame_record = 1;
     }
     else
     {
@@ -215,8 +278,8 @@ macho_uwnd_step(Arch arch, MemoryMap *memory_map, UWND_ModuleInfo *module_info, 
     
     // rjf: read the whole region of interest at once
     U64 saved_lo = saved_top - saved_slot_count*8;
-    Rng1U64 read_range = r1u64(saved_lo, (mode == MACHO_UWND_ARM64_MODE_FRAME) ? cfa : saved_top);
-    U64 read_size = dim_1u64(read_range);
+    Rng1U64 read_range = r1u64(saved_lo, unwind_via_frame_record ? cfa : saved_top);
+    U64 read_size = restore_saved_regs ? dim_1u64(read_range) : 0;
     if(read_size != 0)
     {
       Temp scratch = scratch_begin(0, 0);
@@ -252,7 +315,7 @@ macho_uwnd_step(Arch arch, MemoryMap *memory_map, UWND_ModuleInfo *module_info, 
       }
       
       // rjf: restore fp / lr / pc / sp
-      if(mode == MACHO_UWND_ARM64_MODE_FRAME)
+      if(unwind_via_frame_record)
       {
         U64 fp = r->fp;
         U64 caller_fp = MACHO_UWND_SLOT(fp);
