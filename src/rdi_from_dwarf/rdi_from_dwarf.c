@@ -774,10 +774,11 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
         // advances the address & emits the row, so splitting when the register changes
         // would terminate the previous sequence at the previous row's address, leaving
         // its last line as a zero-length range, and the code up to the next row without
-        // any line info. rows with line 0 (no source) never split nor emit, so that
-        // their code stays attributed to the preceding line.
+        // any line info. rows with line 0 (no source), and rows which are not
+        // statements (is_stmt == 0), never split nor begin a line, so that their
+        // code stays attributed to the preceding line (see below).
         //
-        B32 emitting_row_in_new_file = (emit_line && vm_regs.line != 0 && src_file != line_seq_src_file && first_line_seq_chunk != 0);
+        B32 emitting_row_in_new_file = (emit_line && vm_regs.line != 0 && vm_regs.is_stmt && src_file != line_seq_src_file && first_line_seq_chunk != 0);
         if(line_seq_src_file != 0 && (vm_regs.end_sequence || emitting_row_in_new_file || off >= unit_line_table_data.size))
         {
           // rjf: combine voffs/lines/cols
@@ -865,7 +866,14 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
           // we need to adjust this when we want to start correctly supporting columnar
           // line info / stepping
           //
-          B32 need_new_line = (last_line != (U32)vm_regs.line);
+          // NOTE(rjf): rows which are not statements (is_stmt == 0) mark code which
+          // belongs to a line but is not a place to stop at (compilers emit them for
+          // scheduled & merged code, heavily in optimized builds). They do not begin
+          // a new line here, so that their code is stepped through as part of the
+          // preceding statement, as other debuggers do; only the first row of a
+          // sequence always begins one.
+          //
+          B32 need_new_line = (last_line_seq_chunk == 0 || (vm_regs.is_stmt && last_line != (U32)vm_regs.line));
           
           // rjf: need new line -> grab chunk
           LineSeqChunk *chunk = last_line_seq_chunk;
