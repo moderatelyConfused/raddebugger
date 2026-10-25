@@ -65,6 +65,16 @@ bundled with Zig: `zig cc -target aarch64-macos -fsyntax-only ...`).
   an image (`*(TPIDRRO_EL0 + 8*key)`, key from the image's first TLV
   descriptor).
 
+## Display scaling
+
+`wm_dpi_from_window` / `wm_dpi_from_monitor` report 96 × the backing scale
+factor (192 on Retina displays), and all window geometry, mouse positions and
+rendering use backing pixels. The frontend treats the configured `font_size`
+settings as 96-DPI values and multiplies them by DPI/96 (`rd_dpi_scale` in
+`raddbg_core.c`), so configs are portable between displays, and a window
+dragged to a screen with a different scale factor only re-rasterizes its fonts
+(`fnt_reset`); the settings themselves are never rewritten.
+
 ## Signing
 
 `task_for_pid` requires the `com.apple.security.cs.debugger` entitlement

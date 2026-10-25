@@ -541,7 +541,7 @@ RD_VocabTable:
         'smooth_code_text': bool,
       @default(1) @display_name('Hint Code Text') @description("Controls whether or not code text is hinted, for better text readability at small sizes.")
         'hint_code_text': bool,
-      @default(11) @display_name('Window Font Size') @description("Controls the window's default font size. Does not apply to tabs with their own font size set.")
+      @default(11) @display_name('Window Font Size') @description("Controls the window's default font size, for a 100% display scale (it is multiplied by the display's scale factor). Does not apply to tabs with their own font size set.")
         'font_size': @range[6, 72] u64,
       
       //- rjf: size settings
@@ -564,7 +564,7 @@ RD_VocabTable:
       @row_commands(@file copy_tab_full_path, @file show_file_in_explorer, duplicate_tab, close_tab)
       x:
     {
-      @override @display_name('Tab Font Size') @description("Controls the tab's font size.") @no_callee_helper
+      @override @display_name('Tab Font Size') @description("Controls the tab's font size, for a 100% display scale (it is multiplied by the display's scale factor).") @no_callee_helper
         'font_size': @range[6, 72] u64,
     }
     ```

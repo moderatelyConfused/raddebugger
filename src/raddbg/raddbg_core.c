@@ -5890,16 +5890,13 @@ rd_window_frame(void)
       cfg_node_release(rd_state->cfg, cfg_node_child_from_string(window, str8_lit("maximized")));
     }
     
-    //- rjf: DPI changes -> xform font size / window size
+    //- rjf: DPI changes -> re-rasterize fonts at the new scale. the configured
+    // font sizes are DPI-independent, and are scaled by the window's DPI in
+    // rd_font_size, so the config does not need to change.
     F32 dpi = wm_dpi_from_window(ws->os);
     if(dpi != ws->last_dpi)
     {
       fnt_reset();
-      F32 current_font_size = rd_font_size();
-      F32 new_font_size = current_font_size * (dpi / ws->last_dpi);
-      new_font_size = Clamp(6.f, new_font_size, 72.f);
-      CFG_Node *font_size_cfg = cfg_node_child_from_string_or_alloc(rd_state->cfg, window, str8_lit("font_size"));
-      cfg_node_new_replacef(rd_state->cfg, font_size_cfg, "%I64u", (U64)new_font_size);
       ws->last_dpi = dpi;
     }
     
@@ -10592,10 +10589,46 @@ rd_code_color_slot_from_txt_token_kind_lookup_string(TXT_TokenKind kind, String8
 //- rjf: fonts/sizes
 
 internal F32
-rd_font_size(void)
+rd_unscaled_font_size(void)
 {
   F32 size = rd_setting_f32_from_name(str8_lit("font_size"));
   size = Clamp(6.f, size, 72.f);
+  return size;
+}
+
+internal F32
+rd_dpi_scale(void)
+{
+  // rjf: `font_size` settings are specified for a 96 DPI (100% scale) display.
+  // the current window's DPI scales them, so that the UI keeps the same physical
+  // size on high-DPI displays (e.g. 2x on Retina screens), and so that the same
+  // config can be used on displays with different scale factors.
+  F32 scale = 1.f;
+  CFG_ID window_id = rd_window_from_cfg(cfg_node_from_id(rd_regs()->window))->id;
+  if(window_id != 0 && rd_state->window_state_slots_count != 0)
+  {
+    U64 hash = d_hash_from_string(str8_struct(&window_id));
+    U64 slot_idx = hash%rd_state->window_state_slots_count;
+    RD_WindowStateSlot *slot = &rd_state->window_state_slots[slot_idx];
+    for(RD_WindowState *w = slot->first; w != 0; w = w->hash_next)
+    {
+      if(w->cfg_id == window_id)
+      {
+        if(w->last_dpi > 0)
+        {
+          scale = w->last_dpi / 96.f;
+        }
+        break;
+      }
+    }
+  }
+  return scale;
+}
+
+internal F32
+rd_font_size(void)
+{
+  F32 size = rd_unscaled_font_size() * rd_dpi_scale();
   return size;
 }
 
@@ -14604,7 +14637,7 @@ rd_frame(void)
           if(cfg != &cfg_nil_node)
           {
             fnt_reset();
-            F32 current_font_size = rd_font_size();
+            F32 current_font_size = rd_unscaled_font_size();
             F32 new_font_size = current_font_size+1;
             new_font_size = Clamp(6.f, new_font_size, 72.f);
             CFG_Node *font_size_cfg = cfg_node_child_from_string_or_alloc(rd_state->cfg, cfg, str8_lit("font_size"));
@@ -14616,7 +14649,7 @@ rd_frame(void)
           if(cfg != &cfg_nil_node)
           {
             fnt_reset();
-            F32 current_font_size = rd_font_size();
+            F32 current_font_size = rd_unscaled_font_size();
             F32 new_font_size = current_font_size-1;
             new_font_size = Clamp(6.f, new_font_size, 72.f);
             CFG_Node *font_size_cfg = cfg_node_child_from_string_or_alloc(rd_state->cfg, cfg, str8_lit("font_size"));

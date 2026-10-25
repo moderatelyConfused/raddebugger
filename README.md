@@ -354,6 +354,13 @@ codesign -s "<your certificate name>" -f --entitlements src/mac/raddbg.entitleme
 Targets must be plain arm64 (not arm64e) executables. Hardened-runtime system
 programs cannot be attached to.
 
+The UI follows the display's scale factor: on a Retina (HiDPI) display, where
+macOS reports a 2x backing scale, the font sizes in the settings (which are
+given for a 100% scale, 11 by default) are doubled, and a window that moves to
+a display with a different scale factor is re-rasterized at that scale. The
+`Window Font Size` setting and the `Increase/Decrease Window Font Size`
+commands adjust the base size.
+
 ### 3. Debug Information
 
 The debugger reads DWARF debug information from Mach-O files. On macOS the
