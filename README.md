@@ -373,13 +373,10 @@ linked executable yourself; if no dSYM is found, the debugger's converter will
 try to run `xcrun dsymutil` on the executable and cache the result under
 `~/Library/Caches/raddbg/dsyms`.
 
-The directory you launch the debugger from matters in two ways. The file
-browser behind `Add Target` and `Open File` starts there (and then remembers
-where you last browsed, until you launch from a different directory). And
-`dsymutil` is run from there, so if your executables are linked with
-`-oso_prefix` (relative object file paths in the debug map), launch the
-debugger from the directory those paths are relative to, usually the build
-directory.
+`dsymutil` is run from the directory the debugger was launched from, so if
+your executables are linked with `-oso_prefix` (relative object file paths in
+the debug map), launch the debugger from the directory those paths are
+relative to, usually the build directory.
 
 ### 4. Current Limitations
 
