@@ -464,7 +464,7 @@ rb_thread_entry_point(void *p)
               str8_list_push(scratch.arena, &params.cmd_line, input_file_path);
               str8_list_push(scratch.arena, &params.cmd_line, str8_lit("-o"));
               str8_list_push(scratch.arena, &params.cmd_line, bundle_path);
-              log_infof("Running `xcrun dsymutil %S -o %S`\n", input_file_path, bundle_path);
+              log_infof("Running `xcrun dsymutil %S -o %S` from `%S` (relative object file paths in the debug map resolve from there)\n", input_file_path, bundle_path, get_current_path(scratch.arena));
               Process process = process_launch(&params);
               if(process_match(process, process_zero()))
               {

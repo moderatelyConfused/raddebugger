@@ -75,6 +75,19 @@ settings as 96-DPI values and multiplies them by DPI/96 (`rd_dpi_scale` in
 dragged to a screen with a different scale factor only re-rasterizes its fonts
 (`fnt_reset`); the settings themselves are never rewritten.
 
+## Working directory
+
+`dbg_info` spawns the converter (`raddbg --bin --rdi ...`) with the
+debugger's initial working directory (upstream used the executable's
+directory), and the `dsymutil` fallback in `radbin.c` inherits it, so relative
+`N_OSO` entries (from `ld -oso_prefix`) resolve from wherever the user
+launched the debugger. On the frontend side, opening a user file seeds its
+`current_path` (the start directory for file path queries such as Add Target)
+from the launch directory whenever that differs from the previous launch
+(`launch_path`, stored next to it in the user file); launches with no useful
+directory (`/` from Finder or `open`, or the executable's own folder) leave the
+remembered path alone.
+
 ## Signing
 
 `task_for_pid` requires the `com.apple.security.cs.debugger` entitlement

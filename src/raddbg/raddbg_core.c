@@ -14438,6 +14438,27 @@ rd_frame(void)
               }
             }
             
+            //- rjf: launched from a different directory than the last time this user
+            // was opened -> start file path queries (e.g. Add Target) there. otherwise,
+            // keep the directory last browsed with this user (`current_path`). launches
+            // without a meaningful directory (Finder / `open` -> "/", Explorer / shortcuts
+            // -> the executable's own folder) keep the remembered directory too.
+            if(file_is_okay && kind == RD_CmdKind_OpenUser)
+            {
+              String8 launch_path = path_normalized_from_string(scratch.arena, get_process_info()->initial_path);
+              B32 launch_path_is_usable = (launch_path.size != 0 &&
+                                           !str8_match(launch_path, str8_lit("/"), 0) &&
+                                           !path_match_normalized(launch_path, get_process_info()->binary_path));
+              CFG_Node *last_launch_path = cfg_node_child_from_string(file_root, str8_lit("launch_path"));
+              if(launch_path_is_usable && !path_match_normalized(launch_path, last_launch_path->first->string))
+              {
+                CFG_Node *launch_path_cfg = cfg_node_child_from_string_or_alloc(rd_state->cfg, file_root, str8_lit("launch_path"));
+                cfg_node_new_replace(rd_state->cfg, launch_path_cfg, launch_path);
+                CFG_Node *current_path_cfg = cfg_node_child_from_string_or_alloc(rd_state->cfg, file_root, str8_lit("current_path"));
+                cfg_node_new_replace(rd_state->cfg, current_path_cfg, launch_path);
+              }
+            }
+            
             //- rjf: record last-opened user in config directory
             if(file_is_okay && kind == RD_CmdKind_OpenUser && !rd_regs()->non_graphical)
             {

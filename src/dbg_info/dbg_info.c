@@ -873,7 +873,16 @@ di_async_tick(void)
         {
           B32 should_compress = 0;
           ProcessLaunchParams params = {0};
-          params.path = get_process_info()->binary_path;
+          // rjf: run the converter from the debugger's own working directory, so that
+          // paths which debug info references relative to the build directory (e.g.
+          // the object file paths in a Mach-O debug map linked with `-oso_prefix`,
+          // which `dsymutil` resolves from its working directory) resolve the same
+          // way they do for the tools the user runs from there.
+          params.path = get_process_info()->initial_path;
+          if(params.path.size == 0)
+          {
+            params.path = get_process_info()->binary_path;
+          }
           params.inherit_env = 1;
           params.consoleless = 1;
           str8_list_push(scratch.arena, &params.cmd_line, get_process_info()->binary_file_path);
