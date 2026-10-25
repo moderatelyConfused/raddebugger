@@ -1,0 +1,90 @@
+# macOS (Apple Silicon) Port Notes
+
+Developer notes for the macOS/arm64 port. User-facing build instructions are
+in the top-level README ("macOS (Apple Silicon)").
+
+## Layout
+
+| Layer | Files | Notes |
+|-------|-------|-------|
+| base | `mac/base/mac_base.{h,c}` | POSIX/Mach port of `linux/base`. Named semaphores & shared memory names are hashed to fit macOS' 31-char limit. Unnamed semaphores are Mach semaphores. |
+| socket | `mac/socket/mac_socket.{h,c}` | kqueue instead of epoll, `SO_NOSIGPIPE` instead of `MSG_NOSIGNAL`. |
+| demon | `mac/demon/mac_demon.{h,c}` | Process control (see below). |
+| window manager | `mac/window_manager/mac_window_manager.{h,c}` | Thin C layer over the platform API. |
+| shell | `mac/shell/mac_shell.{h,c}` | Alerts / file panels / `open` via the platform API. |
+| platform | `mac/mac_platform.{h,m}` | The ONLY file that includes Apple framework headers (Cocoa, OpenGL, CoreText). Compiled separately as Objective-C by `build.sh` and linked into graphical targets. Exposes a plain C API (`mac_plat_*`). |
+| render | `render/opengl/mac/render_opengl_mac.{h,c}` | NSOpenGLContext (GL 4.1 core) through the platform API; GL entry points resolved with `dlsym`. |
+| fonts | `font_provider/coretext/font_provider_coretext.{h,c}` | CoreText rasterization through the platform API. |
+| arch | `arm64/arm64.{h,c,mdesk}`, `arm64/disasm/` | Register block, DWARF/RDI register maps, AArch64 disassembler. |
+| binaries | `macho/macho*.{h,c}`, `dwarf/dwarf_parse_macho.{h,c}`, `rdi_from_macho/` | Mach-O parsing, DWARF extraction from `__DWARF` (dSYM), RDI conversion. |
+| unwinding | `macho/unwind/macho_unwind.{h,c}` | Apple compact unwind (`__unwind_info`), falling back to `__eh_frame` FDEs and finally the frame-pointer chain. |
+
+The unity build on macOS includes only libc / POSIX / Mach headers, so it can
+be syntax-checked on any host with Apple's open-source headers (e.g. the ones
+bundled with Zig: `zig cc -target aarch64-macos -fsyntax-only ...`).
+
+## Demon (process control)
+
+* Launch: `posix_spawn` with `POSIX_SPAWN_START_SUSPENDED`, `task_for_pid`,
+  `task_set_exception_ports` (EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES) and
+  `ptrace(PT_ATTACHEXC)` so BSD signals are delivered as `EXC_SOFTWARE` /
+  `EXC_SOFT_SIGNAL` exceptions. The first `dmn_ctrl_run` reports process,
+  thread and module creation while the process is still stopped at dyld's
+  first instruction; the main executable's header address is taken from the
+  top of the stack and dyld's from a page scan below the PC.
+* Attach: `task_for_pid` + `PT_ATTACHEXC`; the resulting `SIGSTOP` soft
+  signal is the initial stop.
+* Waiting: a kqueue with `EVFILT_MACHPORT` (exception port set),
+  `EVFILT_PROC` (`NOTE_EXIT`) and `EVFILT_USER` (halt requests).
+* Stops: on the first exception message the whole task is suspended with
+  `task_suspend`, stragglers are drained, `task_threads` is diffed against the
+  known thread list (thread create/exit events), and registers are read with
+  `thread_get_state` (`ARM_THREAD_STATE64`, `ARM_NEON_STATE64`).
+* Resume: pending exception messages are replied to (`PT_THUPDATE` chooses
+  the signal to deliver for soft signals; `KERN_FAILURE` escalates a hardware
+  exception to its BSD signal when the engine did not ask to ignore it),
+  frozen threads are `thread_suspend`ed, then `task_resume`.
+* Breakpoints: `brk #0`; the PC points at the trap instruction when reported
+  (no rollback). Single stepping: `MDSCR_EL1.SS` via `ARM_DEBUG_STATE64`.
+  Watchpoints: `DBGWCR/DBGWVR` via `ARM_DEBUG_STATE64`; since arm64 reports
+  them before the access, the demon steps past the access internally.
+* Modules: a permanent `brk` on dyld's `_dyld_debugger_notification`
+  (`x0` = mode, `x1` = count, `x2` = `dyld_image_info[]`) reports loads and
+  unloads; the demon steps over its own trap internally. Mode 3
+  (`dyld_image_dyld_moved`, dyld handing over to its copy in the shared cache)
+  re-targets the trap to the new dyld. As a safety net, every stop compares
+  `dyld_all_image_infos.infoArrayCount` with the last seen count and diffs the
+  image list when it changed (or when the trap could not be placed; the
+  `notification` pointer is used as a fallback once dyld has rebased, with
+  pointer-authentication bits stripped). Module info is parsed from the
+  in-memory Mach-O header (`__unwind_info`, `__eh_frame`, UUID, entry point,
+  `__thread_vars`).
+* Exception codes reported to the engine: BSD signal numbers, or
+  `0x10000 + EXC_*` for Mach exception types (see `mac/mac.mdesk`).
+* TLS: `dmn_thread_get_module_tls_vaddr` returns the thread's TLS block for
+  an image (`*(TPIDRRO_EL0 + 8*key)`, key from the image's first TLV
+  descriptor).
+
+## Signing
+
+`task_for_pid` requires the `com.apple.security.cs.debugger` entitlement
+(`mac/raddbg.entitlements`); `build.sh` applies it with an ad-hoc signature.
+
+## Known gaps / follow-ups
+
+* Rendering uses one shared `NSOpenGLContext` that is re-targeted with
+  `setView:` when the frame switches windows. With a single window this is
+  fine; with several windows it may flicker because the window-server surface
+  follows the context. The fix is one context per window (created with
+  `shareContext:`) and a per-window vertex array object.
+* Text input reads `NSEvent` characters directly; dead keys and CJK input
+  methods do not compose (would need `interpretKeyEvents:` /
+  `NSTextInputClient`).
+* Caps Lock produces one press when it turns on and one release when it turns
+  off, rather than a press/release pair per keystroke.
+* `wm_dim_from_monitor` reports a screen's own backing pixels while window
+  rects use the primary screen's scale; only cosmetic on mixed-DPI setups.
+* Executables with only a debug map (`N_OSO` stabs) and no dSYM are not
+  linked by the converter itself; it runs `dsymutil` when available.
+* Hardware execute breakpoints are implemented as software `brk` traps;
+  watchpoints use `DBGWCR`/`DBGWVR` (up to 16, 8-byte aligned ranges).

@@ -2980,12 +2980,18 @@ d_ctrl_thread__next_dmn_event(Arena *arena, DMN_CtrlCtx *ctrl_ctx, D_Msg *msg, D
               D_ExceptionCodeKind code_kind = D_ExceptionCodeKind_Null;
               if(should_filter_event)
               {
+                // NOTE: codes are not unique across operating systems (e.g. signal
+                // numbers), so prefer entries belonging to the current OS.
                 for(D_ExceptionCodeKind k = (D_ExceptionCodeKind)0; k < D_ExceptionCodeKind_COUNT; k = (D_ExceptionCodeKind)(k+1))
                 {
-                  if(d_exception_code_kind_code_table[k] == ev->code)
+                  if(d_exception_code_kind_code_table[k] == ev->code &&
+                     (code_kind == D_ExceptionCodeKind_Null || d_exception_code_kind_os_table[k] == OperatingSystem_CURRENT))
                   {
                     code_kind = k;
-                    break;
+                    if(d_exception_code_kind_os_table[k] == OperatingSystem_CURRENT)
+                    {
+                      break;
+                    }
                   }
                 }
               }
@@ -3374,6 +3380,28 @@ d_ctrl_thread__next_dmn_event(Arena *arena, DMN_CtrlCtx *ctrl_ctx, D_Msg *msg, D
           }
           unwind_info_opaque = unwind_info;
         }
+        
+#if defined(MACHO_UNWIND_H)
+        //- rjf: Mach-O (compact unwind + __eh_frame) unwinder
+        else if(module_info->arch == Arch_arm64 &&
+                (dim_1u64(module_info->macho_unwind_info_vaddr_range) != 0 ||
+                 dim_1u64(module_info->macho_eh_frame_vaddr_range) != 0))
+        {
+          unwinder = UWND_Unwinder_MachO;
+          MACHO_UWND_ModuleUnwindInfo *unwind_info = push_array(arena, MACHO_UWND_ModuleUnwindInfo, 1);
+          {
+            if(dim_1u64(module_info->macho_unwind_info_vaddr_range) != 0)
+            {
+              unwind_info->unwind_info_data = d_data_from_process_vaddr_range(arena, process_handle, module_info->macho_unwind_info_vaddr_range, 0);
+            }
+            unwind_info->eh_frame_vaddr_range = module_info->macho_eh_frame_vaddr_range;
+            unwind_info->ptr_ctx.pc_vaddr   = module_info->macho_eh_frame_vaddr_range.min;
+            unwind_info->ptr_ctx.data_vaddr = module_info->macho_eh_frame_vaddr_range.min;
+            unwind_info->ptr_ctx.text_vaddr = module_info->macho_text_vaddr_range.min;
+          }
+          unwind_info_opaque = unwind_info;
+        }
+#endif
       }
       
       //- rjf: compute local symbol server cache path for this debug info
@@ -3383,6 +3411,17 @@ d_ctrl_thread__next_dmn_event(Arena *arena, DMN_CtrlCtx *ctrl_ctx, D_Msg *msg, D
       String8 initial_debug_info_path = {0};
       {
         String8List candidates = {0};
+        
+#if OS_MAC
+        // rjf: dSYM bundles take precedence over the image itself (next to the
+        // image, and in the debugger's dsymutil cache)
+        {
+          String8 exe_path = module_info->module_path;
+          String8 image_name = str8_skip_last_slash(exe_path);
+          str8_list_pushf(scratch2.arena, &candidates, "%S.dSYM/Contents/Resources/DWARF/%S", exe_path, image_name);
+          str8_list_pushf(scratch2.arena, &candidates, "%S/raddbg/dsyms/%S.dSYM/Contents/Resources/DWARF/%S", get_process_info()->user_program_cache_data_path, image_name, image_name);
+        }
+#endif
         
         // rjf: push module-embedded debug info paths, try both relative-to-exe & absolute
         if(module_info->debug_info_path.size != 0)

@@ -8,6 +8,8 @@
 # include "render/opengl/win32/render_opengl_win32.c"
 #elif OS_LINUX
 # include "render/opengl/linux/render_opengl_linux.c"
+#elif OS_MAC
+# include "render/opengl/mac/render_opengl_mac.c"
 #else
 # error OS portion of OpenGL rendering backend not defined.
 #endif

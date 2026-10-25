@@ -86,6 +86,9 @@ struct DMN_ModuleInfo
   // rjf: unwinding info
   Rng1U64 pe_intel_pdatas_vaddr_range;
   Rng1U64 eh_frame_header_vaddr_range;
+  Rng1U64 macho_unwind_info_vaddr_range; // __TEXT,__unwind_info (Apple compact unwind)
+  Rng1U64 macho_eh_frame_vaddr_range;    // __TEXT,__eh_frame (no .eh_frame_hdr on Mach-O)
+  Rng1U64 macho_text_vaddr_range;        // __TEXT,__text
   
   // rjf: special raddbg data
   Rng1U64 raddbg_info_voff_range;

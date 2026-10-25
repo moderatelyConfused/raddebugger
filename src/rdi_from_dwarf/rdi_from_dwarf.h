@@ -77,6 +77,7 @@ struct D2R_ConvertParams
 {
   String8 exe_name;
   String8 exe_data;
+  ExecutableImageKind exe_kind; // NOTE: may be Null; Macho selects the Mach-O TLS descriptor model
   Arch arch;
   U64 base_vaddr;
   RDIM_BinarySectionList binary_sections;

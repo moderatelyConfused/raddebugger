@@ -13,6 +13,34 @@ internal UWND_StepResult
 uwnd_step_moduleless(Arch arch, MemoryMap *memory_map, void *regs)
 {
   UWND_StepResult result = {UWND_StepStatus_Error};
+#if defined(ARM64_H)
+  //- rjf: arm64 -> follow the frame pointer chain (the arm64 ABI requires
+  // frame pointers: [fp] = caller's fp, [fp+8] = return address)
+  if(arch == Arch_arm64)
+  {
+    ARM64_RegBlock *regs_arm64 = (ARM64_RegBlock *)regs;
+    U64 fp = regs_arm64->fp;
+    if(fp != 0 && (fp & 0xf) == 0)
+    {
+      U64 frame[2] = {0};
+      Rng1U64 frame_vaddr_range = r1u64(fp, fp+16);
+      if(memory_map_read(memory_map, frame_vaddr_range, frame) != 16)
+      {
+        result.status = UWND_StepStatus_FailedMemoryRead;
+        result.missed_read_vaddr_range = frame_vaddr_range;
+      }
+      else
+      {
+        regs_arm64->fp = frame[0];
+        regs_arm64->lr = frame[1];
+        regs_arm64->pc = frame[1];
+        regs_arm64->sp = fp + 16;
+        result.status = UWND_StepStatus_Good;
+      }
+    }
+    return result;
+  }
+#endif
   {
     B32 done = 0;
     ARCH_Info *arch_info = arch_info_from_arch(arch);

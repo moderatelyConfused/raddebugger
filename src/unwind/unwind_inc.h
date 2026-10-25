@@ -11,5 +11,8 @@
 #if defined(EH_FRAME_H)
 # include "eh_frame/unwind/eh_frame_unwind.h"
 #endif
+#if defined(EH_FRAME_H) && defined(ARM64_H)
+# include "macho/unwind/macho_unwind.h"
+#endif
 
 #endif // UNWIND_INC_H

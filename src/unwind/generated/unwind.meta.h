@@ -11,11 +11,13 @@ typedef enum UWND_Unwinder
 UWND_Unwinder_Null,
 UWND_Unwinder_PEx64,
 UWND_Unwinder_EHFrame,
+UWND_Unwinder_MachO,
 UWND_Unwinder_COUNT,
 } UWND_Unwinder;
 
 #define UWND_Unwinder_XList \
 X(PEx64, pe_x64)\
 X(EHFrame, eh)\
+X(MachO, macho)\
 
 #endif // UNWIND_META_H

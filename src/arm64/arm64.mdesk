@@ -1,0 +1,315 @@
+// Copyright (c) Epic Games Tools
+// Licensed under the MIT license (https://opensource.org/license/mit/)
+
+////////////////////////////////
+//~ rjf: ARM64 (AArch64) Register Table
+//
+// NOTE: `fp` and `lr` are the primary names for x29 and x30; `x29`/`x30` are
+// aliases, as are the 32-bit `w` views, and the q/d/s/h/b views of the `v`
+// vector registers. The DWARF and RDI register numberings are attached to the
+// primary registers only.
+
+@table(name  base  off  size  is_vector  has_rdi  has_dwarf)
+ARM64_RegTable:
+{
+  {nil            -        0    0    - x -}
+  {x0             -        0    8    - x x}
+  {x1             -        0    8    - x x}
+  {x2             -        0    8    - x x}
+  {x3             -        0    8    - x x}
+  {x4             -        0    8    - x x}
+  {x5             -        0    8    - x x}
+  {x6             -        0    8    - x x}
+  {x7             -        0    8    - x x}
+  {x8             -        0    8    - x x}
+  {x9             -        0    8    - x x}
+  {x10            -        0    8    - x x}
+  {x11            -        0    8    - x x}
+  {x12            -        0    8    - x x}
+  {x13            -        0    8    - x x}
+  {x14            -        0    8    - x x}
+  {x15            -        0    8    - x x}
+  {x16            -        0    8    - x x}
+  {x17            -        0    8    - x x}
+  {x18            -        0    8    - x x}
+  {x19            -        0    8    - x x}
+  {x20            -        0    8    - x x}
+  {x21            -        0    8    - x x}
+  {x22            -        0    8    - x x}
+  {x23            -        0    8    - x x}
+  {x24            -        0    8    - x x}
+  {x25            -        0    8    - x x}
+  {x26            -        0    8    - x x}
+  {x27            -        0    8    - x x}
+  {x28            -        0    8    - x x}
+  {fp             -        0    8    - x x}
+  {lr             -        0    8    - x x}
+  {sp             -        0    8    - x x}
+  {pc             -        0    8    - x x}
+  {cpsr           -        0    4    - x -}
+  {fpsr           -        0    4    - x -}
+  {fpcr           -        0    4    - x -}
+  {tpidrro_el0    -        0    8    - x x}
+  {tpidr_el0      -        0    8    - x x}
+  {v0             -        0    16   x x x}
+  {v1             -        0    16   x x x}
+  {v2             -        0    16   x x x}
+  {v3             -        0    16   x x x}
+  {v4             -        0    16   x x x}
+  {v5             -        0    16   x x x}
+  {v6             -        0    16   x x x}
+  {v7             -        0    16   x x x}
+  {v8             -        0    16   x x x}
+  {v9             -        0    16   x x x}
+  {v10            -        0    16   x x x}
+  {v11            -        0    16   x x x}
+  {v12            -        0    16   x x x}
+  {v13            -        0    16   x x x}
+  {v14            -        0    16   x x x}
+  {v15            -        0    16   x x x}
+  {v16            -        0    16   x x x}
+  {v17            -        0    16   x x x}
+  {v18            -        0    16   x x x}
+  {v19            -        0    16   x x x}
+  {v20            -        0    16   x x x}
+  {v21            -        0    16   x x x}
+  {v22            -        0    16   x x x}
+  {v23            -        0    16   x x x}
+  {v24            -        0    16   x x x}
+  {v25            -        0    16   x x x}
+  {v26            -        0    16   x x x}
+  {v27            -        0    16   x x x}
+  {v28            -        0    16   x x x}
+  {v29            -        0    16   x x x}
+  {v30            -        0    16   x x x}
+  {v31            -        0    16   x x x}
+  //-
+  //- aliases
+  //-
+  {x29            fp       0    8    - - -}
+  {x30            lr       0    8    - - -}
+  {w0             x0       0    4    - - -}
+  {w1             x1       0    4    - - -}
+  {w2             x2       0    4    - - -}
+  {w3             x3       0    4    - - -}
+  {w4             x4       0    4    - - -}
+  {w5             x5       0    4    - - -}
+  {w6             x6       0    4    - - -}
+  {w7             x7       0    4    - - -}
+  {w8             x8       0    4    - - -}
+  {w9             x9       0    4    - - -}
+  {w10            x10      0    4    - - -}
+  {w11            x11      0    4    - - -}
+  {w12            x12      0    4    - - -}
+  {w13            x13      0    4    - - -}
+  {w14            x14      0    4    - - -}
+  {w15            x15      0    4    - - -}
+  {w16            x16      0    4    - - -}
+  {w17            x17      0    4    - - -}
+  {w18            x18      0    4    - - -}
+  {w19            x19      0    4    - - -}
+  {w20            x20      0    4    - - -}
+  {w21            x21      0    4    - - -}
+  {w22            x22      0    4    - - -}
+  {w23            x23      0    4    - - -}
+  {w24            x24      0    4    - - -}
+  {w25            x25      0    4    - - -}
+  {w26            x26      0    4    - - -}
+  {w27            x27      0    4    - - -}
+  {w28            x28      0    4    - - -}
+  {w29            fp       0    4    - - -}
+  {w30            lr       0    4    - - -}
+  {wsp            sp       0    4    - - -}
+  {q0             v0       0    16   x - -}
+  {q1             v1       0    16   x - -}
+  {q2             v2       0    16   x - -}
+  {q3             v3       0    16   x - -}
+  {q4             v4       0    16   x - -}
+  {q5             v5       0    16   x - -}
+  {q6             v6       0    16   x - -}
+  {q7             v7       0    16   x - -}
+  {q8             v8       0    16   x - -}
+  {q9             v9       0    16   x - -}
+  {q10            v10      0    16   x - -}
+  {q11            v11      0    16   x - -}
+  {q12            v12      0    16   x - -}
+  {q13            v13      0    16   x - -}
+  {q14            v14      0    16   x - -}
+  {q15            v15      0    16   x - -}
+  {q16            v16      0    16   x - -}
+  {q17            v17      0    16   x - -}
+  {q18            v18      0    16   x - -}
+  {q19            v19      0    16   x - -}
+  {q20            v20      0    16   x - -}
+  {q21            v21      0    16   x - -}
+  {q22            v22      0    16   x - -}
+  {q23            v23      0    16   x - -}
+  {q24            v24      0    16   x - -}
+  {q25            v25      0    16   x - -}
+  {q26            v26      0    16   x - -}
+  {q27            v27      0    16   x - -}
+  {q28            v28      0    16   x - -}
+  {q29            v29      0    16   x - -}
+  {q30            v30      0    16   x - -}
+  {q31            v31      0    16   x - -}
+  {d0             v0       0    8    x - -}
+  {d1             v1       0    8    x - -}
+  {d2             v2       0    8    x - -}
+  {d3             v3       0    8    x - -}
+  {d4             v4       0    8    x - -}
+  {d5             v5       0    8    x - -}
+  {d6             v6       0    8    x - -}
+  {d7             v7       0    8    x - -}
+  {d8             v8       0    8    x - -}
+  {d9             v9       0    8    x - -}
+  {d10            v10      0    8    x - -}
+  {d11            v11      0    8    x - -}
+  {d12            v12      0    8    x - -}
+  {d13            v13      0    8    x - -}
+  {d14            v14      0    8    x - -}
+  {d15            v15      0    8    x - -}
+  {d16            v16      0    8    x - -}
+  {d17            v17      0    8    x - -}
+  {d18            v18      0    8    x - -}
+  {d19            v19      0    8    x - -}
+  {d20            v20      0    8    x - -}
+  {d21            v21      0    8    x - -}
+  {d22            v22      0    8    x - -}
+  {d23            v23      0    8    x - -}
+  {d24            v24      0    8    x - -}
+  {d25            v25      0    8    x - -}
+  {d26            v26      0    8    x - -}
+  {d27            v27      0    8    x - -}
+  {d28            v28      0    8    x - -}
+  {d29            v29      0    8    x - -}
+  {d30            v30      0    8    x - -}
+  {d31            v31      0    8    x - -}
+  {s0             v0       0    4    x - -}
+  {s1             v1       0    4    x - -}
+  {s2             v2       0    4    x - -}
+  {s3             v3       0    4    x - -}
+  {s4             v4       0    4    x - -}
+  {s5             v5       0    4    x - -}
+  {s6             v6       0    4    x - -}
+  {s7             v7       0    4    x - -}
+  {s8             v8       0    4    x - -}
+  {s9             v9       0    4    x - -}
+  {s10            v10      0    4    x - -}
+  {s11            v11      0    4    x - -}
+  {s12            v12      0    4    x - -}
+  {s13            v13      0    4    x - -}
+  {s14            v14      0    4    x - -}
+  {s15            v15      0    4    x - -}
+  {s16            v16      0    4    x - -}
+  {s17            v17      0    4    x - -}
+  {s18            v18      0    4    x - -}
+  {s19            v19      0    4    x - -}
+  {s20            v20      0    4    x - -}
+  {s21            v21      0    4    x - -}
+  {s22            v22      0    4    x - -}
+  {s23            v23      0    4    x - -}
+  {s24            v24      0    4    x - -}
+  {s25            v25      0    4    x - -}
+  {s26            v26      0    4    x - -}
+  {s27            v27      0    4    x - -}
+  {s28            v28      0    4    x - -}
+  {s29            v29      0    4    x - -}
+  {s30            v30      0    4    x - -}
+  {s31            v31      0    4    x - -}
+  {h0             v0       0    2    x - -}
+  {h1             v1       0    2    x - -}
+  {h2             v2       0    2    x - -}
+  {h3             v3       0    2    x - -}
+  {h4             v4       0    2    x - -}
+  {h5             v5       0    2    x - -}
+  {h6             v6       0    2    x - -}
+  {h7             v7       0    2    x - -}
+  {h8             v8       0    2    x - -}
+  {h9             v9       0    2    x - -}
+  {h10            v10      0    2    x - -}
+  {h11            v11      0    2    x - -}
+  {h12            v12      0    2    x - -}
+  {h13            v13      0    2    x - -}
+  {h14            v14      0    2    x - -}
+  {h15            v15      0    2    x - -}
+  {h16            v16      0    2    x - -}
+  {h17            v17      0    2    x - -}
+  {h18            v18      0    2    x - -}
+  {h19            v19      0    2    x - -}
+  {h20            v20      0    2    x - -}
+  {h21            v21      0    2    x - -}
+  {h22            v22      0    2    x - -}
+  {h23            v23      0    2    x - -}
+  {h24            v24      0    2    x - -}
+  {h25            v25      0    2    x - -}
+  {h26            v26      0    2    x - -}
+  {h27            v27      0    2    x - -}
+  {h28            v28      0    2    x - -}
+  {h29            v29      0    2    x - -}
+  {h30            v30      0    2    x - -}
+  {h31            v31      0    2    x - -}
+  {b0             v0       0    1    x - -}
+  {b1             v1       0    1    x - -}
+  {b2             v2       0    1    x - -}
+  {b3             v3       0    1    x - -}
+  {b4             v4       0    1    x - -}
+  {b5             v5       0    1    x - -}
+  {b6             v6       0    1    x - -}
+  {b7             v7       0    1    x - -}
+  {b8             v8       0    1    x - -}
+  {b9             v9       0    1    x - -}
+  {b10            v10      0    1    x - -}
+  {b11            v11      0    1    x - -}
+  {b12            v12      0    1    x - -}
+  {b13            v13      0    1    x - -}
+  {b14            v14      0    1    x - -}
+  {b15            v15      0    1    x - -}
+  {b16            v16      0    1    x - -}
+  {b17            v17      0    1    x - -}
+  {b18            v18      0    1    x - -}
+  {b19            v19      0    1    x - -}
+  {b20            v20      0    1    x - -}
+  {b21            v21      0    1    x - -}
+  {b22            v22      0    1    x - -}
+  {b23            v23      0    1    x - -}
+  {b24            v24      0    1    x - -}
+  {b25            v25      0    1    x - -}
+  {b26            v26      0    1    x - -}
+  {b27            v27      0    1    x - -}
+  {b28            v28      0    1    x - -}
+  {b29            v29      0    1    x - -}
+  {b30            v30      0    1    x - -}
+  {b31            v31      0    1    x - -}
+}
+
+@enum ARM64_RegCode:
+{
+  @expand(ARM64_RegTable a) `$(a.name)`,
+  COUNT,
+}
+
+@struct ARM64_RegBlock:
+{
+  @expand(ARM64_RegTable a) `$(a.name != 'nil' && a.base == '-' -> 'U' .. a.size*8 .. ' ' .. a.name)`,
+}
+
+@data(B8) arm64_reg_code_is_vector_table:
+{
+  @expand(ARM64_RegTable a) `$(a.is_vector == 'x' -> '1')$(a.is_vector != 'x' -> '0')`;
+}
+
+@data(String8) arm64_reg_code_name_table:
+{
+  @expand(ARM64_RegTable a) `str8_lit_comp("$(a.name)")`;
+}
+
+@data(U8) arm64_reg_code_base_table:
+{
+  @expand(ARM64_RegTable a) `$(a.base != '-' -> "ARM64_RegCode_" .. a.base)$(a.base == '-' -> 0)`;
+}
+
+@data(Rng1U16) arm64_reg_code_rng_table:
+{
+  `{0}`,
+  @expand(ARM64_RegTable a) `$(a.name != 'nil' && a.base == '-'-> ("{(U16)OffsetOf(ARM64_RegBlock, " .. a.name .. "), (U16)OffsetOf(ARM64_RegBlock, " .. a.name .. ") + " .. a.size .. "}"))$(a.name != 'nil' && a.base != '-' -> ("{(U16)OffsetOf(ARM64_RegBlock, " .. a.base .. ") + " .. a.off .. ", (U16)OffsetOf(ARM64_RegBlock, " .. a.base .. ") + " .. a.off .. " + " .. a.size .. "}"))`,
+}

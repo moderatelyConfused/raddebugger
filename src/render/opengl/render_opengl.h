@@ -118,6 +118,8 @@ typedef ptrdiff_t GLintptr;
 # include "render/opengl/win32/render_opengl_win32.h"
 #elif OS_LINUX
 # include "render/opengl/linux/render_opengl_linux.h"
+#elif OS_MAC
+# include "render/opengl/mac/render_opengl_mac.h"
 #else
 # error OS portion of OpenGL rendering backend not defined.
 #endif

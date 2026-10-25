@@ -35,6 +35,11 @@
 # define read_only __declspec(allocate(".rdata$"))
 #elif (COMPILER_CLANG && OS_LINUX)
 # define read_only __attribute__((section(".rodata")))
+#elif (COMPILER_CLANG && OS_MAC)
+// NOTE: __DATA_CONST is mapped read-only by dyld after fixups are applied, so
+// this works for data which contains pointers (unlike __TEXT, which cannot
+// hold relocations on arm64).
+# define read_only __attribute__((section("__DATA_CONST,__const")))
 #else
 // NOTE(rjf): I don't know of a useful way to do this in GCC land.
 // __attribute__((section(".rodata"))) looked promising, but it introduces a
@@ -273,8 +278,10 @@
 #  error Atomic intrinsics not defined for this compiler / architecture combination.
 # endif
 #elif COMPILER_CLANG || COMPILER_GCC
-# include <immintrin.h>
-# include <emmintrin.h>
+# if ARCH_X64
+#  include <immintrin.h>
+#  include <emmintrin.h>
+# endif
 #  define ins_atomic_u128_eval_cond_assign(x,k,c) (B32)__atomic_compare_exchange_n((__int128 *)(x),(__int128 *)(c),*(__int128 *)(k),0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST)
 #  define ins_atomic_u64_eval(x)                  __atomic_load_n((U64 *)(x), __ATOMIC_SEQ_CST)
 #  define ins_atomic_u64_inc_eval(x)              __atomic_add_fetch((U64 *)(x), 1, __ATOMIC_SEQ_CST)

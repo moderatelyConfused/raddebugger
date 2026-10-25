@@ -148,6 +148,7 @@ D_EntityKindTable:
   Null,
   @expand(W32_ExceptionCodeKindTable a) `Win32$(a.name)`,
   @expand(LNX_SignalCodeTable a) `Linux$(a.name)`,
+  @expand(MAC_ExceptionCodeTable a) `Mac$(a.name)`,
   COUNT,
 }
 
@@ -155,28 +156,32 @@ D_EntityKindTable:
 {
   `0`;
   @expand(W32_ExceptionCodeKindTable a) `$(a.code)`;
-  @expand(LNX_SignalCodeTable a) `$(a.code)`,
+  @expand(LNX_SignalCodeTable a) `$(a.code)`;
+  @expand(MAC_ExceptionCodeTable a) `$(a.code)`,
 }
 
 @data(OperatingSystem) d_exception_code_kind_os_table:
 {
   `OperatingSystem_Null`;
   @expand(W32_ExceptionCodeKindTable a) `OperatingSystem_Windows`;
-  @expand(LNX_SignalCodeTable a) `OperatingSystem_Linux`,
+  @expand(LNX_SignalCodeTable a) `OperatingSystem_Linux`;
+  @expand(MAC_ExceptionCodeTable a) `OperatingSystem_Mac`,
 }
 
 @data(String8) d_exception_code_kind_display_string_table:
 {
   `{0}`;
   @expand(W32_ExceptionCodeKindTable a) `str8_lit_comp("$(a.display_string)")`;
-  @expand(LNX_SignalCodeTable a) `str8_lit_comp("$(a.name) ($(a.desc))")`,
+  @expand(LNX_SignalCodeTable a) `str8_lit_comp("$(a.name) ($(a.desc))")`;
+  @expand(MAC_ExceptionCodeTable a) `str8_lit_comp("$(a.name) ($(a.desc))")`,
 }
 
 @data(String8) d_exception_code_kind_lowercase_code_string_table:
 {
   `{0}`;
   @expand(W32_ExceptionCodeKindTable a) `str8_lit_comp("win32_$(a.lower_name)")`;
-  @expand(LNX_SignalCodeTable a) `str8_lit_comp("linux_$(a.name_lower)")`,
+  @expand(LNX_SignalCodeTable a) `str8_lit_comp("linux_$(a.name_lower)")`;
+  @expand(MAC_ExceptionCodeTable a) `str8_lit_comp("mac_$(a.name_lower)")`,
 }
 
 @data(B8) d_exception_code_kind_default_enable_table:
@@ -184,4 +189,5 @@ D_EntityKindTable:
   `0`;
   @expand(W32_ExceptionCodeKindTable a) `$(a.default)`;
   @expand(LNX_SignalCodeTable a) `$(a.break_default)`;
+  @expand(MAC_ExceptionCodeTable a) `$(a.break_default)`;
 }

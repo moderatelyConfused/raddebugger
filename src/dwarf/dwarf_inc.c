@@ -12,3 +12,6 @@
 #if defined(ELF_H)
 # include "dwarf/dwarf_parse_elf.c"
 #endif
+#if defined(MACHO_H)
+# include "dwarf/dwarf_parse_macho.c"
+#endif

@@ -3733,8 +3733,30 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
                       case DW_ExprOp_FormTlsAddress:
                       case DW_GNU_ExprOp_PushTlsAddress:
                       {
-                        rdim_bytecode_push_op(arena, &dst_bytecode, RDI_EvalOp_TLSOff, 0);
-                        rdim_bytecode_push_op(arena, &dst_bytecode, RDI_EvalOp_Add, RDI_EvalTypeGroup_U);
+                        if(params->exe_kind == ExecutableImageKind_Macho)
+                        {
+                          // NOTE: on Mach-O the pushed operand is the (unslid) address of the
+                          // variable's TLV descriptor {thunk, key, offset} in __DATA,__thread_vars,
+                          // not an offset into the TLS block. the variable lives at
+                          // tls_block + descriptor.offset, so: slide the descriptor address,
+                          // read its offset field, and add the thread's TLS block base (TLSOff).
+                          //
+                          // stack: [desc_file_addr]
+                          rdim_bytecode_push_op(arena, &dst_bytecode, RDI_EvalOp_ModuleOff, 0);   // [desc, module_base]
+                          rdim_bytecode_push_uconst(arena, &dst_bytecode, base_vaddr);              // [desc, module_base, image_base]
+                          rdim_bytecode_push_op(arena, &dst_bytecode, RDI_EvalOp_Sub, RDI_EvalTypeGroup_U); // [desc, slide]
+                          rdim_bytecode_push_op(arena, &dst_bytecode, RDI_EvalOp_Add, RDI_EvalTypeGroup_U); // [desc + slide]
+                          rdim_bytecode_push_uconst(arena, &dst_bytecode, 16);
+                          rdim_bytecode_push_op(arena, &dst_bytecode, RDI_EvalOp_Add, RDI_EvalTypeGroup_U); // [&desc.offset]
+                          rdim_bytecode_push_op(arena, &dst_bytecode, RDI_EvalOp_MemRead, 8);      // [desc.offset]
+                          rdim_bytecode_push_op(arena, &dst_bytecode, RDI_EvalOp_TLSOff, 0);       // [desc.offset, tls_block]
+                          rdim_bytecode_push_op(arena, &dst_bytecode, RDI_EvalOp_Add, RDI_EvalTypeGroup_U); // [tls_block + offset]
+                        }
+                        else
+                        {
+                          rdim_bytecode_push_op(arena, &dst_bytecode, RDI_EvalOp_TLSOff, 0);
+                          rdim_bytecode_push_op(arena, &dst_bytecode, RDI_EvalOp_Add, RDI_EvalTypeGroup_U);
+                        }
                         push_vals[0].is_addr = 1;
                         push_vals[0].type_kind = RDI_TypeKind_U64;
                         is_tls_dependent = 1;

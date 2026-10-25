@@ -918,10 +918,15 @@ file_read(File file, Rng1U64 rng, void *out_data)
   for(;total_num_bytes_left_to_read > 0;)
   {
     int read_result = pread(fd, (U8 *)out_data + total_num_bytes_read, total_num_bytes_left_to_read, rng.min + total_num_bytes_read);
-    if(read_result >= 0)
+    if(read_result > 0)
     {
       total_num_bytes_read += read_result;
       total_num_bytes_left_to_read -= read_result;
+    }
+    else if(read_result == 0)
+    {
+      // rjf: end of file
+      break;
     }
     else if(errno != EINTR)
     {

@@ -1,0 +1,82 @@
+// Copyright (c) Epic Games Tools
+// Licensed under the MIT license (https://opensource.org/license/mit/)
+
+////////////////////////////////
+//~ rjf: macOS Exception / Signal Code Table
+//
+// Codes below 0x10000 are BSD signal numbers (as delivered to the debugger via
+// EXC_SOFTWARE / EXC_SOFT_SIGNAL when a process is attached with
+// PT_ATTACHEXC). Codes of the form 0x10000 + N are Mach exception types.
+
+@table(name  name_lower  code  repeatable  break_default  desc) MAC_ExceptionCodeTable:
+{
+  { SIGHUP               sighup                1       1  1  "Hangup detected on controlling terminal or death of controlling process" }
+  { SIGINT               sigint                2       1  1  "Interrupt from keyboard" }
+  { SIGQUIT              sigquit               3       1  1  "Quit from keyboard" }
+  { SIGILL               sigill                4       1  1  "Illegal instruction" }
+  { SIGTRAP              sigtrap               5       1  1  "Trace/breakpoint trap" }
+  { SIGABRT              sigabrt               6       1  1  "Abort signal" }
+  { SIGEMT               sigemt                7       1  1  "Emulator trap" }
+  { SIGFPE               sigfpe                8       1  1  "Erroneous arithmetic operation" }
+  { SIGKILL              sigkill               9       1  1  "Kill signal" }
+  { SIGBUS               sigbus                10      1  1  "Bus error (bad address)" }
+  { SIGSEGV              sigsegv               11      1  1  "Invalid memory reference" }
+  { SIGSYS               sigsys                12      1  1  "Bad system call" }
+  { SIGPIPE              sigpipe               13      1  1  "Broken pipe; write to pipe with no readers" }
+  { SIGALRM              sigalrm               14      1  1  "Timer signal" }
+  { SIGTERM              sigterm               15      1  1  "Termination signal" }
+  { SIGURG               sigurg                16      0  0  "Urgent condition on socket" }
+  { SIGSTOP              sigstop               17      1  1  "Stop process" }
+  { SIGTSTP              sigtstp               18      1  1  "Stop typed at terminal" }
+  { SIGCONT              sigcont               19      0  0  "Continue if stopped" }
+  { SIGCHLD              sigchld               20      0  0  "Child stopped, terminated, or continued" }
+  { SIGTTIN              sigttin               21      1  0  "Terminal input for background process" }
+  { SIGTTOU              sigttou               22      1  0  "Terminal output for background process" }
+  { SIGIO                sigio                 23      1  0  "I/O now possible" }
+  { SIGXCPU              sigxcpu               24      1  1  "CPU time limit exceeded" }
+  { SIGXFSZ              sigxfsz               25      1  1  "File size limit exceeded" }
+  { SIGVTALRM            sigvtalrm             26      1  0  "Virtual alarm clock" }
+  { SIGPROF              sigprof               27      1  0  "Profiling timer expired" }
+  { SIGWINCH             sigwinch              28      0  0  "Window resize signal" }
+  { SIGINFO              siginfo               29      0  0  "Information request" }
+  { SIGUSR1              sigusr1               30      1  1  "User-defined signal 1" }
+  { SIGUSR2              sigusr2               31      1  1  "User-defined signal 2" }
+  { EXC_BAD_ACCESS       exc_bad_access        0x10001 1  1  "Bad memory access (EXC_BAD_ACCESS)" }
+  { EXC_BAD_INSTRUCTION  exc_bad_instruction   0x10002 1  1  "Illegal or undefined instruction (EXC_BAD_INSTRUCTION)" }
+  { EXC_ARITHMETIC       exc_arithmetic        0x10003 1  1  "Arithmetic exception (EXC_ARITHMETIC)" }
+  { EXC_EMULATION        exc_emulation         0x10004 1  1  "Emulation instruction (EXC_EMULATION)" }
+  { EXC_SOFTWARE         exc_software          0x10005 1  1  "Software exception (EXC_SOFTWARE)" }
+  { EXC_BREAKPOINT       exc_breakpoint        0x10006 1  1  "Breakpoint or trace trap (EXC_BREAKPOINT)" }
+  { EXC_SYSCALL          exc_syscall           0x10007 1  0  "Unix system call (EXC_SYSCALL)" }
+  { EXC_MACH_SYSCALL     exc_mach_syscall      0x10008 1  0  "Mach system call (EXC_MACH_SYSCALL)" }
+  { EXC_RPC_ALERT        exc_rpc_alert         0x10009 1  0  "RPC alert (EXC_RPC_ALERT)" }
+  { EXC_CRASH            exc_crash             0x1000a 1  1  "Abnormal process exit (EXC_CRASH)" }
+  { EXC_RESOURCE         exc_resource          0x1000b 1  0  "Resource limit hit (EXC_RESOURCE)" }
+  { EXC_GUARD            exc_guard             0x1000c 1  1  "Guarded resource violation (EXC_GUARD)" }
+  { EXC_CORPSE_NOTIFY    exc_corpse_notify     0x1000d 1  0  "Corpse notification (EXC_CORPSE_NOTIFY)" }
+}
+
+@enum MAC_ExceptionCodeKind:
+{
+  Null,
+  @expand(MAC_ExceptionCodeTable a) `$(a.name)`,
+  COUNT,
+}
+
+@data(U32) mac_exception_code_kind_code_table:
+{
+  `0`;
+  @expand(MAC_ExceptionCodeTable a) `$(a.code)`;
+}
+
+@data(String8) mac_exception_code_kind_display_string_table:
+{
+  `{0}`;
+  @expand(MAC_ExceptionCodeTable a) `str8_lit_comp("$(a.name) ($(a.desc))")`;
+}
+
+@data(B8) mac_exception_code_kind_is_repeatable_table:
+{
+  `0`;
+  @expand(MAC_ExceptionCodeTable a) `$(a.repeatable)`;
+}

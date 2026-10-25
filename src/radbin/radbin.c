@@ -7,6 +7,17 @@
 #include "radbin/generated/radbin.meta.c"
 
 ////////////////////////////////
+//~ rjf: Mach-O Dumping
+//
+// NOTE: radbin is the only user of the Mach-O dumper; include it here if the
+// main file hasn't already.
+
+#if !defined(MACHO_DUMP_H)
+# include "macho/macho_dump.h"
+# include "macho/macho_dump.c"
+#endif
+
+////////////////////////////////
 //~ rjf: Top-Level Entry Points
 
 internal void
@@ -262,7 +273,45 @@ rb_thread_entry_point(void *p)
             file_format = (identifier_maybe[ELF_Identifier_Class] == ELF_Class_64) ? RB_FileFormat_ELF64 : RB_FileFormat_ELF32;
           }
         }
-        
+
+        //- rjf: Mach-O magic -> Mach-O input
+        if(file_format == RB_FileFormat_Null && props.size >= sizeof(MACHO_Header64))
+        {
+          U32 magic_maybe = 0;
+          file_read_struct(file, 0, &magic_maybe);
+          if(magic_maybe == MACHO_MH_MAGIC_64)
+          {
+            // rjf: thin 64-bit Mach-O
+            file_format = RB_FileFormat_MachO;
+          }
+          else
+          {
+            // rjf: fat (universal) binary; the fat headers are big-endian. NOTE: Java class
+            // files share the 0xcafebabe magic, so we also require a sane slice count, and a
+            // Mach-O magic at the start of one of the slices. NOTE: reads are clamped to the
+            // file size; `file_read` does not stop at EOF.
+            Temp scratch = scratch_begin(&arena, 1);
+            U8 fat_hdr_maybe[sizeof(MACHO_FatHeader) + MACHO_FAT_ARCH_MAX_COUNT*sizeof(MACHO_FatArch64)] = {0};
+            U64 fat_hdr_read_size = file_read(file, r1u64(0, Min((U64)sizeof(fat_hdr_maybe), props.size)), fat_hdr_maybe);
+            MACHO_FatArchArray fat_arches = macho_fat_arch_array_from_data(scratch.arena, str8(fat_hdr_maybe, fat_hdr_read_size));
+            for EachIndex(idx, fat_arches.count)
+            {
+              MACHO_FatArch64 *arch = &fat_arches.v[idx];
+              if(arch->offset <= props.size && arch->size <= props.size - arch->offset && arch->size >= sizeof(MACHO_Header64))
+              {
+                U32 slice_magic_maybe = 0;
+                file_read_struct(file, arch->offset, &slice_magic_maybe);
+                if(slice_magic_maybe == MACHO_MH_MAGIC_64 || slice_magic_maybe == MACHO_MH_MAGIC)
+                {
+                  file_format = RB_FileFormat_MachO;
+                  break;
+                }
+              }
+            }
+            scratch_end(scratch);
+          }
+        }
+
         //- rjf: RDI magic -> RDI input
         if(file_format == RB_FileFormat_Null)
         {
@@ -356,7 +405,126 @@ rb_thread_entry_point(void *p)
         }
         scratch_end(scratch);
       }
-      
+
+      //////////////////////////
+      //- rjf: Mach-O format => generate new implicit path tasks for dSYM debug files
+      //
+      // Mach-O executables normally carry no DWARF themselves; the linker only
+      // leaves a "debug map" (N_OSO stabs) pointing at the object files, and
+      // `dsymutil` links the DWARF into `<exe>.dSYM/Contents/Resources/DWARF/<exe>`.
+      //
+      if(file_format == RB_FileFormat_MachO)
+      {
+        Temp scratch = scratch_begin(&arena, 1);
+        MACHO_Bin bin = macho_bin_from_data(scratch.arena, file_data);
+        if(bin.is_valid && bin.hdr.filetype != MACHO_MH_DSYM && !macho_is_dwarf_present_from_bin(&bin))
+        {
+          //- rjf: look for a dSYM bundle next to the executable
+          String8 dsym_path = macho_dsym_path_from_exe_path(arena, input_file_path);
+          B32 dsym_path_is_found = file_path_exists(dsym_path);
+          if(dsym_path_is_found)
+          {
+            log_infof("Found separate debug info file for %S (%S) at %S\n", n->string, rb_file_format_display_name_table[file_format], dsym_path);
+          }
+
+          //- rjf: no dSYM, but the executable has a debug map => try to generate one with dsymutil
+          else if(macho_has_debug_map_from_bin(&bin))
+          {
+            log_infof("No dSYM bundle found at %S; %S has a debug map (%I64u N_OSO stabs)\n", dsym_path, n->string, bin.oso_count);
+#if OS_MAC
+            // rjf: generated dSYMs are cached per executable UUID, so that stale
+            // bundles from older builds of the same program are never picked up.
+            String8 exe_name = str8_skip_last_slash(input_file_path);
+            String8 cache_root = get_process_info()->user_program_cache_data_path;
+            String8 dsyms_dir = str8f(scratch.arena, "%S/raddbg/dsyms", cache_root);
+            String8 bundle_name = exe_name;
+            if(bin.has_uuid)
+            {
+              bundle_name = str8f(scratch.arena, "%S-%08X%04X%04X%02X%02X%02X%02X%02X%02X%02X%02X", exe_name,
+                                  bin.uuid.data1, bin.uuid.data2, bin.uuid.data3,
+                                  bin.uuid.data4[0], bin.uuid.data4[1], bin.uuid.data4[2], bin.uuid.data4[3],
+                                  bin.uuid.data4[4], bin.uuid.data4[5], bin.uuid.data4[6], bin.uuid.data4[7]);
+            }
+            String8 bundle_path = str8f(scratch.arena, "%S/%S.dSYM", dsyms_dir, bundle_name);
+            dsym_path = str8f(arena, "%S/Contents/Resources/DWARF/%S", bundle_path, exe_name);
+            if(file_path_exists(dsym_path))
+            {
+              log_infof("Reusing previously generated dSYM at %S\n", dsym_path);
+              dsym_path_is_found = 1;
+            }
+            else
+            {
+              make_directory(str8f(scratch.arena, "%S/raddbg", cache_root));
+              make_directory(dsyms_dir);
+              ProcessLaunchParams params = {0};
+              params.inherit_env = 1;
+              params.consoleless = 1;
+              str8_list_push(scratch.arena, &params.cmd_line, str8_lit("xcrun"));
+              str8_list_push(scratch.arena, &params.cmd_line, str8_lit("dsymutil"));
+              str8_list_push(scratch.arena, &params.cmd_line, input_file_path);
+              str8_list_push(scratch.arena, &params.cmd_line, str8_lit("-o"));
+              str8_list_push(scratch.arena, &params.cmd_line, bundle_path);
+              log_infof("Running `xcrun dsymutil %S -o %S`\n", input_file_path, bundle_path);
+              Process process = process_launch(&params);
+              if(process_match(process, process_zero()))
+              {
+                log_infof("Failed to launch dsymutil\n");
+              }
+              else
+              {
+                U64 exit_code = 0;
+                U64 timeout_us = 10*60*Million(1);
+                B32 joined = process_join(process, now_time_us() + timeout_us, &exit_code);
+                if(!joined)
+                {
+                  process_kill(process);
+                  log_infof("dsymutil did not complete within %I64u seconds; killed\n", timeout_us/Million(1));
+                }
+                else if(exit_code != 0)
+                {
+                  log_infof("dsymutil exited with code %I64u\n", exit_code);
+                }
+                else if(file_path_exists(dsym_path))
+                {
+                  log_infof("dsymutil generated %S\n", dsym_path);
+                  dsym_path_is_found = 1;
+                }
+                else
+                {
+                  log_infof("dsymutil exited successfully, but %S was not produced\n", dsym_path);
+                }
+              }
+            }
+#else
+            log_infof("Generating a dSYM with dsymutil is only attempted on macOS hosts; skipping\n");
+#endif
+          }
+          else
+          {
+            log_infof("%S (%S) contains no DWARF, no dSYM bundle was found at %S, and it has no debug map; no debug info is available for it\n", n->string, rb_file_format_display_name_table[file_format], dsym_path);
+          }
+
+          //- rjf: push task (unless that path was already specified)
+          if(dsym_path_is_found)
+          {
+            B32 is_already_a_task = 0;
+            for(String8Node *task_n = input_file_path_tasks.first; task_n != 0; task_n = task_n->next)
+            {
+              if(str8_match(task_n->string, dsym_path, 0))
+              {
+                is_already_a_task = 1;
+                break;
+              }
+            }
+            if(!is_already_a_task)
+            {
+              str8_list_push(arena, &input_file_path_tasks, dsym_path);
+            }
+          }
+        }
+        scratch_end(scratch);
+      }
+
       //////////////////////////
       //- rjf: PE => check if contains DWARF
       //
@@ -409,7 +577,22 @@ rb_thread_entry_point(void *p)
         }
         scratch_end(scratch);
       }
-      
+
+      //////////////////////////
+      //- rjf: Mach-O => check if contains DWARF
+      //
+      if(file_format == RB_FileFormat_MachO)
+      {
+        Temp scratch = scratch_begin(&arena, 1);
+        MACHO_Bin macho_bin = macho_bin_from_data(scratch.arena, file_data);
+        if(dw_is_dwarf_present_from_macho_bin(file_data, &macho_bin))
+        {
+          log_infof("DWARF data detected in %S (%S)\n", n->string, rb_file_format_display_name_table[file_format]);
+          file_format_flags |= RB_FileFormatFlag_HasDWARF;
+        }
+        scratch_end(scratch);
+      }
+
       //////////////////////////
       //- rjf: ELF => check if contains EH frame info
       //
@@ -581,7 +764,7 @@ rb_thread_entry_point(void *p)
       fprintf(stderr, "This utility provides a number of operations relating to executable image and\n");
       fprintf(stderr, "debug information formats. It can convert debug information to the RAD Debug\n");
       fprintf(stderr, "Info (.rdi) format. It can also parse and dump textualized contents of several\n");
-      fprintf(stderr, "formats, including PDB, PE, ELF, and RDI. It also supports converting debug\n");
+      fprintf(stderr, "formats, including PDB, PE, ELF, Mach-O, and RDI. It also supports converting debug\n");
       fprintf(stderr, "information to the textual Breakpad format.\n\n");
       
       fprintf(stderr, "-------------------------------------------------------------------------------\n\n");
@@ -653,7 +836,7 @@ rb_thread_entry_point(void *p)
         case OutputKind_Breakpad:
         {
           fprintf(stderr, "All input files specified on the command line will be dumped. The following\n");
-          fprintf(stderr, "formats are currently supported: PE, COFF, RDI, and ELF\n\n");
+          fprintf(stderr, "formats are currently supported: PE, COFF, RDI, ELF, and Mach-O\n\n");
         }break;
         case OutputKind_VOff2Line:
         {
@@ -724,12 +907,22 @@ rb_thread_entry_point(void *p)
                           input_files_from_format_table[RB_FileFormat_PE].first->v->format_flags & RB_FileFormatFlag_HasDWARF);
         B32 elf_w_dwarf = (input_files_from_format_table[RB_FileFormat_ELF32].count != 0 ||
                            input_files_from_format_table[RB_FileFormat_ELF64].count != 0);
-        if(pe_w_dwarf || elf_w_dwarf)
+        B32 macho_w_dwarf = 0;
+        for(RB_FileNode *n = input_files_from_format_table[RB_FileFormat_MachO].first; n != 0; n = n->next)
+        {
+          if(n->v->format_flags & RB_FileFormatFlag_HasDWARF)
+          {
+            macho_w_dwarf = 1;
+            break;
+          }
+        }
+        if(pe_w_dwarf || elf_w_dwarf || macho_w_dwarf)
         {
           convert_done = 1;
           if(0){}
-          else if(pe_w_dwarf)  { log_infof("PEs w/ DWARF specified; converting DWARF data to RDI\n"); }
-          else if(elf_w_dwarf) { log_infof("ELFs specified; converting DWARF data to RDI\n"); }
+          else if(pe_w_dwarf)    { log_infof("PEs w/ DWARF specified; converting DWARF data to RDI\n"); }
+          else if(elf_w_dwarf)   { log_infof("ELFs specified; converting DWARF data to RDI\n"); }
+          else if(macho_w_dwarf) { log_infof("Mach-O files w/ DWARF specified; converting DWARF data to RDI\n"); }
           
           // rjf: convert
           D2R_ConvertParams convert_params = {0};
@@ -812,6 +1005,66 @@ rb_thread_entry_point(void *p)
                 }
               }
             }
+            if(!got_exe && !got_dbg)
+            {
+              // rjf: debug info file: first Mach-O input w/ DWARF (a dSYM's DWARF file, or an
+              // object/executable with an embedded __DWARF segment)
+              RB_File *dbg_file = 0;
+              for(RB_FileNode *n = input_files_from_format_table[RB_FileFormat_MachO].first; n != 0; n = n->next)
+              {
+                if(n->v->format_flags & RB_FileFormatFlag_HasDWARF)
+                {
+                  dbg_file = n->v;
+                  break;
+                }
+              }
+              if(dbg_file != 0)
+              {
+                Temp scratch = scratch_begin(&arena, 1);
+                MACHO_Bin dbg_bin = macho_bin_from_data(scratch.arena, dbg_file->data);
+
+                // rjf: executable image: a non-dSYM Mach-O input, preferring one whose UUID
+                // matches the debug file, then one with the same base name; else the debug file itself
+                RB_File *exe_file = 0;
+                S32 exe_file_score = 0;
+                for(RB_FileNode *n = input_files_from_format_table[RB_FileFormat_MachO].first; n != 0; n = n->next)
+                {
+                  if(n->v == dbg_file) { continue; }
+                  MACHO_Bin exe_bin = macho_bin_from_data(scratch.arena, n->v->data);
+                  if(!exe_bin.is_valid || exe_bin.hdr.filetype == MACHO_MH_DSYM) { continue; }
+                  S32 score = 1;
+                  if(str8_match(str8_skip_last_slash(n->v->path), str8_skip_last_slash(dbg_file->path), 0))
+                  {
+                    score = 2;
+                  }
+                  if(exe_bin.has_uuid && dbg_bin.has_uuid && MemoryMatch(&exe_bin.uuid, &dbg_bin.uuid, sizeof(Guid)))
+                  {
+                    score = 3;
+                  }
+                  if(score > exe_file_score)
+                  {
+                    exe_file_score = score;
+                    exe_file = n->v;
+                  }
+                }
+                if(exe_file == 0)
+                {
+                  exe_file = dbg_file;
+                }
+                else
+                {
+                  log_infof("Using %S as the executable image for the debug info in %S\n", exe_file->path, dbg_file->path);
+                }
+                got_exe = 1;
+                got_dbg = 1;
+                exe_name = exe_file->path;
+                exe_data = exe_file->data;
+                exe_kind = ExecutableImageKind_Macho;
+                dbg_name = dbg_file->path;
+                dbg_data = dbg_file->data;
+                scratch_end(scratch);
+              }
+            }
             switch(exe_kind)
             {
               default:{}break;
@@ -841,9 +1094,24 @@ rb_thread_entry_point(void *p)
                 convert_params.binary_sections = e2r_rdi_binary_sections_from_elf_section_table(arena, dbg_data, &bin, &bin.shdrs);
                 scratch_end(scratch);
               }break;
+              case ExecutableImageKind_Macho:
+              {
+                // NOTE: the dSYM carries copies of the executable's segment/section
+                // headers (same vmaddrs), so sections & base come from the debug file,
+                // like the ELF path. DWARF addresses are unslid vaddrs; voff = vaddr - base.
+                Temp scratch = scratch_begin(&arena, 1);
+                MACHO_Bin bin = macho_bin_from_data(scratch.arena, dbg_data);
+                convert_params.arch = arch_from_macho_cputype(bin.hdr.cputype);
+                convert_params.base_vaddr = bin.base_vaddr;
+                convert_params.raw = dw_raw_from_macho_bin(arena, dbg_data, &bin);
+                convert_params.path_style = PathStyle_UnixAbsolute;
+                convert_params.binary_sections = m2r_rdi_binary_sections_from_macho(arena, dbg_data, &bin);
+                scratch_end(scratch);
+              }break;
             }
             convert_params.exe_name = exe_name;
             convert_params.exe_data = exe_data;
+            convert_params.exe_kind = exe_kind;
             convert_params.subset_flags  = subset_flags;
             convert_params.deterministic = cmd_line_has_flag(cmdline, str8_lit("deterministic"));
           }
@@ -938,6 +1206,32 @@ rb_thread_entry_point(void *p)
         if(output_path__noext.size == 0) { output_path__noext = str8_chop_last_dot(rb_file_list_first(&input_files_from_format_table[RB_FileFormat_PE])->path); }
         if(output_path__noext.size == 0) { output_path__noext = str8_chop_last_dot(rb_file_list_first(&input_files_from_format_table[RB_FileFormat_ELF64])->path); }
         if(output_path__noext.size == 0) { output_path__noext = str8_chop_last_dot(rb_file_list_first(&input_files_from_format_table[RB_FileFormat_ELF32])->path); }
+        if(output_path__noext.size == 0)
+        {
+          // rjf: Mach-O: prefer the executable's path. a dSYM's DWARF file lives inside the
+          // bundle (<exe>.dSYM/Contents/Resources/DWARF/<exe>); in that case, output next to the bundle.
+          String8 macho_path = {0};
+          for(RB_FileNode *n = input_files_from_format_table[RB_FileFormat_MachO].first; n != 0; n = n->next)
+          {
+            String8 path = n->v->path;
+            U64 dsym_pos = str8_find_needle(path, 0, str8_lit(".dSYM/"), StringMatchFlag_CaseInsensitive);
+            if(dsym_pos < path.size)
+            {
+              if(macho_path.size == 0)
+              {
+                macho_path = str8_prefix(path, dsym_pos);
+              }
+            }
+            else
+            {
+              macho_path = path;
+              break;
+            }
+          }
+          String8 macho_file_name = str8_skip_last_slash(macho_path);
+          B32 macho_file_name_has_ext = (str8_find_needle(macho_file_name, 0, str8_lit("."), 0) < macho_file_name.size);
+          output_path__noext = macho_file_name_has_ext ? str8_chop_last_dot(macho_path) : macho_path;
+        }
         if(output_path__noext.size == 0) { output_path__noext = str8_chop_last_dot(rb_file_list_first(&input_files_from_format_table[RB_FileFormat_RDI])->path); }
         switch(output_kind)
         {
@@ -966,7 +1260,7 @@ rb_thread_entry_point(void *p)
       //- rjf: no viable input paths
       if(!convert_done && cmdline->inputs.node_count != 0)
       {
-        log_user_errorf("Could not load debug info from the specified inputs. You must provide a valid PDB file, an executable image (PE, ELF) file with DWARF debug info, or RDI file(s).");
+        log_user_errorf("Could not load debug info from the specified inputs. You must provide a valid PDB file, an executable image (PE, ELF, Mach-O) file with DWARF debug info, a dSYM bundle's DWARF file, or RDI file(s).");
       }
       
       //- rjf: bake
@@ -1346,6 +1640,14 @@ rb_thread_entry_point(void *p)
         DW_SectionKind_XList
 #undef X
         fprintf(stderr, "\n");
+
+        fprintf(stderr, "-------------------------------------------------------------------------------\n\n");
+
+        fprintf(stderr, "Mach-O Sections:\n");
+#define X(name, name_lower, title) fprintf(stderr, " - " #name_lower "\n");
+        MACHO_DumpSubset_XList
+#undef X
+        fprintf(stderr, "\n");
       }
       
       B32 verbose = cmd_line_has_flag(cmdline, str8_lit("verbose"));
@@ -1355,6 +1657,7 @@ rb_thread_entry_point(void *p)
       DW_SectionFlags     dw_dump_subset_flags  = DW_SectionFlag_All;
       EH_DumpSubsetFlags  eh_dump_subset_flags  = EH_DumpSubsetFlag_All;
       ELF_DumpSubsetFlags elf_dump_subset_flags = ELF_DumpSubsetFlag_All;
+      MACHO_DumpSubsetFlags macho_dump_subset_flags = MACHO_DumpSubsetFlag_All;
       {
         String8List only_names = cmd_line_strings(cmdline, str8_lit("only"));
         if(only_names.node_count != 0)
@@ -1362,6 +1665,7 @@ rb_thread_entry_point(void *p)
           rdi_dump_subset_flags = 0;
           dw_dump_subset_flags = 0;
           eh_dump_subset_flags = 0;
+          macho_dump_subset_flags = 0;
         }
         for(String8Node *n = only_names.first; n != 0; n = n->next)
         {
@@ -1377,6 +1681,9 @@ rb_thread_entry_point(void *p)
 #undef X
 #define X(name, name_lower, title) else if(str8_match(n->string, str8_lit(#name_lower), 0)) { elf_dump_subset_flags |= ELF_DumpSubsetFlag_##name; }
           ELF_DumpSubset_XList
+#undef X
+#define X(name, name_lower, title) else if(str8_match(n->string, str8_lit(#name_lower), 0)) { macho_dump_subset_flags |= MACHO_DumpSubsetFlag_##name; }
+          MACHO_DumpSubset_XList
 #undef X
         }
         String8List omit_names = cmd_line_strings(cmdline, str8_lit("omit"));
@@ -1394,6 +1701,9 @@ rb_thread_entry_point(void *p)
 #undef X
 #define X(name, name_lower, title) else if(str8_match(n->string, str8_lit(#name_lower), 0)) { elf_dump_subset_flags &= ~ELF_DumpSubsetFlag_##name; }
           ELF_DumpSubset_XList
+#undef X
+#define X(name, name_lower, title) else if(str8_match(n->string, str8_lit(#name_lower), 0)) { macho_dump_subset_flags &= ~MACHO_DumpSubsetFlag_##name; }
+          MACHO_DumpSubset_XList
 #undef X
         }
       }
@@ -1415,6 +1725,7 @@ rb_thread_entry_point(void *p)
         Arch arch = Arch_Null;
         PE_BinInfo pe = {0};
         ELF_Bin elf = {0};
+        MACHO_Bin macho = {0};
         COFF_FileHeaderInfo coff_obj = {0};
         DW_Raw dw = {0};
         U64 eh_frame_hdr_vaddr = 0;
@@ -1455,6 +1766,11 @@ rb_thread_entry_point(void *p)
               }
             }
           }
+          else if(f->format == RB_FileFormat_MachO)
+          {
+            macho = macho_bin_from_data(arena, f->data);
+            arch  = arch_from_macho_cputype(macho.hdr.cputype);
+          }
           if(f->format_flags & RB_FileFormatFlag_HasDWARF)
           {
             if(f->format == RB_FileFormat_PE)
@@ -1469,6 +1785,10 @@ rb_thread_entry_point(void *p)
                     f->format == RB_FileFormat_ELF64)
             {
               dw = dw_raw_from_elf_bin(arena, f->data, &elf);
+            }
+            else if(f->format == RB_FileFormat_MachO)
+            {
+              dw = dw_raw_from_macho_bin(arena, f->data, &macho);
             }
           }
         }
@@ -1515,6 +1835,14 @@ rb_thread_entry_point(void *p)
           {
             String8List elf_strings = elf_dump(arena, f->data, elf_dump_subset_flags);
             str8_list_concat_in_place(&output_blobs, &elf_strings);
+          }break;
+
+          //- rjf: Mach-O
+          case RB_FileFormat_MachO:
+          if(lane_idx() == 0)
+          {
+            String8List macho_strings = macho_dump(arena, f->data, &macho, macho_dump_subset_flags);
+            str8_list_concat_in_place(&output_blobs, &macho_strings);
           }break;
           
           //- rjf: RDI file

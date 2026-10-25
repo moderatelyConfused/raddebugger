@@ -1,0 +1,66 @@
+// Copyright (c) Epic Games Tools
+// Licensed under the MIT license (https://opensource.org/license/mit/)
+
+//- GENERATED CODE
+
+#ifndef MAC_META_H
+#define MAC_META_H
+
+typedef enum MAC_ExceptionCodeKind
+{
+MAC_ExceptionCodeKind_Null,
+MAC_ExceptionCodeKind_SIGHUP,
+MAC_ExceptionCodeKind_SIGINT,
+MAC_ExceptionCodeKind_SIGQUIT,
+MAC_ExceptionCodeKind_SIGILL,
+MAC_ExceptionCodeKind_SIGTRAP,
+MAC_ExceptionCodeKind_SIGABRT,
+MAC_ExceptionCodeKind_SIGEMT,
+MAC_ExceptionCodeKind_SIGFPE,
+MAC_ExceptionCodeKind_SIGKILL,
+MAC_ExceptionCodeKind_SIGBUS,
+MAC_ExceptionCodeKind_SIGSEGV,
+MAC_ExceptionCodeKind_SIGSYS,
+MAC_ExceptionCodeKind_SIGPIPE,
+MAC_ExceptionCodeKind_SIGALRM,
+MAC_ExceptionCodeKind_SIGTERM,
+MAC_ExceptionCodeKind_SIGURG,
+MAC_ExceptionCodeKind_SIGSTOP,
+MAC_ExceptionCodeKind_SIGTSTP,
+MAC_ExceptionCodeKind_SIGCONT,
+MAC_ExceptionCodeKind_SIGCHLD,
+MAC_ExceptionCodeKind_SIGTTIN,
+MAC_ExceptionCodeKind_SIGTTOU,
+MAC_ExceptionCodeKind_SIGIO,
+MAC_ExceptionCodeKind_SIGXCPU,
+MAC_ExceptionCodeKind_SIGXFSZ,
+MAC_ExceptionCodeKind_SIGVTALRM,
+MAC_ExceptionCodeKind_SIGPROF,
+MAC_ExceptionCodeKind_SIGWINCH,
+MAC_ExceptionCodeKind_SIGINFO,
+MAC_ExceptionCodeKind_SIGUSR1,
+MAC_ExceptionCodeKind_SIGUSR2,
+MAC_ExceptionCodeKind_EXC_BAD_ACCESS,
+MAC_ExceptionCodeKind_EXC_BAD_INSTRUCTION,
+MAC_ExceptionCodeKind_EXC_ARITHMETIC,
+MAC_ExceptionCodeKind_EXC_EMULATION,
+MAC_ExceptionCodeKind_EXC_SOFTWARE,
+MAC_ExceptionCodeKind_EXC_BREAKPOINT,
+MAC_ExceptionCodeKind_EXC_SYSCALL,
+MAC_ExceptionCodeKind_EXC_MACH_SYSCALL,
+MAC_ExceptionCodeKind_EXC_RPC_ALERT,
+MAC_ExceptionCodeKind_EXC_CRASH,
+MAC_ExceptionCodeKind_EXC_RESOURCE,
+MAC_ExceptionCodeKind_EXC_GUARD,
+MAC_ExceptionCodeKind_EXC_CORPSE_NOTIFY,
+MAC_ExceptionCodeKind_COUNT,
+} MAC_ExceptionCodeKind;
+
+C_LINKAGE_BEGIN
+extern U32 mac_exception_code_kind_code_table[45];
+extern String8 mac_exception_code_kind_display_string_table[45];
+extern B8 mac_exception_code_kind_is_repeatable_table[45];
+
+C_LINKAGE_END
+
+#endif // MAC_META_H

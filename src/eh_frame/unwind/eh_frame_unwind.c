@@ -1,63 +1,19 @@
 // Copyright (c) Epic Games Tools
 // Licensed under the MIT license (https://opensource.org/license/mit/)
 
+////////////////////////////////
+//~ rjf: Stepping From A Known FDE
+
 internal UWND_StepResult
-eh_uwnd_step(Arch arch, MemoryMap *memory_map, UWND_ModuleInfo *module_info, U64 tls_vaddr, void *regs, U64 *cfa_out)
+eh_uwnd_step_from_fde_vaddr(Arch arch, MemoryMap *memory_map, EH_PtrCtx *ptr_ctx, U64 fde_vaddr, U64 tls_vaddr, void *regs, U64 *cfa_out)
 {
   Temp scratch = scratch_begin(0, 0);
   B32 done = 0;
   UWND_StepResult result = {0};
-  EH_UWND_ModuleUnwindInfo *unwind_info = (EH_UWND_ModuleUnwindInfo *)module_info->unwind_info;
-  if(unwind_info != 0)
   {
     //- rjf: unpack context
-    EH_FrameHdr *header = &unwind_info->header;
-    EH_PtrCtx *ptr_ctx = &unwind_info->ptr_ctx;
     ARCH_Info *arch_info = arch_info_from_arch(arch);
     U64 pc = arch_ip_from_reg_block(arch_info, regs);
-    
-    //- rjf: find nearest FDE entry to the IP
-    U64 fde_vaddr = 0;
-    if(header->version == 1 && header->fde_count != 0)
-    {
-      // rjf: binary search to find FDE number
-      U64 fde_num = 0;
-      {
-        U64 min_idx = 0;
-        U64 max_idx = header->fde_count-1;
-        for(;min_idx <= max_idx;)
-        {
-          U64 mid_idx = min_idx + (max_idx - min_idx) / 2;
-          U64 mid_pc_off = mid_idx*header->entry_byte_size;
-          U64 mid_pc = 0;
-          eh_read_ptr(header->table, mid_pc_off, ptr_ctx->pc_vaddr + mid_pc_off, ptr_ctx, header->table_enc, &mid_pc);
-          if(mid_pc > pc)
-          {
-            max_idx = mid_idx - 1;
-          }
-          else if(mid_pc < pc)
-          {
-            min_idx = mid_idx + 1;
-          }
-          else
-          {
-            fde_num = mid_idx + 1;
-            break;
-          }
-        }
-        if(fde_num == 0)
-        {
-          fde_num = min_idx > 0 ? min_idx : 1;
-        }
-      }
-      
-      // rjf: FDE number -> FDE vaddr
-      if(0 < fde_num && fde_num <= header->fde_count)
-      {
-        U64 fde_vaddr_off = ((fde_num-1) * header->entry_byte_size) + header->field_byte_size;
-        eh_read_ptr(header->table, fde_vaddr_off, ptr_ctx->pc_vaddr + fde_vaddr_off, ptr_ctx, header->table_enc, &fde_vaddr);
-      }
-    }
     
     //- rjf: parse info from FDE entry
     DW_CIE cie = {0};
@@ -248,7 +204,7 @@ eh_uwnd_step(Arch arch, MemoryMap *memory_map, UWND_ModuleInfo *module_info, U64
             //- rjf: location adjustments
             case DW_CFAOpCode_SetLoc:
             {
-              off += eh_read_ptr(inst_data, off, ptr_ctx->pc_vaddr + inst_data_off + off, ptr_ctx, header->table_enc, &new_base_pc_off);
+              off += eh_read_ptr(inst_data, off, ptr_ctx->pc_vaddr + inst_data_off + off, ptr_ctx, (EH_PtrEnc)cie.ext[EH_CIE_Ext_AddrEnc], &new_base_pc_off);
             }break;
             case DW_CFAOpCode_AdvanceLoc:
             {
@@ -679,6 +635,25 @@ eh_uwnd_step(Arch arch, MemoryMap *memory_map, UWND_ModuleInfo *module_info, U64
     // pointer be modified via the above rules? so what are we doing
     // here?
     //
+    //- rjf: the CIE's return address column names the register which now holds
+    // the caller's IP. on x64 that is the IP register itself, but on arm64 it is
+    // the link register (x30), so transfer it. an "undefined" rule for that
+    // register marks the outermost frame (IP = 0).
+    if(!done)
+    {
+      ARCH_RegCode ra_reg_code = arch_reg_code_from_dw(arch, (DW_RegCode)cie.ret_addr_reg);
+      if(ra_reg_code != 0 && ra_reg_code != arch_info->instruction_pointer_reg_code)
+      {
+        U64 new_ip = 0;
+        B32 ra_is_undefined = (cie.ret_addr_reg < reg_count && cfi_row.reg_rules[cie.ret_addr_reg].code == DW_UnwindRuleCode_Undefined);
+        if(!ra_is_undefined)
+        {
+          arch_reg_block_read_range(arch_info, regs, arch_info->reg_code_rng_table[ra_reg_code], &new_ip);
+        }
+        arch_reg_block_write_ip(arch_info, regs, new_ip);
+      }
+    }
+    
     if(!done)
     {
       arch_reg_block_write_sp(arch_info, regs, cfa);
@@ -695,5 +670,70 @@ eh_uwnd_step(Arch arch, MemoryMap *memory_map, UWND_ModuleInfo *module_info, U64
     }
   }
   scratch_end(scratch);
+  return result;
+}
+
+////////////////////////////////
+//~ rjf: Unwinding Abstraction Implementation
+
+internal UWND_StepResult
+eh_uwnd_step(Arch arch, MemoryMap *memory_map, UWND_ModuleInfo *module_info, U64 tls_vaddr, void *regs, U64 *cfa_out)
+{
+  UWND_StepResult result = {0};
+  EH_UWND_ModuleUnwindInfo *unwind_info = (EH_UWND_ModuleUnwindInfo *)module_info->unwind_info;
+  if(unwind_info != 0)
+  {
+    //- rjf: unpack context
+    EH_FrameHdr *header = &unwind_info->header;
+    EH_PtrCtx *ptr_ctx = &unwind_info->ptr_ctx;
+    ARCH_Info *arch_info = arch_info_from_arch(arch);
+    U64 pc = arch_ip_from_reg_block(arch_info, regs);
+    
+    //- rjf: find nearest FDE entry to the IP
+    U64 fde_vaddr = 0;
+    if(header->version == 1 && header->fde_count != 0)
+    {
+      // rjf: binary search to find FDE number
+      U64 fde_num = 0;
+      {
+        U64 min_idx = 0;
+        U64 max_idx = header->fde_count-1;
+        for(;min_idx <= max_idx;)
+        {
+          U64 mid_idx = min_idx + (max_idx - min_idx) / 2;
+          U64 mid_pc_off = mid_idx*header->entry_byte_size;
+          U64 mid_pc = 0;
+          eh_read_ptr(header->table, mid_pc_off, ptr_ctx->pc_vaddr + mid_pc_off, ptr_ctx, header->table_enc, &mid_pc);
+          if(mid_pc > pc)
+          {
+            max_idx = mid_idx - 1;
+          }
+          else if(mid_pc < pc)
+          {
+            min_idx = mid_idx + 1;
+          }
+          else
+          {
+            fde_num = mid_idx + 1;
+            break;
+          }
+        }
+        if(fde_num == 0)
+        {
+          fde_num = min_idx > 0 ? min_idx : 1;
+        }
+      }
+      
+      // rjf: FDE number -> FDE vaddr
+      if(0 < fde_num && fde_num <= header->fde_count)
+      {
+        U64 fde_vaddr_off = ((fde_num-1) * header->entry_byte_size) + header->field_byte_size;
+        eh_read_ptr(header->table, fde_vaddr_off, ptr_ctx->pc_vaddr + fde_vaddr_off, ptr_ctx, header->table_enc, &fde_vaddr);
+      }
+    }
+    
+    //- rjf: step using the FDE
+    result = eh_uwnd_step_from_fde_vaddr(arch, memory_map, ptr_ctx, fde_vaddr, tls_vaddr, regs, cfa_out);
+  }
   return result;
 }

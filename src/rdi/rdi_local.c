@@ -6,6 +6,9 @@
 #if defined(X64_H)
 # include "rdi/x64/rdi_x64.c"
 #endif
+#if defined(ARM64_H)
+# include "rdi/arm64/rdi_arm64.c"
+#endif
 
 ////////////////////////////////
 //~ rjf: RDI Enum <=> Base Enum
@@ -19,6 +22,7 @@ arch_from_rdi_arch(RDI_Arch arch)
     case RDI_Arch_NULL:{}break;
     case RDI_Arch_X86:{result = Arch_x86;}break;
     case RDI_Arch_X64:{result = Arch_x64;}break;
+    case RDI_Arch_ARM64:{result = Arch_arm64;}break;
   }
   return result;
 }
@@ -33,7 +37,7 @@ rdi_arch_from_arch(Arch arch)
     case Arch_Null:{}break;
     case Arch_x86:{result = RDI_Arch_X86;}break;
     case Arch_x64:{result = RDI_Arch_X64;}break;
-    case Arch_arm64:{}break;
+    case Arch_arm64:{result = RDI_Arch_ARM64;}break;
     case Arch_arm32:{}break;
   }
   return result;

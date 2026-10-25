@@ -87,6 +87,8 @@
 
 # if defined(__gnu_linux__) || defined(__linux__)
 #  define OS_LINUX 1
+# elif defined(__APPLE__) && defined(__MACH__)
+#  define OS_MAC 1
 # else
 #  error This compiler/OS combo is not supported.
 # endif
@@ -110,9 +112,9 @@
 ////////////////////////////////
 //~ rjf: Arch Cracking
 
-#if defined(ARCH_X64)
+#if defined(ARCH_X64) || defined(ARCH_ARM64)
 # define ARCH_64BIT 1
-#elif defined(ARCH_X86)
+#elif defined(ARCH_X86) || defined(ARCH_ARM32)
 # define ARCH_32BIT 1
 #endif
 
@@ -244,8 +246,8 @@
 #if ARCH_X86
 # error You tried to build in x86 (32 bit) mode, but currently, only building in x64 (64 bit) mode is supported.
 #endif
-#if !ARCH_X64
-# error You tried to build with an unsupported architecture. Currently, only building in x64 mode is supported.
+#if !ARCH_X64 && !ARCH_ARM64
+# error You tried to build with an unsupported architecture. Currently, only building in x64 or arm64 mode is supported.
 #endif
 
 ////////////////////////////////

@@ -13,7 +13,13 @@ internal void
 x64_cpuid(U32 leaf, U32 *eax, U32 *ebx, U32 *ecx, U32 *edx)
 {
   U32 info[4] = {0};
-#if COMPILER_MSVC
+#if !ARCH_X64
+  // NOTE: not running on an x86 host; report no features
+  if (eax) { *eax = 0; }
+  if (ebx) { *ebx = 0; }
+  if (ecx) { *ecx = 0; }
+  if (edx) { *edx = 0; }
+#elif COMPILER_MSVC
   __cpuid(info, leaf);
   if (eax) { *eax = info[0]; }
   if (ebx) { *ebx = info[1]; }
@@ -33,8 +39,14 @@ x64_cpuid(U32 leaf, U32 *eax, U32 *ebx, U32 *ecx, U32 *edx)
 internal void
 x64_cpuid_ex(U32 leaf, U32 sub_leaf, U32 *eax, U32 *ebx, U32 *ecx, U32 *edx)
 {
-  U32 info[4];
-#if COMPILER_MSVC
+  U32 info[4] = {0};
+#if !ARCH_X64
+  // NOTE: not running on an x86 host; report no features
+  if (eax) { *eax = 0; }
+  if (ebx) { *ebx = 0; }
+  if (ecx) { *ecx = 0; }
+  if (edx) { *edx = 0; }
+#elif COMPILER_MSVC
   __cpuidex(info, leaf, sub_leaf);
   if (eax) { *eax = info[0]; }
   if (ebx) { *ebx = info[1]; }

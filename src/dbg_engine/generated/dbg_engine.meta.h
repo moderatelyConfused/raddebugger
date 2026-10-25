@@ -139,6 +139,50 @@ D_ExceptionCodeKind_LinuxSIGWINCH,
 D_ExceptionCodeKind_LinuxSIGIO,
 D_ExceptionCodeKind_LinuxSIGPWR,
 D_ExceptionCodeKind_LinuxSIGSYS,
+D_ExceptionCodeKind_MacSIGHUP,
+D_ExceptionCodeKind_MacSIGINT,
+D_ExceptionCodeKind_MacSIGQUIT,
+D_ExceptionCodeKind_MacSIGILL,
+D_ExceptionCodeKind_MacSIGTRAP,
+D_ExceptionCodeKind_MacSIGABRT,
+D_ExceptionCodeKind_MacSIGEMT,
+D_ExceptionCodeKind_MacSIGFPE,
+D_ExceptionCodeKind_MacSIGKILL,
+D_ExceptionCodeKind_MacSIGBUS,
+D_ExceptionCodeKind_MacSIGSEGV,
+D_ExceptionCodeKind_MacSIGSYS,
+D_ExceptionCodeKind_MacSIGPIPE,
+D_ExceptionCodeKind_MacSIGALRM,
+D_ExceptionCodeKind_MacSIGTERM,
+D_ExceptionCodeKind_MacSIGURG,
+D_ExceptionCodeKind_MacSIGSTOP,
+D_ExceptionCodeKind_MacSIGTSTP,
+D_ExceptionCodeKind_MacSIGCONT,
+D_ExceptionCodeKind_MacSIGCHLD,
+D_ExceptionCodeKind_MacSIGTTIN,
+D_ExceptionCodeKind_MacSIGTTOU,
+D_ExceptionCodeKind_MacSIGIO,
+D_ExceptionCodeKind_MacSIGXCPU,
+D_ExceptionCodeKind_MacSIGXFSZ,
+D_ExceptionCodeKind_MacSIGVTALRM,
+D_ExceptionCodeKind_MacSIGPROF,
+D_ExceptionCodeKind_MacSIGWINCH,
+D_ExceptionCodeKind_MacSIGINFO,
+D_ExceptionCodeKind_MacSIGUSR1,
+D_ExceptionCodeKind_MacSIGUSR2,
+D_ExceptionCodeKind_MacEXC_BAD_ACCESS,
+D_ExceptionCodeKind_MacEXC_BAD_INSTRUCTION,
+D_ExceptionCodeKind_MacEXC_ARITHMETIC,
+D_ExceptionCodeKind_MacEXC_EMULATION,
+D_ExceptionCodeKind_MacEXC_SOFTWARE,
+D_ExceptionCodeKind_MacEXC_BREAKPOINT,
+D_ExceptionCodeKind_MacEXC_SYSCALL,
+D_ExceptionCodeKind_MacEXC_MACH_SYSCALL,
+D_ExceptionCodeKind_MacEXC_RPC_ALERT,
+D_ExceptionCodeKind_MacEXC_CRASH,
+D_ExceptionCodeKind_MacEXC_RESOURCE,
+D_ExceptionCodeKind_MacEXC_GUARD,
+D_ExceptionCodeKind_MacEXC_CORPSE_NOTIFY,
 D_ExceptionCodeKind_COUNT,
 } D_ExceptionCodeKind;
 
@@ -166,11 +210,11 @@ struct {B32 *value_ptr; String8 name;} DEV_toggle_table[] =
 C_LINKAGE_BEGIN
 extern String8 d_entity_kind_code_name_table[13];
 extern String8 d_entity_kind_display_string_table[13];
-extern U32 d_exception_code_kind_code_table[69];
-extern OperatingSystem d_exception_code_kind_os_table[69];
-extern String8 d_exception_code_kind_display_string_table[69];
-extern String8 d_exception_code_kind_lowercase_code_string_table[69];
-extern B8 d_exception_code_kind_default_enable_table[69];
+extern U32 d_exception_code_kind_code_table[113];
+extern OperatingSystem d_exception_code_kind_os_table[113];
+extern String8 d_exception_code_kind_display_string_table[113];
+extern String8 d_exception_code_kind_lowercase_code_string_table[113];
+extern B8 d_exception_code_kind_default_enable_table[113];
 
 C_LINKAGE_END
 

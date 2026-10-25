@@ -7,6 +7,8 @@
 # include "dwrite/font_provider_dwrite.c"
 #elif FP_BACKEND == FP_BACKEND_FREETYPE
 # include "freetype/font_provider_freetype.c"
+#elif FP_BACKEND == FP_BACKEND_CORETEXT
+# include "coretext/font_provider_coretext.c"
 #else
 # error Font provider backend not specified.
 #endif

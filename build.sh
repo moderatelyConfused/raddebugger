@@ -17,20 +17,38 @@ if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   auto_compile_flags="$auto_compile_flags -DBUILD_GIT_HASH=\"$(git describe --always --dirty)\" -DBUILD_GIT_HASH_FULL=$(git rev-parse HEAD)"
 fi
 
+# --- Platform Detection ------------------------------------------------------
+host_os="$(uname -s)"
+host_arch="$(uname -m)"
+
 # --- Compile/Link Line Definitions -------------------------------------------
 cc_cflags_gcc=""
-cc_cflags_clang=" -fdiagnostics-absolute-paths -Wno-for-loop-analysis  -Wno-incompatible-pointer-types-discards-qualifiers -Wno-initializer-overrides -Wno-compare-distinct-pointer-types -Wno-single-bit-bitfield-constant-conversion -Wno-deprecated-declarations -Wno-writable-strings -Wno-unknown-warning-option -Wno-deprecated-register -Wno-unused-local-typedef -msse2"
-cc_common=${auto_compile_flags}"-mcx16 -I../src/ -I../local/ -D_GNU_SOURCE -g -Wall -Wno-missing-braces -Wno-unused-function -Wno-unused-variable -Wno-unused-but-set-variable -Wno-unused-value -D_USE_MATH_DEFINES -Dstrdup=_strdup -Dgnu_printf=printf"
+cc_cflags_clang=" -fdiagnostics-absolute-paths -Wno-for-loop-analysis  -Wno-incompatible-pointer-types-discards-qualifiers -Wno-initializer-overrides -Wno-compare-distinct-pointer-types -Wno-single-bit-bitfield-constant-conversion -Wno-deprecated-declarations -Wno-writable-strings -Wno-unknown-warning-option -Wno-deprecated-register -Wno-unused-local-typedef"
+if [[ "$host_os" == "Darwin" ]]; then
+  # macOS: clang only, no x86 ISA flags, BSD libc (no librt), frameworks instead of X11/EGL/FreeType
+  cc_common=${auto_compile_flags}" -I../src/ -I../local/ -D_DARWIN_C_SOURCE -g -Wall -Wno-missing-braces -Wno-unused-function -Wno-unused-variable -Wno-unused-but-set-variable -Wno-unused-value -D_USE_MATH_DEFINES -Dgnu_printf=printf"
+  cc_link="-lpthread -lm -ldl"
+else
+  cc_cflags_clang="$cc_cflags_clang -msse2"
+  cc_common=${auto_compile_flags}"-mcx16 -I../src/ -I../local/ -D_GNU_SOURCE -g -Wall -Wno-missing-braces -Wno-unused-function -Wno-unused-variable -Wno-unused-but-set-variable -Wno-unused-value -D_USE_MATH_DEFINES -Dstrdup=_strdup -Dgnu_printf=printf"
+  cc_link="-lpthread -lm -lrt -ldl"
+fi
 cc_debug="-g -O0 -DBUILD_DEBUG=1 ${cc_common}"
 cc_release="-g -O2 -DBUILD_DEBUG=0 ${cc_common}"
-cc_link="-lpthread -lm -lrt -ldl"
 
 # --- Per-Build Settings ------------------------------------------------------
 cc_link_dll="-fPIC"
 
 # --- External Libraries ------------------------------------------------------
-# sudo apt install -y pkg-config libfreetype6-dev libx11-dev libxext-dev libxfixes-dev libxrandr-dev libgl-dev libegl-dev
-if [[ -x "$(command -v pkg-config)" ]]; then
+# linux: sudo apt install -y pkg-config libfreetype6-dev libx11-dev libxext-dev libxfixes-dev libxrandr-dev libgl-dev libegl-dev
+# macOS: Xcode command line tools (xcode-select --install); windowing, rendering & fonts come from system frameworks
+mac_platform_obj=""
+if [[ "$host_os" == "Darwin" ]]; then
+  cc_font_provider="-framework CoreText -framework CoreGraphics -framework CoreFoundation"
+  cc_os_gfx="-framework Cocoa -framework QuartzCore"
+  cc_render="-framework OpenGL"
+  mac_platform_obj="mac_platform.o"
+elif [[ -x "$(command -v pkg-config)" ]]; then
   cc_font_provider="$(pkg-config --cflags --libs freetype2)"  
   cc_os_gfx="$(pkg-config --cflags --libs x11 xext xfixes xrandr)"
   cc_render="$(pkg-config --cflags --libs gl egl)"
@@ -41,10 +59,15 @@ else
 fi
 
 # --- Icons -------------------------------------------------------------------
-cc_icon="-DLNX_WM_ICON=1"
+if [[ "$host_os" == "Darwin" ]]; then
+  cc_icon=""
+else
+  cc_icon="-DLNX_WM_ICON=1"
+fi
 
 # --- Choose Compile/Link Lines -----------------------------------------------
-if   [[ "${gcc:-0}"   == "1" ]]; then compiler="${CC:-gcc}   $cc_cflags_gcc";   ar="${AR:-ar}";      echo "[gcc compile]";
+if   [[ "$host_os" == "Darwin" ]]; then compiler="${CC:-clang} $cc_cflags_clang"; ar="${AR:-ar}";      echo "[clang compile (macOS)]";
+elif [[ "${gcc:-0}"   == "1" ]]; then compiler="${CC:-gcc}   $cc_cflags_gcc";   ar="${AR:-ar}";      echo "[gcc compile]";
 elif [[ "${clang:-1}" == "1" ]]; then compiler="${CC:-clang} $cc_cflags_clang"; ar="${AR:-llvm-ar}"; echo "[clang compile]";
 fi
 if   [[ "${release:-0}" == "1" ]]; then echo "[release mode]"; compile="$compiler $cc_release";
@@ -52,9 +75,23 @@ elif [[ "${debug:-1}"   == "1" ]]; then echo "[debug mode]";   compile="$compile
 fi
 
 oodle_flags=()
-compile() {
-  $compile "${oodle_flags[@]}" -Wl,--start-group "$@" blake3.a -latomic -Wl,--end-group
-}
+if [[ "$host_os" == "Darwin" ]]; then
+  compile() {
+    $compile "${oodle_flags[@]}" "$@" blake3.a
+  }
+  # ad-hoc code signing with the debugger entitlement, required for task_for_pid()
+  # (see src/mac/raddbg.entitlements and the README)
+  sign() {
+    if [[ -x "$(command -v codesign)" ]]; then
+      codesign -s - -f --entitlements ../src/mac/raddbg.entitlements "$1" || echo "[WARNING] codesign failed for $1; task_for_pid() will not work unless run as root"
+    fi
+  }
+else
+  compile() {
+    $compile "${oodle_flags[@]}" -Wl,--start-group "$@" blake3.a -latomic -Wl,--end-group
+  }
+  sign() { :; }
+fi
 
 # --- Prep Directories --------------------------------------------------------
 mkdir -p build local
@@ -74,11 +111,27 @@ cd ..
 # --- Assemble BLAKE3 ---------------------------------------------------------
 if [[ ! -f "build/blake3.a" ]]; then
   echo "[assembling blake3]"
-  $compiler -c -g -o build/blake3_sse2_x86-64_unix.o   src/third_party/blake3/blake3_sse2_x86-64_unix.S
-  $compiler -c -g -o build/blake3_sse41_x86-64_unix.o  src/third_party/blake3/blake3_sse41_x86-64_unix.S
-  $compiler -c -g -o build/blake3_avx2_x86-64_unix.o   src/third_party/blake3/blake3_avx2_x86-64_unix.S
-  $compiler -c -g -o build/blake3_avx512_x86-64_unix.o src/third_party/blake3/blake3_avx512_x86-64_unix.S
-  $ar rs build/blake3.a build/blake3_*_unix.o
+  if [[ "$host_os" == "Darwin" ]]; then
+    if [[ "$host_arch" == "arm64" ]]; then
+      $compiler -c -g -DBLAKE3_USE_NEON=1 -o build/blake3_neon.o src/third_party/blake3/blake3_neon.c
+      $ar rs build/blake3.a build/blake3_neon.o
+    else
+      echo "" > build/blake3_empty.c && $compiler -c -o build/blake3_empty.o build/blake3_empty.c
+      $ar rs build/blake3.a build/blake3_empty.o
+    fi
+  else
+    $compiler -c -g -o build/blake3_sse2_x86-64_unix.o   src/third_party/blake3/blake3_sse2_x86-64_unix.S
+    $compiler -c -g -o build/blake3_sse41_x86-64_unix.o  src/third_party/blake3/blake3_sse41_x86-64_unix.S
+    $compiler -c -g -o build/blake3_avx2_x86-64_unix.o   src/third_party/blake3/blake3_avx2_x86-64_unix.S
+    $compiler -c -g -o build/blake3_avx512_x86-64_unix.o src/third_party/blake3/blake3_avx512_x86-64_unix.S
+    $ar rs build/blake3.a build/blake3_*_unix.o
+  fi
+fi
+
+# --- Compile macOS Platform Layer (Objective-C) ------------------------------
+if [[ "$host_os" == "Darwin" ]]; then
+  echo "[compiling mac_platform.m]"
+  (cd build && $compile -x objective-c -fno-objc-arc -c ../src/mac/mac_platform.m -o mac_platform.o)
 fi
 
 # --- Set up Oodle SDK -------------------------------------------------------
@@ -120,11 +173,11 @@ fi
 
 # --- Build Everything (@build_targets) ---------------------------------------
 cd build
-if [[ "${raddbg:-0}"               == "1" ]]; then didbuild=1 && compile ../src/raddbg/raddbg_main.c $cc_icon $cc_link $cc_os_gfx $cc_render $cc_font_provider -o raddbg; fi
-if [[ "${raddbg_non_graphical:-0}" == "1" ]]; then didbuild=1 && compile ../src/raddbg/raddbg_main.c -DWM_STUB=1 -DR_BACKEND=R_BACKEND_STUB $cc_link $cc_os_gfx $cc_render $cc_font_provider -o raddbg_non_graphical; fi
+if [[ "${raddbg:-0}"               == "1" ]]; then didbuild=1 && compile ../src/raddbg/raddbg_main.c $cc_icon $cc_link $cc_os_gfx $cc_render $cc_font_provider $mac_platform_obj -o raddbg && sign raddbg; fi
+if [[ "${raddbg_non_graphical:-0}" == "1" ]]; then didbuild=1 && compile ../src/raddbg/raddbg_main.c -DWM_STUB=1 -DR_BACKEND=R_BACKEND_STUB $cc_link $cc_os_gfx $cc_render $cc_font_provider $mac_platform_obj -o raddbg_non_graphical && sign raddbg_non_graphical; fi
 if [[ "${radbin:-0}"               == "1" ]]; then didbuild=1 && compile ../src/radbin/radbin_main.c   $cc_link -o radbin; fi
 if [[ "${radlink:-0}"              == "1" ]]; then didbuild=1 && compile ../src/linker/lnk.c           $cc_link -o radlink; fi
-if [[ "${torture:-0}"              == "1" ]]; then didbuild=1 && compile ../src/torture/torture_main.c $cc_link $cc_os_gfx $cc_render $cc_font_provider -o torture; fi
+if [[ "${torture:-0}"              == "1" ]]; then didbuild=1 && compile ../src/torture/torture_main.c $cc_link $cc_os_gfx $cc_render $cc_font_provider $mac_platform_obj -o torture && sign torture; fi
 cd ..
 
 # --- Warn On No Builds -------------------------------------------------------

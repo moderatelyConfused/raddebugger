@@ -15,5 +15,8 @@
 #if defined(ELF_H)
 # include "dwarf/dwarf_parse_elf.h"
 #endif
+#if defined(MACHO_H)
+# include "dwarf/dwarf_parse_macho.h"
+#endif
 
 #endif // DWARF_INC_H

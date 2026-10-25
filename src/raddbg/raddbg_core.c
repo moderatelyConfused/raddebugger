@@ -10622,12 +10622,18 @@ internal String8
 rd_string_from_exception_code(U32 code)
 {
   String8 string = {0};
+  // NOTE: codes are not unique across operating systems (e.g. signal numbers),
+  // so prefer entries belonging to the current OS.
   for EachNonZeroEnumVal(D_ExceptionCodeKind, k)
   {
-    if(code == d_exception_code_kind_code_table[k])
+    if(code == d_exception_code_kind_code_table[k] &&
+       (string.size == 0 || d_exception_code_kind_os_table[k] == OperatingSystem_CURRENT))
     {
       string = d_exception_code_kind_display_string_table[k];
-      break;
+      if(d_exception_code_kind_os_table[k] == OperatingSystem_CURRENT)
+      {
+        break;
+      }
     }
   }
   return string;

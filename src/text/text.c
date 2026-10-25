@@ -42,6 +42,7 @@ txt_lang_kind_from_arch(Arch arch)
   {
     default:{}break;
     case Arch_x64:{kind = TXT_LangKind_DisasmX64Intel;}break;
+    case Arch_arm64:{kind = TXT_LangKind_DisasmX64Intel;}break;
   }
   return kind;
 }

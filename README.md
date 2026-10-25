@@ -8,9 +8,11 @@ local copy has been built. You can find pre-built release binaries
 [here](https://github.com/EpicGames/raddebugger/releases)._
 
 The RAD Debugger is a native, user-mode, multi-process, graphical debugger. It
-currently only supports local-machine x64 debugging on both Windows and Linux
-(although Linux support is still very early). We plan to expand support to
-other architectures, and to implement remote and multi-machine debugging.
+currently supports local-machine x64 debugging on both Windows and Linux
+(although Linux support is still very early), and local-machine arm64 (Apple
+Silicon) debugging on macOS (also early; see the macOS section below). We plan
+to expand support to other architectures, and to implement remote and
+multi-machine debugging.
 
 The debugger is currently in *ALPHA*. In order to get the debugger
 bullet-proof, it'd greatly help out if you submitted the issues you find
@@ -85,7 +87,8 @@ A benchmark of the linker's performance is below:
 # Project Development Setup / Local Build Instructions
 
 The project is actively developed both on [Windows x64](#windows-x64) and
-[Linux x64](#linux-x64) development machines. Click on whichever you'd like to
+[Linux x64](#linux-x64) development machines, and can also be built on
+[macOS (Apple Silicon)](#macos-apple-silicon). Click on whichever you'd like to
 use.
 
 ## Windows x64
@@ -307,6 +310,71 @@ Linker, or the `radbin` CLI binary file utility:
 ./build.sh radlink release
 ./build.sh radbin release
 ```
+
+## macOS (Apple Silicon)
+
+The macOS port targets native arm64 processes on Apple Silicon machines
+(macOS 12 or later). Intel Macs and x86-64 (Rosetta) processes are not
+supported.
+
+### 1. Installing the Required Tools (Xcode Command Line Tools)
+
+The build needs Apple's Clang, the macOS SDK, and `dsymutil`, all of which are
+provided by the Xcode command line tools:
+
+```
+xcode-select --install
+```
+
+No third-party libraries are required; windowing, rendering, and fonts use the
+Cocoa, OpenGL, and CoreText frameworks.
+
+### 2. Building
+
+From the repository root, the same script used on Linux detects macOS and
+builds the debugger:
+
+```
+./build.sh raddbg
+```
+
+As on Linux, `release` produces an optimized build, and `radbin` builds the
+command line binary utility. The build writes `build/raddbg` and signs it
+ad-hoc with the `com.apple.security.cs.debugger` entitlement from
+`src/mac/raddbg.entitlements`. That entitlement is what allows a debugger to
+obtain the task port of another process with `task_for_pid()`. If launching or
+attaching fails with a `task_for_pid` error in the log, either run the
+debugger as root (`sudo ./build/raddbg`), or sign it with a self-signed code
+signing certificate that is trusted for code signing in your keychain:
+
+```
+codesign -s "<your certificate name>" -f --entitlements src/mac/raddbg.entitlements build/raddbg
+```
+
+Targets must be plain arm64 (not arm64e) executables. Hardened-runtime system
+programs cannot be attached to.
+
+### 3. Debug Information
+
+The debugger reads DWARF debug information from Mach-O files. On macOS the
+linker does not copy DWARF into the executable; it is linked into a `.dSYM`
+bundle by `dsymutil`. When you compile and link in one step (for example
+`clang -g main.c -o main`) the compiler driver runs `dsymutil` for you and
+produces `main.dSYM` next to the executable, which the debugger finds
+automatically. If you compile and link separately, run `dsymutil` on the
+linked executable yourself; if no dSYM is found, the debugger's converter will
+try to run `xcrun dsymutil` on the executable and cache the result under
+`~/Library/Caches/raddbg/dsyms`.
+
+### 4. Current Limitations
+
+- Only native arm64 processes are supported; x86-64 (Rosetta) processes are not.
+- Launched and attached processes must be debuggable by the current user (no
+  hardened runtime, same user, or run the debugger as root).
+- System libraries that live in the dyld shared cache have no on-disk file, so
+  they are shown without symbols (unwinding through them still works via their
+  compact unwind information).
+- The `radlink` linker is not supported on macOS.
 
 ---
 

@@ -7,7 +7,9 @@
 ////////////////////////////////
 //~ rjf: Abstraction Backend Info
 
-typedef U8 ARCH_RegCode;
+// NOTE: 16 bits, since architectures with many register aliases (arm64's
+// x/w/v/q/d/s/h/b views) exceed 256 codes.
+typedef U16 ARCH_RegCode;
 
 typedef struct ARCH_Info ARCH_Info;
 struct ARCH_Info
