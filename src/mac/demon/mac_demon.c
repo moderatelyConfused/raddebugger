@@ -2521,9 +2521,16 @@ dmn_ctrl_run(Arena *arena, DMN_CtrlCtx *ctx, DMN_RunCtrls *ctrls)
     U64 bytes_per_trap = arch_info->trap_instruction.size;
     
     ////////////////////////////
-    //- rjf: read initial bytes at all trap locations, write trap instructions
+    //- rjf: read initial bytes at all trap locations
+    //
+    // NOTE: all of the original bytes must be read before any trap is written:
+    // the list may contain several traps at one address (e.g. a stepping trap
+    // on the same instruction as a user breakpoint), and reading after writing
+    // would record the trap instruction as that address' original bytes, which
+    // the restore below would then leave permanently in the program.
     //
     U8 *trap_swap_bytes = push_array(scratch.arena, U8, ctrls->traps.trap_count * bytes_per_trap);
+    B8 *trap_is_read    = push_array(scratch.arena, B8, ctrls->traps.trap_count);
     B8 *trap_is_written = push_array(scratch.arena, B8, ctrls->traps.trap_count);
     {
       U64 trap_idx = 0;
@@ -2535,10 +2542,26 @@ dmn_ctrl_run(Arena *arena, DMN_CtrlCtx *ctx, DMN_RunCtrls *ctrls)
           if(trap->flags == 0)
           {
             U8 *swap = trap_swap_bytes + trap_idx*bytes_per_trap;
-            if(dmn_process_read(trap->process, r1u64(trap->vaddr, trap->vaddr + bytes_per_trap), swap) == bytes_per_trap)
-            {
-              trap_is_written[trap_idx] = dmn_process_write(trap->process, r1u64(trap->vaddr, trap->vaddr + bytes_per_trap), arch_info->trap_instruction.str);
-            }
+            trap_is_read[trap_idx] = (dmn_process_read(trap->process, r1u64(trap->vaddr, trap->vaddr + bytes_per_trap), swap) == bytes_per_trap);
+          }
+          trap_idx += 1;
+        }
+      }
+    }
+    
+    ////////////////////////////
+    //- rjf: write trap instructions
+    //
+    {
+      U64 trap_idx = 0;
+      for EachNode(n, DMN_TrapChunkNode, ctrls->traps.first)
+      {
+        for EachIndex(n_idx, n->count)
+        {
+          DMN_Trap *trap = n->v+n_idx;
+          if(trap->flags == 0 && trap_is_read[trap_idx])
+          {
+            trap_is_written[trap_idx] = dmn_process_write(trap->process, r1u64(trap->vaddr, trap->vaddr + bytes_per_trap), arch_info->trap_instruction.str);
           }
           trap_idx += 1;
         }
