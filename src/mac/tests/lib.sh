@@ -33,8 +33,13 @@ export HARNESS_DIR HARNESS_DIR_OWNED
 S=$HARNESS_DIR
 mkdir -p "$S"
 RD_PID=${RD_PID:-}
-# a script which owns its scratch directory (lib.sh made it) removes it at exit; a caller's HARNESS_DIR is theirs
-remove_owned_harness_dir_at_exit() { [[ ${HARNESS_DIR_OWNED:-0} == 1 ]] && trap 'rm -rf "$S"' EXIT; return 0; }
+# a script which owns its scratch directory (lib.sh made it) removes it at exit; a caller's HARNESS_DIR is theirs.
+# zsh runs the EXIT trap in subshells too (the `( nohup ... & )` which starts an instance would remove the
+# directory under the instance), so the trap acts only in the shell which set it (its real pid; `$$` is the
+# main shell's in subshells as well).
+zmodload zsh/system 2>/dev/null
+HARNESS_OWNER_PID=${sysparams[pid]:-$$}
+remove_owned_harness_dir_at_exit() { [[ ${HARNESS_DIR_OWNED:-0} == 1 ]] && trap '[[ ${sysparams[pid]:-$$} == $HARNESS_OWNER_PID ]] && rm -rf "$S"' EXIT; return 0; }
 
 # -- the instance ----------------------------------------------------------------------------------
 # ipc <command...>: any `raddbg --ipc` command against the instance on $P; the reply (and errors) on stdout
