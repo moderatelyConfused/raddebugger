@@ -108,20 +108,44 @@ rd_test__ipc_cmd(Arena *arena, TestCtx *ctx, U64 ipc_port, String8 string)
 ////////////////////////////////
 //~ rjf: Exemplar Test Helpers
 
+// NOTE: the exemplar of a test is looked up in the tree first
+// (`src/raddbg/tests/exemplars/<test>/exemplar_<os>`, committed, so that a fresh checkout
+// compares against a reviewed baseline), then under `local/test_data/exemplars/<test>/`
+// (`ctx->exemplars_path`; the downloaded upstream exemplars, and the place a first run
+// records a new one). A test whose exemplar exists nowhere records the current run there
+// and is *skipped*, with a message naming the file: a run compared against nothing is not a
+// pass, and the recording has to be inspected before it is trusted (`*created_out` = 1;
+// the caller skips after its own cleanup, `TestSkip` returns from the function it is in).
+internal String8
+rd_test__in_tree_exemplar_path(Arena *arena, TestCtx *ctx, String8 file_name)
+{
+  String8 root_path = str8_chop_last_slash(get_process_info()->binary_path);
+  String8 test_label = str8_skip_last_slash(ctx->exemplars_path);
+  String8 path = str8f(arena, "%S/src/raddbg/tests/exemplars/%S/%S", root_path, test_label, file_name);
+  return path;
+}
+
 internal void
-rd_test__exemplar_test_finish(Arena *arena, TestCtx *ctx, String8List test_log_strings)
+rd_test__exemplar_test_finish(Arena *arena, TestCtx *ctx, String8List test_log_strings, B32 *created_out)
 {
   Temp scratch = scratch_begin(&arena, 1);
-  
+
   // rjf: combine all current test log output; write to 'current' data
   String8 test_log_current = str8_list_join(scratch.arena, &test_log_strings, 0);
   String8 test_log_current_path = str8f(scratch.arena, "%S/current", ctx->artifacts_path);
   write_data_to_file_path(test_log_current_path, test_log_current);
-  
-  // rjf: load test log exemplar
-  make_directory(ctx->exemplars_path);
-  String8 exemplar_path = str8f(scratch.arena, "%S/exemplar_%S", ctx->exemplars_path, lower_from_str8(scratch.arena, string_from_operating_system(OperatingSystem_CURRENT)));
+
+  // rjf: load test log exemplar: in-tree first, then local/
+  String8 exemplar_file_name = str8f(scratch.arena, "exemplar_%S", lower_from_str8(scratch.arena, string_from_operating_system(OperatingSystem_CURRENT)));
+  String8 in_tree_exemplar_path = rd_test__in_tree_exemplar_path(scratch.arena, ctx, exemplar_file_name);
+  String8 local_exemplar_path = str8f(scratch.arena, "%S/%S", ctx->exemplars_path, exemplar_file_name);
+  String8 exemplar_path = in_tree_exemplar_path;
   String8 exemplar_data = data_from_file_path(scratch.arena, exemplar_path);
+  if(exemplar_data.size == 0)
+  {
+    exemplar_path = local_exemplar_path;
+    exemplar_data = data_from_file_path(scratch.arena, exemplar_path);
+  }
   B32 exemplar_exists = (exemplar_data.size != 0);
   String8List exemplar_data_lines = str8_split(scratch.arena, exemplar_data, (U8 *)"\n", 1, StringSplitFlag_KeepEmpties);
   String8List exemplar_data_lines_sanitized = {0};
@@ -136,12 +160,19 @@ rd_test__exemplar_test_finish(Arena *arena, TestCtx *ctx, String8List test_log_s
   }
   exemplar_data = str8_list_join(scratch.arena, &exemplar_data_lines_sanitized, &(StringJoin){.sep = s("\n"), .post = s("\n")});
   
-  // rjf: if exemplar data is empty -> just save our output as the new exemplar
+  // rjf: no exemplar anywhere -> record this run under local/ and skip (see the note above)
   if(!exemplar_exists)
   {
-    copy_file_path(exemplar_path, test_log_current_path);
+    make_directory(ctx->exemplars_path);
+    copy_file_path(local_exemplar_path, test_log_current_path);
+    test_outf("exemplar created from this run: %S\n", path_normalized_from_string(scratch.arena, local_exemplar_path));
+    test_outf("inspect it, then re-run (it is compared from now on); a reviewed copy belongs in the tree at %S\n", path_normalized_from_string(scratch.arena, in_tree_exemplar_path));
+    if(created_out != 0)
+    {
+      created_out[0] = 1;
+    }
   }
-  
+
   // rjf: if we have exemplar data, then we need to check that it matches
   if(exemplar_exists)
   {
@@ -185,23 +216,33 @@ rd_test__build_debuggee(Arena *arena, TestCtx *ctx, String8 source_name)
 ////////////////////////////////
 //~ rjf: Test Helpers
 
+// NOTE: `record_voffs`: the prebuilt test inputs are fixed binaries, so their logs record each
+// stop's `lines` dump, `ip_voff` and symbol, as the downloaded exemplars do. A debuggee compiled
+// on the fly by the host compiler has no stable code layout (its voffs move with the compiler
+// version and its line ranges with the codegen), so those tests record what the stepping is
+// about and what the source fixes: the stop's symbol and its lines (`file:line`, every inline
+// frame, outermost first). A stop without line info is recorded as such, so a step which lands
+// in a stub or in dyld still differs from the exemplar.
 internal void
-rd_test__stepping_regressions_from_binary(Arena *arena, TestCtx *ctx, String8 binary_path, String8 start_symbol, B32 step_over_on_even)
+rd_test__stepping_regressions_from_binary(Arena *arena, TestCtx *ctx, String8 binary_path, String8 start_symbol, B32 step_over_on_even, B32 record_voffs)
 {
   Temp scratch = scratch_begin(&arena, 1);
   Arena *iter_arena = arena_alloc(); // NOTE: a third scratch would alias `arena` (the test output's)
   String8List test_log_strings = {0};
   String8 target_binary = str8_chop_last_dot(str8_skip_last_slash(binary_path));
-  
+  B32 exemplar_created = 0;
+
   // rjf: start debugger
   {
     U64 ipc_port = rd_test__ipc_port(ctx);
     Process debugger = rd_test__open_debugger(ctx, ipc_port, binary_path);
-    
+
     // rjf: step & gather info
     B32 timed_out = 0;
     {
       U64 last_stop_count = max_U64;
+      U64 last_run_gen = max_U64;
+      U64 idle_polls_since_cmd = 0;
       B32 ready_for_next_operation = 0;
       B32 saw_process = 0;
       U64 deadline_us = now_time_us() + 300000000;
@@ -235,6 +276,7 @@ rd_test__stepping_regressions_from_binary(Arena *arena, TestCtx *ctx, String8 bi
           (void)step_response;
           test_outf("command %I64u: %S\n", cmd_idx, step_cmd);
           last_cmd_us = now_time_us();
+          idle_polls_since_cmd = 0;
           cmd_idx += 1;
         }
         
@@ -286,14 +328,40 @@ rd_test__stepping_regressions_from_binary(Arena *arena, TestCtx *ctx, String8 bi
           
           // rjf: a step the debugger could not perform (step out of the outermost
           // frame, once `main` has returned into dyld) leaves the thread stopped
-          // where it was: let the process run to its end
+          // where it was: let the process run to its end.
+          //
+          // Detected from the state, not from a fixed time: the frame which handles an
+          // `--ipc` command replies after it ran (`update()` in raddbg_main.c), and the
+          // engine marks the thread running (`running: 1`) on the user thread in the frame
+          // which dispatches a run, so a step which runs is visible as `running: 1`, a new
+          // `run_gen` or a new `stop_count` in the first `state` after the reply. The one
+          // legitimate reason for `running: 0` with nothing changed is a *deferred* step: a
+          // trap net the engine could not build yet is retried for up to 100 frames
+          // (`retry_idx`, dbg_engine_user.c) before it gives up. Every `state` command
+          // renders a frame, so counting the idle polls bounds that deferral in frames
+          // (twice the engine's budget), whatever the machine's load; a 30 s wall-clock
+          // ceiling remains as the backstop (the old fixed 3 s fired early on a loaded
+          // machine, making the exemplar depend on the timing).
           U64 running = 0;
+          U64 run_gen = 0;
           try_u64_from_str8_c_rules(md_child_from_string(state, s("running"), 0)->first->string, &running);
-          if(!ready_for_next_operation && !process_exited && running == 0 && last_cmd_us != 0 && now_time_us() - last_cmd_us > 3000000)
+          try_u64_from_str8_c_rules(md_child_from_string(state, s("run_gen"), 0)->first->string, &run_gen);
+          if(ready_for_next_operation || running != 0 || run_gen != last_run_gen)
           {
-            test_outf("command %I64u did not run the thread; continuing the process\n", cmd_idx-1);
+            idle_polls_since_cmd = 0;
+          }
+          else if(last_cmd_us != 0)
+          {
+            idle_polls_since_cmd += 1;
+          }
+          last_run_gen = run_gen;
+          if(!ready_for_next_operation && !process_exited && running == 0 && last_cmd_us != 0 &&
+             (idle_polls_since_cmd >= 200 || now_time_us() - last_cmd_us > 30000000))
+          {
+            test_outf("command %I64u did not run the thread (%I64u idle state polls); continuing the process\n", cmd_idx-1, idle_polls_since_cmd);
             rd_test__ipc_cmd(scratch2.arena, ctx, ipc_port, s("run"));
             last_cmd_us = now_time_us();
+            idle_polls_since_cmd = 0;
           }
         }
         
@@ -310,12 +378,31 @@ rd_test__stepping_regressions_from_binary(Arena *arena, TestCtx *ctx, String8 bi
             MD_Node *lines = md_child_from_string(state, s("lines"), 0);
             MD_Node *ip_voff = md_child_from_string(state, s("ip_voff"), 0);
             MD_Node *ip_voff_symbol = md_child_from_string(state, s("ip_voff_symbol"), 0);
-            String8 lines_dump = md_string_from_tree(scratch.arena, lines);
-            String8 ip_voff_dump = md_string_from_tree(scratch.arena, ip_voff);
-            String8 ip_voff_symbol_dump = md_string_from_tree(scratch.arena, ip_voff_symbol);
-            str8_list_push(scratch.arena, &test_log_strings, lines_dump);
-            str8_list_push(scratch.arena, &test_log_strings, ip_voff_dump);
-            str8_list_push(scratch.arena, &test_log_strings, ip_voff_symbol_dump);
+            if(record_voffs)
+            {
+              String8 lines_dump = md_string_from_tree(scratch.arena, lines);
+              String8 ip_voff_dump = md_string_from_tree(scratch.arena, ip_voff);
+              String8 ip_voff_symbol_dump = md_string_from_tree(scratch.arena, ip_voff_symbol);
+              str8_list_push(scratch.arena, &test_log_strings, lines_dump);
+              str8_list_push(scratch.arena, &test_log_strings, ip_voff_dump);
+              str8_list_push(scratch.arena, &test_log_strings, ip_voff_symbol_dump);
+            }
+            else
+            {
+              // rjf: one line per stop: `stop: <symbol> @ <file>:<line>[ > <file>:<line> ...]`
+              // (the `lines` entries, outermost call site first), or `@ (no line info)`
+              String8List line_locs = {0};
+              for MD_EachNode(line, lines->first)
+              {
+                String8 file_name = md_child_from_string(line, s("file_name"), 0)->first->string;
+                String8 line_num = md_child_from_string(line, s("line_num"), 0)->first->string;
+                str8_list_pushf(scratch.arena, &line_locs, "%S:%S", str8_skip_last_slash(file_name), line_num);
+              }
+              String8 locs = (line_locs.node_count != 0
+                              ? str8_list_join(scratch.arena, &line_locs, &(StringJoin){.sep = s(" > ")})
+                              : s("(no line info)"));
+              str8_list_pushf(scratch.arena, &test_log_strings, "stop: %S @ %S\n", ip_voff_symbol->first->string, locs);
+            }
           }
         }
         
@@ -353,11 +440,17 @@ rd_test__stepping_regressions_from_binary(Arena *arena, TestCtx *ctx, String8 bi
     // rjf: end exemplar test (a run which never stopped in the target is not a baseline)
     TestCheck(!timed_out);
     TestCheck(test_log_strings.node_count != 0);
-    rd_test__exemplar_test_finish(arena, ctx, test_log_strings);
+    rd_test__exemplar_test_finish(arena, ctx, test_log_strings, &exemplar_created);
   }
-  
+
   arena_release(iter_arena);
   scratch_end(scratch);
+
+  // rjf: a first run recorded the exemplar: not a pass (see rd_test__exemplar_test_finish)
+  if(exemplar_created)
+  {
+    TestSkip();
+  }
 }
 
 internal void
@@ -375,12 +468,12 @@ rd_test__stepping_regressions(Arena *arena, TestCtx *ctx, String8 target_binary,
     TestSkip();
   }
   
-  // rjf: otherwise run
+  // rjf: otherwise run (a fixed binary: voffs are part of the record)
   else
   {
-    rd_test__stepping_regressions_from_binary(arena, ctx, binary_path, start_symbol, step_over_on_even);
+    rd_test__stepping_regressions_from_binary(arena, ctx, binary_path, start_symbol, step_over_on_even, 1);
   }
-  
+
   scratch_end(scratch);
 }
 
@@ -389,7 +482,8 @@ rd_test__built_debuggee_stepping_regressions(Arena *arena, TestCtx *ctx, String8
 {
   String8 binary_path = rd_test__build_debuggee(arena, ctx, source_name);
   TestCheck(binary_path.size != 0);
-  rd_test__stepping_regressions_from_binary(arena, ctx, binary_path, start_symbol, step_over_on_even);
+  // rjf: compiled by the host compiler: lines and symbols only (see rd_test__stepping_regressions_from_binary)
+  rd_test__stepping_regressions_from_binary(arena, ctx, binary_path, start_symbol, step_over_on_even, 0);
 }
 
 internal void
@@ -469,12 +563,20 @@ rd_test__eval_regressions(Arena *arena, TestCtx *ctx, String8 target_binary, Str
     }
     
     // rjf: end exemplar test
-    rd_test__exemplar_test_finish(arena, ctx, test_log_strings);
-    
+    B32 exemplar_created = 0;
+    rd_test__exemplar_test_finish(arena, ctx, test_log_strings, &exemplar_created);
+
     // rjf: close debugger
     rd_test__close_debugger(debugger);
+
+    // rjf: a first run recorded the exemplar: not a pass
+    if(exemplar_created)
+    {
+      scratch_end(scratch);
+      TestSkip();
+    }
   }
-  
+
   scratch_end(scratch);
 }
 

@@ -184,15 +184,37 @@ t_run_caller(void *raw_ctx)
     LogScopeResult log_scope_result = log_scope_end(scratch.arena);
     if(log_scope_result.strings[LogMsgKind_Info].size != 0)
     {
+      // rjf: the exemplar is looked up in the tree first (`src/<layer>/tests/exemplars/<test>/`,
+      // committed and reviewed), then under local/test_data/exemplars/<test>/ (downloaded, or
+      // recorded by a first run). A test without any exemplar records this run under local/
+      // and is skipped with a message: a run compared against nothing is not a pass.
       String8 current_path = str8f(scratch.arena, "%S/current", g_wdir);
-      String8 exemplar_path = str8f(scratch.arena, "%S/exemplar_%S_%S", g_exemplar_dir, lower_from_str8(scratch.arena, string_from_operating_system(OperatingSystem_CURRENT)), lower_from_str8(scratch.arena, string_from_arch(Arch_CURRENT)));
+      String8 exemplar_file_name = str8f(scratch.arena, "exemplar_%S_%S", lower_from_str8(scratch.arena, string_from_operating_system(OperatingSystem_CURRENT)), lower_from_str8(scratch.arena, string_from_arch(Arch_CURRENT)));
+      String8 root_dir_path = str8_chop_last_slash(get_process_info()->binary_path);
+      String8 in_tree_exemplar_path = str8f(scratch.arena, "%S/src/%S/tests/exemplars/%S/%S", root_dir_path, ctx->test->layer, ctx->test->label, exemplar_file_name);
+      String8 local_exemplar_path = str8f(scratch.arena, "%S/%S", g_exemplar_dir, exemplar_file_name);
       String8 current = log_scope_result.strings[LogMsgKind_Info];
+      String8 exemplar_path = in_tree_exemplar_path;
       String8 exemplar = data_from_file_path(scratch.arena, exemplar_path);
+      if(exemplar.size == 0)
+      {
+        exemplar_path = local_exemplar_path;
+        exemplar = data_from_file_path(scratch.arena, exemplar_path);
+      }
       write_data_to_file_path(current_path, current);
       if(exemplar.size == 0)
       {
+        // TODO(rjf): @hack, see below
+        TestCtx *ctx = &test_ctx;
+        Arena *arena = scratch.arena;
         make_directory(g_exemplar_dir);
-        copy_file_path(exemplar_path, current_path);
+        copy_file_path(local_exemplar_path, current_path);
+        test_outf("exemplar created from this run: %S\n", path_normalized_from_string(scratch.arena, local_exemplar_path));
+        test_outf("inspect it, then re-run (it is compared from now on); a reviewed copy belongs in the tree at %S\n", path_normalized_from_string(scratch.arena, in_tree_exemplar_path));
+        if(ctx->result_out->status == TestStatus_Pass)
+        {
+          ctx->result_out[0] = (TestResult){.status = TestStatus_Skip};
+        }
       }
       else
       {
@@ -243,7 +265,13 @@ t_run_caller(void *raw_ctx)
       t_errorf("%S\n", g_output);
     }
   }
-  
+  // rjf: a skipped test's own messages (why it skipped: an exemplar it just recorded, say)
+  else if (ctx->result.status == TestStatus_Skip) {
+    for EachNode(n, String8Node, test_out.first) {
+      t_errorf("  %S", n->string);
+    }
+  }
+
   scratch_end(scratch);
 }
 
