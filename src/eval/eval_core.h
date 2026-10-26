@@ -792,6 +792,9 @@ struct E_BaseCtx
   Arch thread_arch;
   U64 thread_unwind_count;
   
+  // rjf: deadline for asynchronous debug info name matches (0: do not wait for one)
+  U64 dbgi_match_endt_us;
+  
   // rjf: debug infos
   E_DbgInfo *dbg_infos;
   U64 dbg_infos_count;

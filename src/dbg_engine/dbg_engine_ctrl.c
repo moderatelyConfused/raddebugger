@@ -3949,6 +3949,13 @@ d_ctrl_thread__eval_scope_begin(Arena *arena, D_BreakpointList *user_bps, D_Enti
     ctx->thread_reg_space.u64_0 = (U64)thread;
     ctx->thread_process_space = e_space_make(D_EvalSpaceKind_Entity);
     ctx->thread_process_space.u64_0 = (U64)process;
+
+    //- rjf: fill name match deadline. names in expression breakpoints and conditions are
+    // resolved through the asynchronous debug info search, which the frontend only ever polls;
+    // this thread has waited for the RDIs above, so it waits for the search too (a trap for a
+    // name the search has not seen yet would otherwise never be placed). the budget is per
+    // scope; it is only ever reached with the async workers swamped.
+    ctx->dbgi_match_endt_us = now_time_us() + 5000000;
     
     //- rjf: fill debug infos
     ctx->dbg_infos        = eval_dbg_infos;
