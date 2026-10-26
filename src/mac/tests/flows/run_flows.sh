@@ -17,6 +17,8 @@
 # (wait_stop / wait_exit). Scenario names: F* = stepping/inline-frame review, D* = demon review,
 # U* = unwinder review (see the coordinator's lists); the rest are the feature flows.
 set +e
+zmodload zsh/datetime
+now_ms() { printf '%.0f' $(( EPOCHREALTIME * 1000 )); }
 here=$(cd "$(dirname ${(%):-%x})" && pwd)
 repo=$(cd "$here/../../../.." && pwd)
 export IPC_PORT=${IPC_PORT:-7500}
@@ -555,7 +557,11 @@ scenario_eval_O0() {
   check outer_pt "{10, 20}" "$(ev pt | sed 's/  */ /g')"
   check outer_arr "[10, 20, 30]" "$(ev arr | sed 's/  */ /g')"
   check_match outer_str '"frame-string"' "$(ev str)"
-  note "outer frame pointer reads: rec->name='$(ev 'rec->name')' (*rec).name='$(ev '(*rec).name')' rec->pt.y=$(ev 'rec->pt.y') (expected \"rec\", \"rec\", 4)"
+  # the first expression to touch g_record's page can read "" before the asynchronous page read
+  # lands (the scripting caveat above), whichever form it is; `(*rec).name` goes first here so the
+  # `->` form is checked once the page is in
+  note "outer frame pointer reads (first touch of g_record's page): (*rec).name='$(ev '(*rec).name')' rec->name='$(ev 'rec->name')' (expected \"rec\" twice)"
+  check_match outer_rec_name '"rec"' "$(ev 'rec->name')"
   check outer_rec_pt_y 4 "$(ev 'rec->pt.y')"
   check outer_arr2 30 "$(ev 'arr[2]')"
   check outer_sizeof_pt 8 "$(ev 'sizeof(pt)')"
@@ -581,11 +587,56 @@ scenario_eval_O0() {
   check watched 10 "$(ev g_watched)"
   check arithmetic 15 "$(ev 'a + 5')"
   check bad_expr_msgs_nonempty 1 "$([[ -n "$(ev_msgs no_such_symbol_xyz)" ]] && echo 1 || echo 0)"
+  # chained prefix unary operators (`*&a`, `!!a`), and the address of a global as an integer:
+  # `cast(T)expr` and `(T)(expr)` work; `(uint64)&g` parses as `uint64 & g` (the evaluator's
+  # C-style cast rule gives up when a prefix operator follows, see eval_parse.c) and reads 0
+  check chained_prefix_unary 10 "$(ev '*&a')"
+  check chained_prefix_unary_not true "$(ev '!!a')"
+  check_match global_addr_cast '^[1-9][0-9]+$' "$(ev 'cast(uint64)&g_counter')"
+  check_match global_addr_cast_paren '^[1-9][0-9]+$' "$(ev '(uint64)(&g_counter)')"
+  check global_addr_cast_deref 15 "$(ev '*&g_counter')"
+  note "eval of '(uint64)&g_counter' (parsed as a binary and): '$(ev '(uint64)&g_counter')'; '&g_counter' prints its pointee over --ipc (disable_addresses): '$(ev '&g_counter')'"
   st=$(go_cmd step_out); check_stop out_to_locals_frame "$st" $D/basic.c locals_call
   check after_stepout_b 20 "$(ev b)"
   check after_stepout_r_type "int" "$(ev_type r)"
   st=$(go_cmd step_over); check_stop locals_after "$st" $D/basic.c locals_after
   check r_after 11 "$(ev r)"
+  finish
+}
+
+# breakpoint resolution while a large debug info is being converted: the control thread resolves
+# expression breakpoints through the asynchronous name search with a per-scope deadline (see
+# README, "Evaluation"); a step with a breakpoint on a name no debug info has must not wait for
+# the conversion (nor plateau at the 5 s budget), and a breakpoint on a name of the module being
+# converted, added while it converts, must hit on the first run after the conversion (the match
+# computed during the conversion is stale by then; the control thread waits for a fresh one)
+scenarios+=(bp_resolution_converting)
+scenario_bp_resolution_converting() {
+  local rdi=$B/big_symbols.dSYM/Contents/Resources/DWARF/big_symbols.rdi
+  rm -f $rdi
+  local t_launch=$(now_ms)
+  begin bp_resolution_converting $B/big_symbols spin || return
+  local src=$B/big_symbols.c
+  ipc "add_function_breakpoint no_such_symbol_xyz" >/dev/null
+  ipc "add_function_breakpoint big_fn_1" >/dev/null
+  local max_ms=0 steps=0 converted_at="not during the steps" t0 t1 st
+  for i in $(seq 1 6); do
+    t0=$(now_ms); st=$(go_cmd step_over); t1=$(now_ms)
+    (( t1 - t0 > max_ms )) && max_ms=$(( t1 - t0 ))
+    steps=$(( steps + 1 ))
+    [[ -f $rdi && "$converted_at" == "not during the steps" ]] && converted_at="step $i ($(( t1 - t_launch )) ms after launch)"
+    [[ "$(process_count "$st")" == "0" ]] && break
+  done
+  note "bp_resolution_converting: $steps steps over with a breakpoint on an unknown name, slowest $max_ms ms; the .rdi appeared: $converted_at"
+  check steps_not_waiting_for_conversion 1 "$(( max_ms < 2500 ? 1 : 0 ))"
+  check process_alive_after_steps 1 "$(process_count "$st")"
+  # the conversion: wait for the .rdi (up to 60 s) and its load, then a run must hit big_fn_1
+  for i in $(seq 1 600); do [[ -f $rdi ]] && break; sleep 0.1; done
+  check rdi_converted 1 "$([[ -f $rdi ]] && echo 1 || echo 0)"
+  sleep 1
+  t0=$(now_ms); st=$(run_stop); t1=$(now_ms)
+  check bp_added_during_conversion_hits "big_fn_1" "$(stop_symbol "$st")"
+  note "bp_resolution_converting: the run after the conversion stopped after $(( t1 - t0 )) ms at $(stop_symbol "$st") $(stop_file_line "$st")"
   finish
 }
 
@@ -840,7 +891,8 @@ scenario_F4a_inline_recursion_O2() {
   check F4a_step_over_line "$(tag_loc $src f_after)" "$(stop_selected_line "$st")"
   check F4a_step_over_sym "g" "$(stop_symbol "$st")"
   check F4a_step_over_depth 1 "$(field "$st" inline_depth)"
-  note "F4a: r after the recursion (register-located at -O2): '$(ev r)' (msgs: $(ev_msgs r)); expected 7"
+  # r lives in x0 here (`DW_OP_reg0`); DWARF register 0 used to map to the nil register (see README)
+  check F4a_r_in_x0 7 "$(ev r)"
   note "F4a after step over: $(stop_file_line "$st") depth $(field "$st" inline_depth) stack: $(call_stack "$st" | tr '\n' ' ')"
   finish
 }
@@ -894,7 +946,13 @@ scenario_F6_visit_qsort_O2() {
   begin F6_visit_qsort_O2 $B/visit_qsort_O2 || return
   local src=$D/visit_qsort.c; bp_tag $src visit_line >/dev/null
   local st=$(run_stop); check_stop at_visit_line "$st" $src visit_line
-  note "F6: node at the breakpoint (register-located at -O2): node='$(ev node)' node->value='$(ev 'node->value')' msgs: $(ev_msgs 'node->value')"
+  # the first hit is in the copy of visit inlined into main (root): clang describes only `sum`
+  # there (`DW_OP_consts 10, DW_OP_stack_value`), `node` has no DWARF entry in that instance, so
+  # "could not be found" is the right answer; the later hits (visit inlined into the block, node
+  # in x22) read it
+  check F6_inlined_in_main 1 "$(field "$st" inline_depth)"
+  check F6_sum_constant_location 10 "$(ev sum)"
+  note "F6: node at the first hit (main's inlined visit, not described by the DWARF): node='$(ev node)' msgs: $(ev_msgs node)"
   local sp0=$(ev sp)
   ipc clear_breakpoints >/dev/null
   st=$(go_cmd step_into)

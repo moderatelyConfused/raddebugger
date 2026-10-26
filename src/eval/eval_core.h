@@ -792,8 +792,15 @@ struct E_BaseCtx
   Arch thread_arch;
   U64 thread_unwind_count;
   
-  // rjf: deadline for asynchronous debug info name matches (0: do not wait for one)
+  // rjf: deadline for asynchronous debug info name matches (0: do not wait for one). an
+  // absolute time, set once per context: every lookup waits until the same instant, so an
+  // evaluation with several unknown names pays the budget once, not once per name
   U64 dbgi_match_endt_us;
+
+  // rjf: when set, a name match computed before the last debug info load is waited on (within
+  // the deadline) instead of being used as it is; the control thread sets it for breakpoint
+  // and condition resolution, the frontend polls
+  B32 dbgi_match_wait_for_fresh;
   
   // rjf: debug infos
   E_DbgInfo *dbg_infos;

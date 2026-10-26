@@ -621,7 +621,7 @@ e_leaf_type_key_from_name(String8 name)
   E_TypeKey key = e_leaf_builtin_type_key_from_name(name);
   if(!e_type_key_match(e_type_key_zero(), key))
   {
-    DI_Match match = di_match_from_string(name, 0, 0, 1, e_base_ctx->primary_dbg_info->dbgi_key, e_base_ctx->dbgi_match_endt_us);
+    DI_Match match = di_match_from_string_flags(name, 0, 0, 1, e_base_ctx->primary_dbg_info->dbgi_key, e_base_ctx->dbgi_match_endt_us, e_base_ctx->dbgi_match_wait_for_fresh ? AC_Flag_WaitForFresh : 0);
     if(match.section_kind == RDI_SectionKind_TypeNodes)
     {
       Access *access = access_open();
@@ -735,8 +735,7 @@ e_push_parse_from_string_tokens__prec(Arena *arena, String8 text, E_TokenArray t
       Rng1U64 range;
       E_Expr *cast_type_expr;
     };
-    PrefixUnaryTask *first_prefix_unary = 0;
-    PrefixUnaryTask *last_prefix_unary = 0;
+    PrefixUnaryTask *first_prefix_unary = 0; // innermost (the last one consumed) first
     E_Expr *atom = &e_expr_nil;
     B32 atom_is_maybe_cast = 0;
     for(B32 done = 0; !done && it < it_opl;)
@@ -829,15 +828,19 @@ e_push_parse_from_string_tokens__prec(Arena *arena, String8 text, E_TokenArray t
           end_cast_parse:;
         }
         
-        // rjf: push prefix unary if we got one
+        // rjf: push prefix unary if we got one. prefix unaries chain (`*&x`, `!!x`,
+        // `cast(T)&x`, `**pp`): the one consumed here is the innermost so far, so it goes
+        // to the front of the list, and the next iteration looks for another one before
+        // it tries to parse the atom.
         if(prefix_unary_precedence != 0)
         {
           PrefixUnaryTask *prefix_unary_task = push_array(scratch.arena, PrefixUnaryTask, 1);
           prefix_unary_task->kind = prefix_unary_kind;
           prefix_unary_task->range = token.range;
           prefix_unary_task->cast_type_expr = prefix_unary_cast_expr;
-          SLLQueuePush(first_prefix_unary, last_prefix_unary, prefix_unary_task);
+          SLLStackPush(first_prefix_unary, prefix_unary_task);
           it += 1;
+          continue;
         }
       }
       
@@ -1174,7 +1177,7 @@ e_push_parse_from_string_tokens__prec(Arena *arena, String8 text, E_TokenArray t
           prefix_unary_task->kind = E_ExprKind_Cast;
           prefix_unary_task->range = maybe_cast->range;
           prefix_unary_task->cast_type_expr = maybe_cast;
-          SLLQueuePush(first_prefix_unary, last_prefix_unary, prefix_unary_task);
+          SLLStackPush(first_prefix_unary, prefix_unary_task);
         }
       }
       
@@ -1366,7 +1369,8 @@ e_push_parse_from_string_tokens__prec(Arena *arena, String8 text, E_TokenArray t
     }
     
     ////////////////////////////
-    //- rjf: upgrade `atom` w/ previously parsed prefix unaries
+    //- rjf: upgrade `atom` w/ previously parsed prefix unaries (innermost first, so that
+    // `*&x` becomes Deref(Address(x)))
     //
     if(atom != &e_expr_nil)
     {
@@ -1391,7 +1395,7 @@ e_push_parse_from_string_tokens__prec(Arena *arena, String8 text, E_TokenArray t
     }
     else if(first_prefix_unary != 0)
     {
-      e_msgf(arena, &result.msgs, E_MsgKind_MalformedInput, last_prefix_unary->range, "Missing expression.");
+      e_msgf(arena, &result.msgs, E_MsgKind_MalformedInput, first_prefix_unary->range, "Missing expression.");
     }
     
     ////////////////////////////
