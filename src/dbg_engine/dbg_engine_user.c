@@ -277,6 +277,110 @@ d_cmd_list_push_new(Arena *arena, D_CmdList *cmds, D_CmdKind kind, D_CmdParams *
 // - for any instructions which may change the stack pointer, traps are placed
 //     at them with the "save-stack-pointer | single-step-after" behaviors.
 
+//- rjf: code lookups for trap net construction
+
+// does the code at vaddr have line info? (false for code outside every module too)
+internal B32
+d_line_info_exists_from_vaddr(D_Entity *process, U64 vaddr)
+{
+  B32 result = 0;
+  D_Entity *module = d_module_from_process_vaddr(process, vaddr);
+  if(module != &d_entity_nil)
+  {
+    Temp scratch = scratch_begin(0, 0);
+    D_Entity *dbg_path = d_entity_child_from_kind(module, D_EntityKind_DebugInfoPath);
+    DI_Key dbgi_key = d_dbgi_key_from_debug_info_path(dbg_path);
+    D_LineList lines = d_lines_from_dbgi_key_path_voff(scratch.arena, dbgi_key, dbg_path->string, d_voff_from_vaddr(module, vaddr));
+    result = (lines.count != 0);
+    scratch_end(scratch);
+  }
+  return result;
+}
+
+// do two addresses lie in the same function? (the same module's RDI puts them in scopes of
+// the same procedure; without debug info for either, nothing says otherwise)
+internal B32
+d_vaddrs_in_same_function(D_Entity *process, U64 vaddr_a, U64 vaddr_b)
+{
+  B32 result = 0;
+  D_Entity *module = d_module_from_process_vaddr(process, vaddr_a);
+  if(module != &d_entity_nil && module == d_module_from_process_vaddr(process, vaddr_b))
+  {
+    Access *access = access_open();
+    RDI_Parsed *rdi = di_rdi_from_key(access, d_dbgi_key_from_module(module), 1, 0);
+    RDI_Scope *scope_a = rdi_scope_from_voff(rdi, d_voff_from_vaddr(module, vaddr_a));
+    RDI_Scope *scope_b = rdi_scope_from_voff(rdi, d_voff_from_vaddr(module, vaddr_b));
+    result = (scope_a->proc_idx == scope_b->proc_idx);
+    access_close(access);
+  }
+  return result;
+}
+
+// the function a stub at vaddr jumps to, or 0 if the code there is not a stub
+//
+// a call to a function of another image, or to a weak symbol, goes through a stub (Mach-O
+// `__stubs`, the PLT) which loads the function's address from a pointer slot the loader
+// bound, and jumps to it: `adrp x16, page; ldr x16, [x16, #off]; br x16` on arm64,
+// `jmp [rip+disp]` on x64. the stub has no line info; the function it jumps to may.
+internal U64
+d_stub_target_from_vaddr(D_Entity *process, Arch arch, U64 vaddr)
+{
+  U64 result = 0;
+  Temp scratch = scratch_begin(0, 0);
+  U64 read_endt_us = now_time_us() + 10000;
+  U64 slot_vaddr = 0;
+  switch(arch)
+  {
+    default:{}break;
+    case Arch_arm64:
+    {
+      D_ProcessMemorySlice code = d_process_memory_slice_from_vaddr_range(scratch.arena, process->handle, r1u64(vaddr, vaddr+12), 1, read_endt_us);
+      if(code.data.size >= 12 && !code.any_byte_bad)
+      {
+        U32 adrp = *(U32 *)(code.data.str+0);
+        U32 ldr  = *(U32 *)(code.data.str+4);
+        U32 br   = *(U32 *)(code.data.str+8);
+        if((adrp & 0x9F000000) == 0x90000000 && // adrp Xd, page:      1 immlo:2 10000 immhi:19 Rd:5
+           (ldr  & 0xFFC00000) == 0xF9400000 && // ldr Xt, [Xn, #imm]: 1111100101 imm12:12 Rn:5 Rt:5 (imm12 * 8)
+           (br   & 0xFFFFFC1F) == 0xD61F0000)   // br Xn:              1101011000011111000000 Rn:5 00000
+        {
+          U32 adrp_rd = (adrp & 0x1F);
+          U32 ldr_rn  = (ldr >> 5) & 0x1F;
+          U32 ldr_rt  = (ldr & 0x1F);
+          U32 br_rn   = (br >> 5) & 0x1F;
+          if(adrp_rd == ldr_rn && ldr_rt == br_rn)
+          {
+            S64 imm21 = (S64)((((adrp >> 5) & 0x7FFFF) << 2) | ((adrp >> 29) & 0x3));
+            imm21 = (imm21 << 43) >> 43;
+            U64 page = (vaddr & ~0xFFFull) + (U64)(imm21 << 12);
+            slot_vaddr = page + ((ldr >> 10) & 0xFFF) * 8;
+          }
+        }
+      }
+    }break;
+    case Arch_x64:
+    {
+      D_ProcessMemorySlice code = d_process_memory_slice_from_vaddr_range(scratch.arena, process->handle, r1u64(vaddr, vaddr+6), 1, read_endt_us);
+      if(code.data.size >= 6 && !code.any_byte_bad && code.data.str[0] == 0xFF && code.data.str[1] == 0x25)
+      {
+        S32 disp = 0;
+        MemoryCopy(&disp, code.data.str+2, 4);
+        slot_vaddr = vaddr + 6 + (S64)disp;
+      }
+    }break;
+  }
+  if(slot_vaddr != 0)
+  {
+    D_ProcessMemorySlice slot = d_process_memory_slice_from_vaddr_range(scratch.arena, process->handle, r1u64(slot_vaddr, slot_vaddr+8), 1, read_endt_us);
+    if(slot.data.size >= 8 && !slot.any_byte_bad)
+    {
+      MemoryCopy(&result, slot.data.str, 8);
+    }
+  }
+  scratch_end(scratch);
+  return result;
+}
+
 internal D_TrapNet
 d_trap_net_from_thread__step_over_inst(Arena *arena, D_Entity *thread)
 {
@@ -319,13 +423,29 @@ d_trap_net_from_thread__step_over_inst(Arena *arena, D_Entity *thread)
   return result;
 }
 
-internal D_TrapNet
-d_trap_net_from_thread__step_over_line(Arena *arena, D_Entity *thread, U64 inline_depth)
+//- rjf: the stepped line: the line at the selected inline depth containing ip, its code & control flow
+
+typedef struct D_StepLine D_StepLine;
+struct D_StepLine
+{
+  D_Entity *process;
+  D_Entity *module;
+  DI_Key dbgi_key;
+  U64 ip_vaddr;
+  Rng1U64 vaddr_rng;                // the line's range containing ip, extended across the line's contiguous ranges (and MSVC's JMC ranges)
+  Rng1U64List all_vaddr_ranges;     // every range of the textual line (this one included; each is a piece of the line's code)
+  B32 good_line_info;
+  String8 machine_code;             // the code in vaddr_rng
+  B32 good_machine_code;
+  DASM_CtrlFlowInfo ctrl_flow_info; // its exit points (calls, branches, jumps, returns, stack pointer changes)
+};
+
+internal D_StepLine
+d_step_line_from_thread(Arena *arena, D_Entity *thread, U64 inline_depth)
 {
   Temp scratch = scratch_begin(&arena, 1);
-  log_infof("step_over_line:\n{\n");
-  D_TrapNet result = {0};
-  
+  D_StepLine result = {0};
+
   // rjf: thread => info
   Arch arch = thread->arch;
   U64 ip_vaddr = d_cached_ip_from_thread(thread->handle);
@@ -334,9 +454,13 @@ d_trap_net_from_thread__step_over_line(Arena *arena, D_Entity *thread, U64 inlin
   D_Entity *dbg_path = d_entity_child_from_kind(module, D_EntityKind_DebugInfoPath);
   String8 dbgi_path = dbg_path->string;
   DI_Key dbgi_key = d_dbgi_key_from_debug_info_path(dbg_path);
+  result.process  = process;
+  result.module   = module;
+  result.dbgi_key = dbgi_key;
+  result.ip_vaddr = ip_vaddr;
   log_infof("ip_vaddr: 0x%I64x\n", ip_vaddr);
   log_infof("dbgi_key: {0x%I64x, 0x%I64x}\n", dbgi_key.u64[0], dbgi_key.u64[1]);
-  
+
   // rjf: ip => line info
   String8 file_path = {0};
   S64 line_num = 0;
@@ -367,43 +491,34 @@ d_trap_net_from_thread__step_over_line(Arena *arena, D_Entity *thread, U64 inlin
     log_infof("voff_range: {0x%I64x, 0x%I64x}\n", line_voff_rng.min, line_voff_rng.max);
     log_infof("vaddr_range: {0x%I64x, 0x%I64x}\n", line_vaddr_rng.min, line_vaddr_rng.max);
   }
-  
-  // rjf: gather other ranges on this same textual line, which we don't want to return to
+
+  // rjf: gather all ranges on this same textual line, which we don't want to return to;
+  // the stepped line's own range is one of them (the lookup by file & line may have found
+  // an enclosing call site's range at its address instead)
   Rng1U64List all_vaddr_ranges_on_same_line = {0};
   {
+    B32 has_own_range = 0;
     D_LineList lines = d_lines_from_dbgi_key_file_path_line_num(scratch.arena, dbgi_key, file_path, line_num, max_U64);
     for EachNode(n, D_LineNode, lines.first)
     {
-      Rng1U64 voff_range = n->v.voff_range;
-      Rng1U64 vaddr_range = d_vaddr_range_from_voff_range(module, voff_range);
+      Rng1U64 vaddr_range = d_vaddr_range_from_voff_range(module, n->v.voff_range);
+      B32 is_own_range = (vaddr_range.min == line_vaddr_rng.min && vaddr_range.max == line_vaddr_rng.max);
       // NOTE: a range strictly containing the stepped line's is an enclosing call
       // site of the same file & line (recursive inlining): not this frame's line
-      if(vaddr_range.min <= line_vaddr_rng.min && line_vaddr_rng.max <= vaddr_range.max &&
-         !(vaddr_range.min == line_vaddr_rng.min && vaddr_range.max == line_vaddr_rng.max))
+      if(!is_own_range && vaddr_range.min <= line_vaddr_rng.min && line_vaddr_rng.max <= vaddr_range.max)
       {
         continue;
       }
-      rng1u64_list_push(scratch.arena, &all_vaddr_ranges_on_same_line, vaddr_range);
+      has_own_range = (has_own_range || is_own_range);
+      rng1u64_list_push(arena, &all_vaddr_ranges_on_same_line, vaddr_range);
       log_infof("same_line_range: {%S:%I64i, 0x%I64x, 0x%I64x}\n", n->v.file_path, n->v.pt.line, vaddr_range.min, vaddr_range.max);
-    }
-    
-    // rjf: the stepped line's own range is one of them (the lookup by file & line
-    // may have found an enclosing call site's range at its address instead)
-    B32 has_own_range = 0;
-    for EachNode(n, Rng1U64Node, all_vaddr_ranges_on_same_line.first)
-    {
-      if(n->v.min == line_vaddr_rng.min && n->v.max == line_vaddr_rng.max)
-      {
-        has_own_range = 1;
-        break;
-      }
     }
     if(!has_own_range && line_vaddr_rng.min < line_vaddr_rng.max)
     {
-      rng1u64_list_push(scratch.arena, &all_vaddr_ranges_on_same_line, line_vaddr_rng);
+      rng1u64_list_push(arena, &all_vaddr_ranges_on_same_line, line_vaddr_rng);
     }
   }
-  
+
   // extend trap-net range across contiguous same-source-line, possibly unsorted, ranges
   //
   // TODO: @ns: converter should never produce these ranges in the first place,
@@ -420,7 +535,7 @@ d_trap_net_from_thread__step_over_line(Arena *arena, D_Entity *thread, U64 inlin
       }
     }
   }
-  
+
   // rjf: opl line_vaddr_rng -> 0xf00f00 or 0xfeefee? => include in line vaddr range
   //
   // MSVC exports line info at these line numbers when /JMC (Just My Code) debugging
@@ -433,16 +548,16 @@ d_trap_net_from_thread__step_over_line(Arena *arena, D_Entity *thread, U64 inlin
       line_vaddr_rng.max = d_vaddr_from_voff(module, lines.first->v.voff_range.max);
     }
   }
-  
+
   // rjf: line vaddr range => did we find anything successfully?
   B32 good_line_info = (line_vaddr_rng.max != 0);
-  
+
   // rjf: line vaddr range => line's machine code
   String8 machine_code = {0};
   B32 good_machine_code = 0;
   if(good_line_info)
   {
-    D_ProcessMemorySlice machine_code_slice = d_process_memory_slice_from_vaddr_range(scratch.arena, process->handle, line_vaddr_rng, 1, now_time_us()+10000);
+    D_ProcessMemorySlice machine_code_slice = d_process_memory_slice_from_vaddr_range(arena, process->handle, line_vaddr_rng, 1, now_time_us()+10000);
     machine_code = machine_code_slice.data;
     good_machine_code = (machine_code.size >= dim_1u64(line_vaddr_rng) && !machine_code_slice.any_byte_bad && !machine_code_slice.stale);
     LogInfoNamedBlockF("machine_code_slice")
@@ -462,12 +577,12 @@ d_trap_net_from_thread__step_over_line(Arena *arena, D_Entity *thread, U64 inlin
       log_infof("]\n");
     }
   }
-  
+
   // rjf: machine code => ctrl flow analysis
   DASM_CtrlFlowInfo ctrl_flow_info = {0};
   if(good_machine_code)
   {
-    ctrl_flow_info = dasm_ctrl_flow_info_from_arch_vaddr_code(scratch.arena,
+    ctrl_flow_info = dasm_ctrl_flow_info_from_arch_vaddr_code(arena,
                                                               DASM_InstFlag_Call|
                                                               DASM_InstFlag_Branch|
                                                               DASM_InstFlag_UnconditionalJump|
@@ -485,94 +600,31 @@ d_trap_net_from_thread__step_over_line(Arena *arena, D_Entity *thread, U64 inlin
       }
     }
   }
-  
-  // rjf: push traps for all exit points
-  if(good_machine_code) for(DASM_CtrlFlowPointNode *n = ctrl_flow_info.exit_points.first; n != 0; n = n->next)
+
+  // rjf: fill result
+  result.vaddr_rng         = line_vaddr_rng;
+  result.all_vaddr_ranges  = all_vaddr_ranges_on_same_line;
+  result.good_line_info    = good_line_info;
+  result.machine_code      = machine_code;
+  result.good_machine_code = good_machine_code;
+  result.ctrl_flow_info    = ctrl_flow_info;
+  scratch_end(scratch);
+  return result;
+}
+
+// rjf: traps for natural linear flow: at the end of every piece of the line, unless another
+// piece begins right there (never at the instruction being stepped from: another piece of
+// the line may end exactly there, and the step would end at once)
+internal void
+d_trap_net_push_step_line_natural_flow_traps(Arena *arena, D_TrapNet *net, D_StepLine *line)
+{
+  if(line->good_line_info && line->good_machine_code)
   {
-    DASM_CtrlFlowPoint *point = &n->v;
-    D_TrapFlags flags = 0;
-    B32 add = 1;
-    U64 trap_addr = point->vaddr;
-    
-    // rjf: branches/jumps/returns => single-step & end, OR trap @ destination.
-    if(point->inst_flags & (DASM_InstFlag_Branch|
-                            DASM_InstFlag_UnconditionalJump|
-                            DASM_InstFlag_Return))
-    {
-      flags |= (D_TrapFlag_SingleStepAfterHit|D_TrapFlag_EndStepping);
-      
-      // rjf: omit if this jump stays inside of this line
-      if(contains_1u64(line_vaddr_rng, point->jump_dest_vaddr))
-      {
-        add = 0;
-      }
-      
-      // rjf: omit if this jump stays inside of any range on this same textual line
-      for EachNode(n, Rng1U64Node, all_vaddr_ranges_on_same_line.first)
-      {
-        if(contains_1u64(n->v, point->jump_dest_vaddr))
-        {
-          add = 0;
-          break;
-        }
-      }
-      
-      // rjf: trap @ destination, if we can - we can avoid a single-step this way.
-      if(point->jump_dest_vaddr != 0)
-      {
-        trap_addr = point->jump_dest_vaddr;
-        flags &= ~D_TrapFlag_SingleStepAfterHit;
-      }
-      
-      // rjf: indirect jump (not a call or return)? -> end after the single step
-      // only if it kept the stack (jump table, tail call); a coroutine's context
-      // switch jumps to another stack, and the line continues when it is switched
-      // back to (see D_TrapFlag_EndSteppingUnlessStackChanged)
-      else if(!(point->inst_flags & (DASM_InstFlag_Call|DASM_InstFlag_Return)))
-      {
-        flags &= ~D_TrapFlag_EndStepping;
-        flags |= D_TrapFlag_EndSteppingUnlessStackChanged;
-      }
-      
-    }
-    
-    // rjf: call => save stack pointer before, single-step to go into call; trap on return
-    else if(point->inst_flags & DASM_InstFlag_Call)
-    {
-      flags |= (D_TrapFlag_SaveStackPointerBefore|D_TrapFlag_SingleStepAfterHit);
-    }
-    
-#if 0 // TODO(rjf): @spoof_stepping
-    // rjf: call => place spoof at return spot in stack, single-step after hitting
-    else if(point->inst_flags & DASM_InstFlag_Call)
-    {
-      flags |= (D_TrapFlag_BeginSpoofMode|D_TrapFlag_SingleStepAfterHit);
-    }
-#endif
-    
-    // rjf: instruction changes stack pointer => single-step over, save off the stack pointer, keep stepping
-    else if(point->inst_flags & DASM_InstFlag_ChangesStackPointer)
-    {
-      flags |= (D_TrapFlag_SingleStepAfterHit|D_TrapFlag_SaveStackPointerAfter);
-    }
-    
-    // rjf: add if appropriate
-    if(add)
-    {
-      D_Trap trap = {flags, trap_addr};
-      d_trap_list_push(arena, &result.traps, &trap);
-    }
-  }
-  
-  // rjf: push traps for natural linear flow
-  if(good_line_info && good_machine_code)
-  {
-    U64 line_opl_vaddr = line_vaddr_rng.max;
-    for EachNode(n, Rng1U64Node, all_vaddr_ranges_on_same_line.first)
+    for EachNode(n, Rng1U64Node, line->all_vaddr_ranges.first)
     {
       U64 opl = n->v.max;
       B32 opl_in_line = 0;
-      for EachNode(n2, Rng1U64Node, all_vaddr_ranges_on_same_line.first)
+      for EachNode(n2, Rng1U64Node, line->all_vaddr_ranges.first)
       {
         if(n != n2 && opl == n2->v.min)
         {
@@ -580,29 +632,133 @@ d_trap_net_from_thread__step_over_line(Arena *arena, D_Entity *thread, U64 inlin
           break;
         }
       }
-      // NOTE: never at the instruction being stepped from (another range of the
-      // same textual line may end exactly there): the step would end at once
-      if(!opl_in_line && opl != ip_vaddr)
+      if(!opl_in_line && opl != line->ip_vaddr)
       {
         D_Trap trap = {D_TrapFlag_EndStepping, opl};
-        d_trap_list_push(arena, &result.traps, &trap);
+        d_trap_list_push(arena, &net->traps, &trap);
       }
     }
   }
-  
-  // rjf: store goodness
-  {
-    result.good_line_info = good_line_info;
-    result.good_read = good_machine_code;
-  }
-  
-  // rjf: log
-  LogInfoNamedBlockF("traps") for(D_TrapNode *n = result.traps.first; n != 0; n = n->next)
+}
+
+internal void
+d_trap_net_log_traps(D_TrapNet *net)
+{
+  LogInfoNamedBlockF("traps") for(D_TrapNode *n = net->traps.first; n != 0; n = n->next)
   {
     log_infof("{flags:0x%x, vaddr:0x%I64x}\n", n->v.flags, n->v.vaddr);
   }
-  
-  scratch_end(scratch);
+}
+
+internal D_TrapNet
+d_trap_net_from_thread__step_over_line(Arena *arena, D_Entity *thread, U64 inline_depth)
+{
+  log_infof("step_over_line:\n{\n");
+  D_TrapNet result = {0};
+  D_StepLine line = d_step_line_from_thread(arena, thread, inline_depth);
+  D_Entity *process = line.process;
+  U64 ip_vaddr = line.ip_vaddr;
+  Rng1U64 line_vaddr_rng = line.vaddr_rng;
+
+  // rjf: push traps for all exit points
+  if(line.good_machine_code) for(DASM_CtrlFlowPointNode *n = line.ctrl_flow_info.exit_points.first; n != 0; n = n->next)
+  {
+    DASM_CtrlFlowPoint *point = &n->v;
+    D_TrapFlags flags = 0;
+    B32 add = 1;
+    U64 trap_addr = point->vaddr;
+
+    // rjf: branches/jumps/returns => single-step & end, OR trap @ destination.
+    if(point->inst_flags & (DASM_InstFlag_Branch|
+                            DASM_InstFlag_UnconditionalJump|
+                            DASM_InstFlag_Return))
+    {
+      flags |= (D_TrapFlag_SingleStepAfterHit|D_TrapFlag_EndStepping);
+
+      // rjf: omit if this jump stays inside of this line
+      if(contains_1u64(line_vaddr_rng, point->jump_dest_vaddr))
+      {
+        add = 0;
+      }
+
+      // rjf: omit if this jump stays inside of any range on this same textual line
+      for EachNode(n, Rng1U64Node, line.all_vaddr_ranges.first)
+      {
+        if(contains_1u64(n->v, point->jump_dest_vaddr))
+        {
+          add = 0;
+          break;
+        }
+      }
+
+      // rjf: trap @ destination, if we can - we can avoid a single-step this way.
+      if(point->jump_dest_vaddr != 0)
+      {
+        trap_addr = point->jump_dest_vaddr;
+        flags &= ~D_TrapFlag_SingleStepAfterHit;
+
+        // rjf: tail call (`b other_function` once the frame is torn down) => the jump is
+        // this line's call, and the step ends after it, in the caller: single-step the
+        // jump (the return address is known then), trap at the return address, and keep
+        // stepping. a jump within the function (to another line) ends the step there.
+        if(point->inst_flags & DASM_InstFlag_UnconditionalJump &&
+           !d_vaddrs_in_same_function(process, ip_vaddr, point->jump_dest_vaddr))
+        {
+          trap_addr = point->vaddr;
+          flags &= ~D_TrapFlag_EndStepping;
+          flags |= (D_TrapFlag_SingleStepAfterHit|D_TrapFlag_TrapReturnAddress);
+        }
+      }
+
+      // rjf: indirect jump (not a call or return)? -> after the single step: a coroutine's
+      // context switch jumps to another stack, and the line continues when it is switched
+      // back to (see D_TrapFlag_EndSteppingUnlessStackChanged); a jump table stays in the
+      // function, and the step ends there; an indirect tail call leaves it, and is stepped
+      // over like a call, with a trap at the return address
+      else if(!(point->inst_flags & (DASM_InstFlag_Call|DASM_InstFlag_Return)))
+      {
+        flags &= ~D_TrapFlag_EndStepping;
+        flags |= (D_TrapFlag_EndSteppingUnlessStackChanged|D_TrapFlag_EndSteppingIfSameFunction|D_TrapFlag_TrapReturnAddress);
+      }
+    }
+
+    // rjf: call => save stack pointer before, single-step to go into call; trap on return
+    else if(point->inst_flags & DASM_InstFlag_Call)
+    {
+      flags |= (D_TrapFlag_SaveStackPointerBefore|D_TrapFlag_SingleStepAfterHit);
+    }
+
+#if 0 // TODO(rjf): @spoof_stepping
+    // rjf: call => place spoof at return spot in stack, single-step after hitting
+    else if(point->inst_flags & DASM_InstFlag_Call)
+    {
+      flags |= (D_TrapFlag_BeginSpoofMode|D_TrapFlag_SingleStepAfterHit);
+    }
+#endif
+
+    // rjf: instruction changes stack pointer => single-step over, save off the stack pointer, keep stepping
+    else if(point->inst_flags & DASM_InstFlag_ChangesStackPointer)
+    {
+      flags |= (D_TrapFlag_SingleStepAfterHit|D_TrapFlag_SaveStackPointerAfter);
+    }
+
+    // rjf: add if appropriate
+    if(add)
+    {
+      D_Trap trap = {flags, trap_addr};
+      d_trap_list_push(arena, &result.traps, &trap);
+    }
+  }
+
+  // rjf: push traps for natural linear flow
+  d_trap_net_push_step_line_natural_flow_traps(arena, &result, &line);
+
+  // rjf: store goodness
+  result.good_line_info = line.good_line_info;
+  result.good_read = line.good_machine_code;
+
+  // rjf: log
+  d_trap_net_log_traps(&result);
   log_infof("}\n\n");
   return result;
 }
@@ -613,162 +769,60 @@ d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread, U64 inlin
   Temp scratch = scratch_begin(&arena, 1);
   log_infof("step_into_line:\n{\n");
   D_TrapNet result = {0};
-  
-  // rjf: thread => info
+  D_StepLine line = d_step_line_from_thread(arena, thread, inline_depth);
   Arch arch = thread->arch;
-  U64 ip_vaddr = d_cached_ip_from_thread(thread->handle);
-  D_Entity *process = d_entity_ancestor_from_kind(thread, D_EntityKind_Process);
-  D_Entity *module = d_module_from_process_vaddr(process, ip_vaddr);
-  D_Entity *dbg_path = d_entity_child_from_kind(module, D_EntityKind_DebugInfoPath);
-  String8 dbgi_path = dbg_path->string;
-  DI_Key dbgi_key = d_dbgi_key_from_debug_info_path(dbg_path);
-  
-  // rjf: ip => line info
-  String8 file_path = {0};
-  S64 line_num = 0;
-  Rng1U64 line_vaddr_rng = {0};
-  {
-    U64 ip_voff = d_voff_from_vaddr(module, ip_vaddr);
-    D_LineList lines = d_lines_from_dbgi_key_path_voff(scratch.arena, dbgi_key, dbgi_path, ip_voff);
-    Rng1U64 line_voff_rng = {0};
-    //
-    // NOTE: the list begins with the unit's line (the outermost call site)
-    // and ends with the line of the innermost inlined function at ip; each
-    // is a frame of the thread. step at the granularity of the selected one
-    // (clamped to the innermost): that function's code is stepped line by
-    // line, and the calls it inlines (recorded as its call site lines in its
-    // line table) are stepped over, like any other call.
-    //
-    D_LineNode *line_n = lines.first;
-    U64 line_depth = 0;
-    for(; line_n != 0 && line_n->next != 0 && line_depth < inline_depth; line_n = line_n->next, line_depth += 1) {}
-    if(line_n != 0)
-    {
-      line_voff_rng = line_n->v.voff_range;
-      file_path = line_n->v.file_path;
-      line_num = line_n->v.pt.line;
-      line_vaddr_rng = d_vaddr_range_from_voff_range(module, line_voff_rng);
-      log_infof("line: {%S:%I64i} (inline depth %I64u of %I64u)\n", line_n->v.file_path, line_n->v.pt.line, line_depth, lines.count ? lines.count-1 : 0);
-    }
-    log_infof("voff_range: {0x%I64x, 0x%I64x}\n", line_voff_rng.min, line_voff_rng.max);
-    log_infof("vaddr_range: {0x%I64x, 0x%I64x}\n", line_vaddr_rng.min, line_vaddr_rng.max);
-  }
-  
-  // rjf: gather other ranges on this same textual line, which we don't want to return to
-  Rng1U64List all_vaddr_ranges_on_same_line = {0};
-  {
-    D_LineList lines = d_lines_from_dbgi_key_file_path_line_num(scratch.arena, dbgi_key, file_path, line_num, max_U64);
-    for EachNode(n, D_LineNode, lines.first)
-    {
-      Rng1U64 voff_range = n->v.voff_range;
-      Rng1U64 vaddr_range = d_vaddr_range_from_voff_range(module, voff_range);
-      // NOTE: a range strictly containing the stepped line's is an enclosing call
-      // site of the same file & line (recursive inlining): not this frame's line
-      if(vaddr_range.min <= line_vaddr_rng.min && line_vaddr_rng.max <= vaddr_range.max &&
-         !(vaddr_range.min == line_vaddr_rng.min && vaddr_range.max == line_vaddr_rng.max))
-      {
-        continue;
-      }
-      rng1u64_list_push(scratch.arena, &all_vaddr_ranges_on_same_line, vaddr_range);
-      log_infof("same_line_range: {%S:%I64i, 0x%I64x, 0x%I64x}\n", n->v.file_path, n->v.pt.line, vaddr_range.min, vaddr_range.max);
-    }
-    
-    // rjf: the stepped line's own range is one of them (the lookup by file & line
-    // may have found an enclosing call site's range at its address instead)
-    B32 has_own_range = 0;
-    for EachNode(n, Rng1U64Node, all_vaddr_ranges_on_same_line.first)
-    {
-      if(n->v.min == line_vaddr_rng.min && n->v.max == line_vaddr_rng.max)
-      {
-        has_own_range = 1;
-        break;
-      }
-    }
-    if(!has_own_range && line_vaddr_rng.min < line_vaddr_rng.max)
-    {
-      rng1u64_list_push(scratch.arena, &all_vaddr_ranges_on_same_line, line_vaddr_rng);
-    }
-  }
-  
-  // rjf: opl line_vaddr_rng -> 0xf00f00 or 0xfeefee? => include in line vaddr range
-  //
-  // MSVC exports line info at these line numbers when /JMC (Just My Code) debugging
-  // is enabled. This is enabled by default normally.
-  {
-    U64 opl_line_voff_rng = d_voff_from_vaddr(module, line_vaddr_rng.max);
-    D_LineList lines = d_lines_from_dbgi_key_path_voff(scratch.arena, dbgi_key, dbgi_path, opl_line_voff_rng);
-    if(lines.first != 0 && (lines.first->v.pt.line == 0xf00f00 || lines.first->v.pt.line == 0xfeefee))
-    {
-      line_vaddr_rng.max = d_vaddr_from_voff(module, lines.first->v.voff_range.max);
-    }
-  }
-  
-  // rjf: line vaddr range => did we find anything successfully?
-  B32 good_line_info = (line_vaddr_rng.max != 0);
-  
-  // rjf: line vaddr range => line's machine code
-  String8 machine_code = {0};
-  B32 good_machine_code = 0;
-  if(good_line_info)
-  {
-    D_ProcessMemorySlice machine_code_slice = d_process_memory_slice_from_vaddr_range(scratch.arena, process->handle, line_vaddr_rng, 1, now_time_us()+10000);
-    machine_code = machine_code_slice.data;
-    good_machine_code = (machine_code.size >= dim_1u64(line_vaddr_rng) && !machine_code_slice.any_byte_bad && !machine_code_slice.stale);
-  }
-  
-  // rjf: machine code => ctrl flow analysis
-  DASM_CtrlFlowInfo ctrl_flow_info = {0};
-  if(good_machine_code)
-  {
-    ctrl_flow_info = dasm_ctrl_flow_info_from_arch_vaddr_code(scratch.arena,
-                                                              DASM_InstFlag_Call|
-                                                              DASM_InstFlag_Branch|
-                                                              DASM_InstFlag_UnconditionalJump|
-                                                              DASM_InstFlag_ChangesStackPointer|
-                                                              DASM_InstFlag_Return,
-                                                              0,
-                                                              arch,
-                                                              line_vaddr_rng.min,
-                                                              machine_code);
-  }
-  
-  // rjf: determine last 
-  DASM_CtrlFlowPoint *last_call_point = 0;
-  if(good_machine_code) for(DASM_CtrlFlowPointNode *n = ctrl_flow_info.exit_points.first; n != 0; n = n->next)
-  {
-    if(n->v.inst_flags & DASM_InstFlag_Call)
-    {
-      last_call_point = &n->v;
-    }
-  }
-  
+  D_Entity *process = line.process;
+  D_Entity *module = line.module;
+  U64 ip_vaddr = line.ip_vaddr;
+  Rng1U64 line_vaddr_rng = line.vaddr_rng;
+
   // rjf: push traps for all exit points
-  if(good_machine_code) for(DASM_CtrlFlowPointNode *n = ctrl_flow_info.exit_points.first; n != 0; n = n->next)
+  if(line.good_machine_code) for(DASM_CtrlFlowPointNode *n = line.ctrl_flow_info.exit_points.first; n != 0; n = n->next)
   {
     DASM_CtrlFlowPoint *point = &n->v;
     D_TrapFlags flags = 0;
     B32 add = 1;
     U64 trap_addr = point->vaddr;
-    
-    // rjf: if this is not the last call instruction in the control flow,
-    // and if we have no line info for this address, then do not add.
-    if(point != last_call_point &&
-       point->inst_flags & DASM_InstFlag_Call &&
-       point->jump_dest_vaddr != 0)
+    U64 jump_dest_vaddr = point->jump_dest_vaddr;
+    B32 jump_dest_has_line_info = 0;
+    B32 jump_leaves_function = 0;
+
+    // rjf: known destination out of this line => does it lie in another function (a tail
+    // call)? for calls and unconditional jumps, resolve a stub there (a call to another
+    // image, or to a weak symbol, goes through `__stubs` / the PLT, which has no line
+    // info; the function it jumps to may), and look up whether it has line info
+    if(jump_dest_vaddr != 0 &&
+       point->inst_flags & (DASM_InstFlag_Call|DASM_InstFlag_Branch|DASM_InstFlag_UnconditionalJump) &&
+       !contains_1u64(line_vaddr_rng, jump_dest_vaddr))
     {
-      U64 jump_dest_vaddr = point->jump_dest_vaddr;
-      D_Entity *jump_dest_module = d_module_from_process_vaddr(process, jump_dest_vaddr);
-      U64 jump_dest_voff = d_voff_from_vaddr(jump_dest_module, jump_dest_vaddr);
-      D_Entity *jump_dest_dbg_path = d_entity_child_from_kind(jump_dest_module, D_EntityKind_DebugInfoPath);
-      String8 jump_dest_dbgi_path = jump_dest_dbg_path->string;
-      DI_Key jump_dest_dbgi_key = d_dbgi_key_from_debug_info_path(jump_dest_dbg_path);
-      D_LineList lines = d_lines_from_dbgi_key_path_voff(scratch.arena, jump_dest_dbgi_key, jump_dest_dbgi_path, jump_dest_voff);
-      if(lines.count == 0)
+      if(point->inst_flags & (DASM_InstFlag_Call|DASM_InstFlag_UnconditionalJump))
       {
-        add = 0;
+        jump_dest_has_line_info = d_line_info_exists_from_vaddr(process, jump_dest_vaddr);
+        if(!jump_dest_has_line_info)
+        {
+          U64 stub_target_vaddr = d_stub_target_from_vaddr(process, arch, jump_dest_vaddr);
+          if(stub_target_vaddr != 0)
+          {
+            log_infof("stub: {0x%I64x -> 0x%I64x}\n", jump_dest_vaddr, stub_target_vaddr);
+            jump_dest_vaddr = stub_target_vaddr;
+            jump_dest_has_line_info = d_line_info_exists_from_vaddr(process, jump_dest_vaddr);
+          }
+        }
       }
+      jump_leaves_function = !d_vaddrs_in_same_function(process, ip_vaddr, jump_dest_vaddr);
     }
-    
+
+    // rjf: direct call into code without line info => not stepped into (as gdb and lldb
+    // do): the line's traps catch the thread when the call returns, as for any call the
+    // step does not enter. (upstream enters the line's last such call; here that meant
+    // landing on a `__stubs` entry or in dyld, where the UI switches to disassembly.)
+    if(point->inst_flags & DASM_InstFlag_Call &&
+       jump_dest_vaddr != 0 &&
+       !jump_dest_has_line_info)
+    {
+      add = 0;
+    }
+
     // rjf: branches/jumps/returns => single-step & end, OR trap @ destination.
     if(point->inst_flags & (DASM_InstFlag_Call|
                             DASM_InstFlag_Branch|
@@ -776,47 +830,77 @@ d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread, U64 inlin
                             DASM_InstFlag_Return))
     {
       flags |= (D_TrapFlag_SingleStepAfterHit|D_TrapFlag_EndStepping|D_TrapFlag_IgnoreStackPointerCheck);
-      
+
       // rjf: omit if this jump stays inside of this line
-      if(contains_1u64(line_vaddr_rng, point->jump_dest_vaddr))
+      if(contains_1u64(line_vaddr_rng, jump_dest_vaddr))
       {
         add = 0;
       }
-      
+
       // rjf: omit if this jump stays inside of any range on this same textual line
-      for EachNode(n, Rng1U64Node, all_vaddr_ranges_on_same_line.first)
+      for EachNode(n, Rng1U64Node, line.all_vaddr_ranges.first)
       {
-        if(contains_1u64(n->v, point->jump_dest_vaddr))
+        if(contains_1u64(n->v, jump_dest_vaddr))
         {
           add = 0;
           break;
         }
       }
-      
+
       // rjf: trap @ destination, if we can - we can avoid a single-step this way.
-      if(point->jump_dest_vaddr != 0)
+      if(jump_dest_vaddr != 0)
       {
-        trap_addr = point->jump_dest_vaddr;
+        trap_addr = jump_dest_vaddr;
         flags &= ~D_TrapFlag_SingleStepAfterHit;
+
+        // rjf: a jump within the function stays in the stepped frame: check the stack
+        // pointer there (a deeper activation of a recursive function, running through the
+        // destination before this one gets there, must not end the step; a call's
+        // destination is another frame)
+        if(!(point->inst_flags & DASM_InstFlag_Call) && !jump_leaves_function)
+        {
+          flags &= ~D_TrapFlag_IgnoreStackPointerCheck;
+        }
+
+        // rjf: tail call (jump into another function) into code without line info =>
+        // not stepped into either; the function making it is gone, so the thread can
+        // only be caught at the return address: single-step the jump (the return
+        // address is known then), trap there and keep stepping
+        if(point->inst_flags & DASM_InstFlag_UnconditionalJump && jump_leaves_function && !jump_dest_has_line_info)
+        {
+          trap_addr = point->vaddr;
+          flags &= ~D_TrapFlag_EndStepping;
+          flags |= (D_TrapFlag_SingleStepAfterHit|D_TrapFlag_TrapReturnAddress);
+        }
       }
-      
-      // rjf: indirect jump (not a call or return)? -> end after the single step
-      // only if it kept the stack (jump table, tail call); a coroutine's context
-      // switch jumps to another stack, and the line continues when it is switched
-      // back to (see D_TrapFlag_EndSteppingUnlessStackChanged)
-      else if(!(point->inst_flags & (DASM_InstFlag_Call|DASM_InstFlag_Return)))
+
+      // rjf: indirect call (`blr`, `call rax`) -> the destination is known after the
+      // single step: end there if it has line info, else let the call run and return
+      // into the line (Zig's threadlocal accesses call dyld's TLV getter this way)
+      else if(point->inst_flags & DASM_InstFlag_Call)
       {
         flags &= ~D_TrapFlag_EndStepping;
-        flags |= D_TrapFlag_EndSteppingUnlessStackChanged;
+        flags |= D_TrapFlag_EndSteppingIfLineInfo;
+      }
+
+      // rjf: indirect jump (not a return) -> after the single step: a coroutine's context
+      // switch jumps to another stack, and the line continues when it is switched back
+      // to (see D_TrapFlag_EndSteppingUnlessStackChanged); a jump table stays in the
+      // function, and an indirect tail call lands in another function, which is stepped
+      // into if it has line info, and run to its return otherwise
+      else if(!(point->inst_flags & DASM_InstFlag_Return))
+      {
+        flags &= ~D_TrapFlag_EndStepping;
+        flags |= (D_TrapFlag_EndSteppingUnlessStackChanged|D_TrapFlag_EndSteppingIfLineInfo|D_TrapFlag_TrapReturnAddress);
       }
     }
-    
+
     // rjf: instruction changes stack pointer => save off the stack pointer, single-step over, keep stepping
     else if(point->inst_flags & DASM_InstFlag_ChangesStackPointer)
     {
       flags |= (D_TrapFlag_SingleStepAfterHit|D_TrapFlag_SaveStackPointerAfter);
     }
-    
+
     // rjf: add if appropriate
     if(add)
     {
@@ -824,7 +908,7 @@ d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread, U64 inlin
       d_trap_list_push(arena, &result.traps, &trap);
     }
   }
-  
+
   // rjf: push traps at the beginnings of calls inlined into this line
   //
   // an inlined call has no call instruction to follow; the inlined function's
@@ -832,17 +916,23 @@ d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread, U64 inlin
   // in) begins within the line's range instead. stop there, as at a call's
   // destination, so that inlined calls are stepped into like any other.
   //
-  if(good_line_info) LogInfoNamedBlockF("inlined_calls")
+  // NOTE: these traps are checked against the stack pointer: the inlined code
+  // belongs to the stepped frame (a deeper activation of the function, reached
+  // through a call the step did not enter, must run through it without ending
+  // the step), and a stack pointer change earlier in the line (the prologue,
+  // when stepping from a function's first line) has updated the checked value.
+  //
+  if(line.good_line_info) LogInfoNamedBlockF("inlined_calls")
   {
     Access *access = access_open();
-    RDI_Parsed *rdi = di_rdi_from_key(access, dbgi_key, 1, 0);
+    RDI_Parsed *rdi = di_rdi_from_key(access, line.dbgi_key, 1, 0);
     if(rdi != &rdi_parsed_nil)
     {
       U64 ip_voff = d_voff_from_vaddr(module, ip_vaddr);
       RDI_Scope *nil_scope = rdi_element_from_name_idx(rdi, Scopes, 0);
       U64 all_scope_voffs_count = 0;
       U64 *all_scope_voffs = rdi_table_from_name(rdi, ScopeVOffData, &all_scope_voffs_count);
-      
+
       // rjf: the inline sites enclosing ip, innermost first, and the procedure's root scope
       RDI_Scope *inline_scopes[64] = {0};
       U64 inline_scope_count = 0;
@@ -856,12 +946,12 @@ d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread, U64 inlin
         }
         root_scope = s;
       }
-      
+
       // rjf: the scope of the function being stepped: the inline site at the
       // selected depth (1 = outermost), or the procedure's root scope
       U64 depth = Min(inline_depth, inline_scope_count);
       RDI_Scope *function_scope = (depth == 0) ? root_scope : inline_scopes[inline_scope_count - depth];
-      
+
       // rjf: find inline sites among its descendants (not descending into
       // them; calls they inline are theirs to step into), beginning in the line
       typedef struct ScopeTask ScopeTask;
@@ -886,7 +976,7 @@ d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread, U64 inlin
               if(contains_1u64(line_vaddr_rng, inline_begin_vaddr) && inline_begin_vaddr != ip_vaddr)
               {
                 log_infof("inlined call begins @ 0x%I64x\n", inline_begin_vaddr);
-                D_Trap trap = {D_TrapFlag_EndStepping|D_TrapFlag_IgnoreStackPointerCheck, inline_begin_vaddr};
+                D_Trap trap = {D_TrapFlag_EndStepping, inline_begin_vaddr};
                 d_trap_list_push(arena, &result.traps, &trap);
               }
             }
@@ -903,52 +993,23 @@ d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread, U64 inlin
     }
     access_close(access);
   }
-  
+
   // rjf: push traps for natural linear flow
-  if(good_line_info && good_machine_code)
-  {
-    U64 line_opl_vaddr = line_vaddr_rng.max;
-    for EachNode(n, Rng1U64Node, all_vaddr_ranges_on_same_line.first)
-    {
-      U64 opl = n->v.max;
-      B32 opl_in_line = 0;
-      for EachNode(n2, Rng1U64Node, all_vaddr_ranges_on_same_line.first)
-      {
-        if(n != n2 && opl == n2->v.min)
-        {
-          opl_in_line = 1;
-          break;
-        }
-      }
-      // NOTE: never at the instruction being stepped from (another range of the
-      // same textual line may end exactly there): the step would end at once
-      if(!opl_in_line && opl != ip_vaddr)
-      {
-        D_Trap trap = {D_TrapFlag_EndStepping, opl};
-        d_trap_list_push(arena, &result.traps, &trap);
-      }
-    }
-  }
-  
+  d_trap_net_push_step_line_natural_flow_traps(arena, &result, &line);
+
   // rjf: store goodness
-  {
-    result.good_line_info = good_line_info;
-    result.good_read = good_machine_code;
-  }
-  
+  result.good_line_info = line.good_line_info;
+  result.good_read = line.good_machine_code;
+
   // rjf: log
-  LogInfoNamedBlockF("traps") for(D_TrapNode *n = result.traps.first; n != 0; n = n->next)
-  {
-    log_infof("{flags:0x%x, vaddr:0x%I64x}\n", n->v.flags, n->v.vaddr);
-  }
-  
+  d_trap_net_log_traps(&result);
   scratch_end(scratch);
   log_infof("}\n\n");
   return result;
 }
 
 internal D_TrapNet
-d_trap_net_from_thread__step_out_scope(Arena *arena, D_Entity *thread)
+d_trap_net_from_thread__step_out_scope(Arena *arena, D_Entity *thread, U64 inline_depth)
 {
   D_TrapNet result = {0};
   {
@@ -964,14 +1025,37 @@ d_trap_net_from_thread__step_out_scope(Arena *arena, D_Entity *thread)
     DI_Key dbgi_key = d_dbgi_key_from_module(module);
     D_CallStack callstack = d_call_stack_from_thread(access, thread->handle, 1, read_endt_us);
     
-    // rjf: ip => enclosing scope's list(voff_range)
+    // rjf: ip => the stepped function's scope => list(voff_range)
+    //
+    // the function stepped out of is the selected frame's: the inline site at the
+    // selected depth (1 = outermost) among the sites enclosing ip, or the procedure's
+    // root scope (depth 0, as for a thread outside inlined code). a step out from an
+    // inlined function ends where its site's code is left; from the concrete function,
+    // where the function returns. (the innermost scope at ip, the lexical block the
+    // thread is in, would make a step out leave the block.)
+    //
     Rng1U64List scope_voff_rngs = {0};
     {
       U64 ip_voff = d_voff_from_vaddr(module, ip_vaddr);
       RDI_Parsed *rdi = di_rdi_from_key(access, dbgi_key, 1, 0);
       if(rdi != &rdi_parsed_nil)
       {
-        RDI_Scope *scope = rdi_scope_from_voff(rdi, ip_voff);
+        RDI_Scope *nil_scope = rdi_element_from_name_idx(rdi, Scopes, 0);
+        RDI_Scope *inline_scopes[64] = {0};
+        U64 inline_scope_count = 0;
+        RDI_Scope *root_scope = nil_scope;
+        for(RDI_Scope *s = rdi_scope_from_voff(rdi, ip_voff); s != nil_scope; s = rdi_element_from_name_idx(rdi, Scopes, s->parent_scope_idx))
+        {
+          if(s->inline_site_idx != 0 && inline_scope_count < ArrayCount(inline_scopes))
+          {
+            inline_scopes[inline_scope_count] = s;
+            inline_scope_count += 1;
+          }
+          root_scope = s;
+        }
+        U64 depth = Min(inline_depth, inline_scope_count);
+        RDI_Scope *scope = (depth == 0) ? root_scope : inline_scopes[inline_scope_count - depth];
+        log_infof("step_out_scope: inline depth %I64u of %I64u\n", depth, inline_scope_count);
         U64 all_scope_voffs_count = 0;
         U64 *all_scope_voffs = rdi_table_from_name(rdi, ScopeVOffData, &all_scope_voffs_count);
         for(U64 voff_idx = scope->voff_range_first; voff_idx+1 < scope->voff_range_opl; voff_idx += 1)
@@ -981,7 +1065,8 @@ d_trap_net_from_thread__step_out_scope(Arena *arena, D_Entity *thread)
         }
       }
     }
-    
+
+
     // rjf: place traps at all possible exit points of all scope's ranges
     result.good_read = 1;
     for EachNode(n, Rng1U64Node, scope_voff_rngs.first)
@@ -2212,7 +2297,7 @@ d_tick(Arena *arena, D_TargetArray *targets, D_BreakpointArray *breakpoints, D_P
               case D_CmdKind_StepOverInst: {trap_net = d_trap_net_from_thread__step_over_inst(scratch.arena, thread);}break;
               case D_CmdKind_StepIntoLine: {trap_net = d_trap_net_from_thread__step_into_line(scratch.arena, thread, cmd->params.inline_depth);}break;
               case D_CmdKind_StepOverLine: {trap_net = d_trap_net_from_thread__step_over_line(scratch.arena, thread, cmd->params.inline_depth);}break;
-              case D_CmdKind_StepOut:      {trap_net = d_trap_net_from_thread__step_out_scope(scratch.arena, thread);}break;
+              case D_CmdKind_StepOut:      {trap_net = d_trap_net_from_thread__step_out_scope(scratch.arena, thread, cmd->params.inline_depth);}break;
               case D_CmdKind_StepToExit:   {trap_net = d_trap_net_from_thread__step_to_exit(scratch.arena, thread);}break;
             }
             B32 good_trap_net = (trap_net.good_read || !trap_net.good_line_info);

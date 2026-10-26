@@ -435,10 +435,13 @@ internal void d_cmd_list_push_new(Arena *arena, D_CmdList *cmds, D_CmdKind kind,
 ////////////////////////////////
 //~ rjf: Stepping "Trap Net" Builders
 
+internal B32 d_line_info_exists_from_vaddr(D_Entity *process, U64 vaddr);
+internal B32 d_vaddrs_in_same_function(D_Entity *process, U64 vaddr_a, U64 vaddr_b);
+internal U64 d_stub_target_from_vaddr(D_Entity *process, Arch arch, U64 vaddr);
 internal D_TrapNet d_trap_net_from_thread__step_over_inst(Arena *arena, D_Entity *thread);
 internal D_TrapNet d_trap_net_from_thread__step_over_line(Arena *arena, D_Entity *thread, U64 inline_depth);
 internal D_TrapNet d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread, U64 inline_depth);
-internal D_TrapNet d_trap_net_from_thread__step_out_scope(Arena *arena, D_Entity *thread);
+internal D_TrapNet d_trap_net_from_thread__step_out_scope(Arena *arena, D_Entity *thread, U64 inline_depth);
 internal D_TrapNet d_trap_net_from_thread__step_to_exit(Arena *arena, D_Entity *thread);
 
 ////////////////////////////////

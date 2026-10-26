@@ -372,6 +372,14 @@ struct D_ServerState
   DMN_EventNode *first_dmn_event_node;
   DMN_EventNode *last_dmn_event_node;
   DMN_EventNode *free_dmn_event_node;
+
+  // rjf: breakpoint & watchpoint hits of other threads, reported by the demon from the run
+  // which another thread's stop ended; held back (copies, keyed by the thread's demon handle)
+  // for the following runs to report (see d_ctrl_thread__run)
+  Arena *held_bp_event_arena;
+  DMN_EventNode *first_held_bp_event_node;
+  DMN_EventNode *last_held_bp_event_node;
+  DMN_EventNode *free_held_bp_event_node;
 };
 
 typedef struct D_ServerSlot D_ServerSlot;

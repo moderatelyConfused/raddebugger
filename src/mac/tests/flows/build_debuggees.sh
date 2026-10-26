@@ -87,6 +87,7 @@ gen_big_symbols() # <source path> <function count> <members per struct>
 echo "[big_symbols.c (generated)]"
 gen_big_symbols "$out/big_symbols.c" 20000 6
 build big_symbols "$out/big_symbols.c" -O0
+build stackswitch_O2 "$src/stackswitch.c" -O2
 # -O2 without frame pointers (call stack through compact-unwind / eh_frame only)
 echo "[basic_O2_nofp]"
 $cc -g -O2 -fomit-frame-pointer -Wall -c -o "$out/obj/basic_O2_nofp.o" "$src/basic.c"

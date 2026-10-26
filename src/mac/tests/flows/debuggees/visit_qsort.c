@@ -15,7 +15,7 @@ static inline int tally(int v)
   return g_tally;
 }
 
-int visit(Node *node)
+__attribute__((noinline)) int visit(Node *node) // out of line, so that the recursion through the callback re-enters this code
 {
   int sum = node->value;
   if(node->count > 0) { qsort_b(node->children, node->count, sizeof(Node *), ^int(const void *a, const void *b) { return visit(*(Node *const *)a) - visit(*(Node *const *)b); }); sum += tally(node->count); } // @visit_line

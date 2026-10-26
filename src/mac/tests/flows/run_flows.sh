@@ -943,6 +943,44 @@ scenario_F5b_bigframe_step_O2() {
   finish
 }
 
+# F5c: one line allocates a 512 KB VLA and then switches through a jump table (`br`): the stack
+# pointer moves far within the thread's stack, which is not a context switch (the step over must not
+# treat it as one and run away)
+scenarios+=(F5c_vla_switch_O2)
+scenario_F5c_vla_switch_O2() {
+  begin F5c_vla_switch_O2 $B/stackswitch_O2 vla || return
+  local src=$D/stackswitch.c; bp_tag $src vla_switch_line >/dev/null
+  local st=$(run_stop); check_stop F5c_at_switch_line "$st" $src vla_switch_line
+  ipc clear_breakpoints >/dev/null
+  st=$(go_cmd step_over)
+  check_stop F5c_step_over_lands_on_next_line "$st" $src vla_after
+  check F5c_sym "dispatch" "$(stop_symbol "$st")"
+  check F5c_case_ran 24 "$(ev g_sw_trace)"
+  note "F5c after step over: $(stop_file_line "$st") sym=$(stop_symbol "$st") stack: $(call_stack "$st" | tr '\n' ' ')"
+  ipc run >/dev/null; st=$(wait_exit); check F5c_exit_code 32 "$(field "$st" last_exit_code)"
+  finish
+}
+
+# F5d: fiber A yields to fiber B with an inlined context switch (`mov sp, xN; br xM` in the stepped
+# line); the two 64 KB fiber stacks come from one malloc, so they lie closer together than a frame
+# can grow on the thread's stack. The step over must come back to A's next line once B switched back.
+scenarios+=(F5d_fiber_switch_O2)
+scenario_F5d_fiber_switch_O2() {
+  begin F5d_fiber_switch_O2 $B/stackswitch_O2 fibers || return
+  local src=$D/stackswitch.c; bp_tag $src fiber_a_switch >/dev/null
+  local st=$(run_stop); check_stop F5d_at_switch "$st" $src fiber_a_switch
+  check F5d_sym "fiber_a_entry" "$(stop_symbol "$st")"
+  check F5d_trace_before 10 "$(ev g_sw_trace)"
+  ipc clear_breakpoints >/dev/null
+  st=$(go_cmd step_over)
+  check_stop F5d_step_over_returns_to_a "$st" $src fiber_a_after
+  check F5d_sym_after "fiber_a_entry" "$(stop_symbol "$st")"
+  check F5d_b_ran_once 11 "$(ev g_sw_trace)"
+  note "F5d after step over: $(stop_file_line "$st") sym=$(stop_symbol "$st") stack: $(call_stack "$st" | tr '\n' ' ')"
+  ipc run >/dev/null; st=$(wait_exit); check F5d_exit_code 3 "$(field "$st" last_exit_code)"
+  finish
+}
+
 scenarios+=(F6_visit_qsort_O2)
 scenario_F6_visit_qsort_O2() {
   begin F6_visit_qsort_O2 $B/visit_qsort_O2 || return
@@ -955,13 +993,44 @@ scenario_F6_visit_qsort_O2() {
   check F6_inlined_in_main 1 "$(field "$st" inline_depth)"
   check F6_sum_constant_location 10 "$(ev sum)"
   note "F6: node at the first hit (main's inlined visit, not described by the DWARF): node='$(ev node)' msgs: $(ev_msgs node)"
-  local sp0=$(ev sp)
+  local sp0=$(ev sp) frame0=$(concrete_frames "$st" | head -1)
   ipc clear_breakpoints >/dev/null
   st=$(go_cmd step_into)
   note "F6 step into stopped at $(stop_file_line "$st") sym=$(stop_symbol "$st") depth=$(field "$st" inline_depth) sp=$(ev sp) (sp before: $sp0) stack: $(call_stack "$st" | tr '\n' ' ')"
   check F6_same_recursion_level_sp "$sp0" "$(ev sp)"
-  check F6_concrete_frame_is_root_visit "visit" "$(concrete_frames "$st" | head -1)"
+  # the root call visit(&root) is inlined into main at -O2, so the concrete frame is main's
+  check F6_concrete_frame_unchanged "$frame0" "$(concrete_frames "$st" | head -1)"
+  check_stop F6_stops_in_inlined_tally "$st" $src tally_body
   note "F6: node->value after the step into: '$(ev 'node->value')'"
+  finish
+}
+
+# F6b: the same step into from the out-of-line visit (the second hit of the breakpoint, reached
+# through qsort_b's callback): the deeper recursive activations of visit, called back from qsort_b,
+# run through the inline entry of tally() in the same code before the stepped activation gets
+# there; the step must not end in one of them (the inline-entry traps are stack pointer checked)
+scenarios+=(F6b_visit_qsort_recursion_O2)
+scenario_F6b_visit_qsort_recursion_O2() {
+  begin F6b_visit_qsort_recursion_O2 $B/visit_qsort_O2 || return
+  local src=$D/visit_qsort.c; bp_tag $src visit_line >/dev/null
+  # the breakpoint also covers the block literal's code on that line, so run to a hit in a visit
+  # activation called back from qsort_b (frame 1 is the block)
+  local st found=0 i
+  for i in 1 2 3 4 5 6; do
+    st=$(run_stop)
+    [[ "$(process_count "$st")" == "0" ]] && break
+    if [[ "$(concrete_frames "$st" | head -1)" == "visit" && "$(concrete_frames "$st" | sed -n 2p)" == "__visit_block_invoke" ]]; then found=1; break; fi
+  done
+  check F6b_recursive_hit_found 1 "$found"
+  check_stop F6b_recursive_hit_line "$st" $src visit_line
+  local sp0=$(ev sp)
+  ipc clear_breakpoints >/dev/null
+  st=$(go_cmd step_into)
+  note "F6b step into stopped at $(stop_file_line "$st") sym=$(stop_symbol "$st") depth=$(field "$st" inline_depth) sp=$(ev sp) (sp before: $sp0) stack: $(call_stack "$st" | tr '\n' ' ')"
+  check F6b_same_recursion_level_sp "$sp0" "$(ev sp)"
+  check F6b_concrete_frame_is_visit "visit" "$(concrete_frames "$st" | head -1)"
+  check_stop F6b_stops_in_inlined_tally "$st" $src tally_body
+  ipc run >/dev/null; st=$(wait_exit); check F6b_exit_code 16 "$(field "$st" last_exit_code)"
   finish
 }
 
@@ -1172,6 +1241,58 @@ scenario_D9_attach_kill9() {
 # ===============================================================================================
 # scenarios: unwinder review (U*)
 # ===============================================================================================
+
+# D10: two workers released by one flag: A hits a breakpoint while B stores to a watched global. When
+# the demon reports both from one run, the engine stops for one and must report the other (held
+# back) on the next run, whichever kind it is.
+scenarios+=(D10_bp_and_watchpoint_together)
+scenario_D10_bp_and_watchpoint_together() {
+  begin D10_bp_and_watchpoint_together $B/threads_O0 barrier_watch || return
+  bp_tag $D/threads.c barrier_release >/dev/null
+  local st=$(run_stop); check_stop D10_at_release "$st" $D/threads.c barrier_release
+  ipc clear_breakpoints >/dev/null
+  bp_tag $D/threads.c barrier_a_line >/dev/null
+  ipc "break_when_value_changes g_watched_by_b" >/dev/null
+  st=$(ipc state); check D10_bp_count 2 "$(bp_count "$st")"
+  local seen="" i
+  for i in 1 2; do
+    st=$(run_stop)
+    if [[ "$(process_count "$st")" == "0" ]]; then note "the process ended after $(( i - 1 )) of 2 expected stops"; break; fi
+    local line=$(stop_file_line "$st") sym=$(stop_symbol "$st")
+    note "D10 stop $i: $line sym=$sym bp=$(stop_bp_id "$st") g_watched_by_b=$(ev g_watched_by_b) explanation: $(stop_explanation "$st")"
+    [[ "$line" == "$(tag_loc $D/threads.c barrier_a_line)" ]] && seen="$seen bp"
+    [[ "$sym" == "barrier_b" ]] && seen="$seen watch"
+  done
+  check D10_both_hits_reported "bp watch" "$(echo $seen | tr ' ' '\n' | grep . | sort | tr '\n' ' ' | sed 's/ $//')"
+  ipc run >/dev/null; st=$(wait_exit); check D10_exit_code 0 "$(field "$st" last_exit_code)"
+  ipc exit >/dev/null 2>&1; sleep 0.5
+  note "D10 hits held back by the engine (one run reported both when > 0): $(grep -c 'held back for a later run' $S/logs/ctrl_thread.raddbg_log)"
+  finish
+}
+
+# D11: main hits a breakpoint right after creating a thread which runs into a breakpoint on its first
+# line; the thread's creation may still be queued behind main's stop when its hit arrives with it.
+scenarios+=(D11_new_thread_bp_with_main_bp)
+scenario_D11_new_thread_bp_with_main_bp() {
+  begin D11_new_thread_bp_with_main_bp $B/threads_O0 create_bp || return
+  bp_tag $D/threads.c after_create >/dev/null
+  bp_tag $D/threads.c worker_body >/dev/null
+  local st seen="" i
+  for i in 1 2; do
+    st=$(run_stop)
+    if [[ "$(process_count "$st")" == "0" ]]; then note "the process ended after $(( i - 1 )) of 2 expected stops"; break; fi
+    local line=$(stop_file_line "$st")
+    note "D11 stop $i: $line sym=$(stop_symbol "$st") thread=$(field "$st" selected_thread)"
+    [[ "$line" == "$(tag_loc $D/threads.c after_create)" ]] && seen="$seen main"
+    [[ "$line" == "$(tag_loc $D/threads.c worker_body)" ]] && seen="$seen worker"
+  done
+  check D11_both_hits_reported "main worker" "$(echo $seen | tr ' ' '\n' | grep . | sort | tr '\n' ' ' | sed 's/ $//')"
+  ipc run >/dev/null; st=$(wait_exit); check D11_exit_code 0 "$(field "$st" last_exit_code)"
+  ipc exit >/dev/null 2>&1; sleep 0.5
+  check D11_no_dropped_hit 0 "$(grep -c 'no such trap anymore, dropped' $S/logs/ctrl_thread.raddbg_log)"
+  note "D11 hits held back by the engine: $(grep -c 'held back for a later run' $S/logs/ctrl_thread.raddbg_log)"
+  finish
+}
 
 scenarios+=(U1_zig_unwind)
 scenario_U1_zig_unwind() {
