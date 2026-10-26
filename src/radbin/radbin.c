@@ -432,18 +432,23 @@ rb_thread_entry_point(void *p)
           {
             log_infof("No dSYM bundle found at %S; %S has a debug map (%I64u N_OSO stabs)\n", dsym_path, n->string, bin.oso_count);
 #if OS_MAC
-            // rjf: generated dSYMs are cached per executable UUID, so that stale
-            // bundles from older builds of the same program are never picked up.
+            // rjf: generated dSYMs are cached per executable UUID and debug map, so
+            // that stale bundles from older builds of the same program are never
+            // picked up. NOTE: ld64's UUID hashes the image's contents only, so two
+            // links of the same code with different debug info (a comment added,
+            // another -gdwarf-N, other source paths) share a UUID; the object files'
+            // paths and modification times from the debug map tell them apart.
             String8 exe_name = str8_skip_last_slash(input_file_path);
             String8 cache_root = get_process_info()->user_program_cache_data_path;
             String8 dsyms_dir = str8f(scratch.arena, "%S/raddbg/dsyms", cache_root);
-            String8 bundle_name = exe_name;
+            String8 bundle_name = str8f(scratch.arena, "%S-%016I64x", exe_name, bin.debug_map_hash);
             if(bin.has_uuid)
             {
-              bundle_name = str8f(scratch.arena, "%S-%08X%04X%04X%02X%02X%02X%02X%02X%02X%02X%02X", exe_name,
+              bundle_name = str8f(scratch.arena, "%S-%08X%04X%04X%02X%02X%02X%02X%02X%02X%02X%02X-%016I64x", exe_name,
                                   bin.uuid.data1, bin.uuid.data2, bin.uuid.data3,
                                   bin.uuid.data4[0], bin.uuid.data4[1], bin.uuid.data4[2], bin.uuid.data4[3],
-                                  bin.uuid.data4[4], bin.uuid.data4[5], bin.uuid.data4[6], bin.uuid.data4[7]);
+                                  bin.uuid.data4[4], bin.uuid.data4[5], bin.uuid.data4[6], bin.uuid.data4[7],
+                                  bin.debug_map_hash);
             }
             String8 bundle_path = str8f(scratch.arena, "%S/%S.dSYM", dsyms_dir, bundle_name);
             dsym_path = str8f(arena, "%S/Contents/Resources/DWARF/%S", bundle_path, exe_name);
