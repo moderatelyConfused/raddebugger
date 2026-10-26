@@ -78,4 +78,5 @@ internal void t_errorf(char *fmt, ...);
 #define TEST(name) Test(name)
 #define SKIP(name) SkippedTest(name)
 #define T_Ok(c)    TestCheck(c)
+#define T_SkipWithoutCl() do { if (t_cl_path().size == 0) { TestSkip(); } } while (0)
 
