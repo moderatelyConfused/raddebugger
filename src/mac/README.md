@@ -253,6 +253,59 @@ Open:
 * A headless driver (the demon from a console program, the way `torture`
   does) would still be useful; the `--ipc` loop above is the next best thing.
 
+## Tests
+
+`./run_tests.sh clang debug` (or `release`) builds `raddbg`, `raddbg_non_graphical`,
+`radlink`, `radbin` and `torture` with `./build.sh meta ...` and runs `build/torture`
+over every registered test; macOS is clang-only. Arguments after `--` go to torture,
+e.g. `./run_tests.sh clang debug -- -keep_going -ipc_port:7705 '*'`. By hand:
+
+```
+./build.sh meta clang debug raddbg raddbg_non_graphical radlink radbin torture
+cd build && ./torture -clang:/usr/bin/clang -keep_going -ipc_port:7705 '*'
+```
+
+The `raddbg/*` tests launch `raddbg_non_graphical` instances and drive them over IPC;
+those instances listen on `-ipc_port:<n>` (default: 7700 + torture's pid modulo 100), so
+a debugger open on the default port is left alone. Each test's own user and project
+files, the debugger's console output and the built debuggees land in
+`build/torture_artifacts/<test>/`.
+
+The prebuilt test inputs (`local/test_data/inputs`, fetched by `run_tests.bat` from
+data.raddbg.com) are Windows executables and PDBs, so on macOS the stepping regressions
+run over `src/mule/old_test_debuggees/{basic_stepping_test,step_into_for_goto}.c`,
+compiled on the fly with the host clang (`-g -O0`, Mach-O + dSYM). They launch with
+`step_into` (stop at the entry point, `main`), then alternate `step_into` / `step_over`
+and log every stop (lines, voff, symbol) until the process exits; the log is compared
+with `local/test_data/exemplars/<test>/exemplar_mac`, which the first run creates (and
+`eval2_regressions` writes `exemplar_mac_arm64`). Inspect a new exemplar before trusting
+it: `basic_stepping_test_step_regressions_0` records main:49, 51, foo:33, 35, main:51, 55,
+then a stop at voff 0x4ac without lines, which is the `_printf` stub (`__stubs`): a step
+into the line's last call enters the stub, and the step out from there returns one
+frame too far (see "Step-into and code without line info" above), so the process runs
+to its exit. `step_into_for_goto` records 18, 19, 21, 22, 20, 24 (clang attributes the
+loop's back-jump to the `}` on line 22).
+
+State on 2026-10-25, debug and release builds (158 registered tests): 144 pass, 13
+skip, 1 fail.
+
+* Skipped: the four `mule_main_9ff1e58f_*` stepping tests and the `p2r_*` / `d2r_*`
+  converter tests (no test data on this machine; `run_tests.sh` does not download it),
+  `mdesk/tokenizer` and `d2r_regressions` (skipped upstream), and the four linker
+  tests that need MSVC (`icf_cpp_*` compile with `cl.exe`, `icf_llvm_addrsig*` link
+  `libcmt.lib`): `T_SkipWithoutCl()` in `torture.h`.
+* Failing: `linker/default_lib_matches_explicit_path`. radlink parses its command line
+  with link.exe rules, so an input given as an absolute POSIX path is taken for a
+  `/option` and dropped; the test's second iteration passes the library as
+  `/.../sdk libs/provider.lib`. Reproduce in `build/torture_artifacts/default_lib_matches_explicit_path`:
+  `../../radlink /subsystem:console /entry:entry /out:default.exe entry.obj /include:first_provider "$PWD/sdk libs/provider.lib" /defaultlib:provider.lib`
+  (unresolved `first_provider`); the same command with the relative path links.
+* Fixed to get here: an absolute POSIX path as the command-line target was treated as a
+  `/flag` and never became a target (`rd_init`); `torture` captured child output with
+  `pipe2` and pidfds (now kqueue on macOS), looked for `cl.exe`, and had no mac
+  tables; `lnk_file_rename` used `/proc/self/fd` (now `F_GETPATH`); the first run of
+  an exemplar test compared against a missing exemplar instead of creating it.
+
 ## Known gaps / follow-ups
 
 * Rendering uses one shared `NSOpenGLContext` that is re-targeted with
