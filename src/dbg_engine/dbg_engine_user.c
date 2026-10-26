@@ -386,6 +386,22 @@ d_trap_net_from_thread__step_over_line(Arena *arena, D_Entity *thread, U64 inlin
       rng1u64_list_push(scratch.arena, &all_vaddr_ranges_on_same_line, vaddr_range);
       log_infof("same_line_range: {%S:%I64i, 0x%I64x, 0x%I64x}\n", n->v.file_path, n->v.pt.line, vaddr_range.min, vaddr_range.max);
     }
+    
+    // rjf: the stepped line's own range is one of them (the lookup by file & line
+    // may have found an enclosing call site's range at its address instead)
+    B32 has_own_range = 0;
+    for EachNode(n, Rng1U64Node, all_vaddr_ranges_on_same_line.first)
+    {
+      if(n->v.min == line_vaddr_rng.min && n->v.max == line_vaddr_rng.max)
+      {
+        has_own_range = 1;
+        break;
+      }
+    }
+    if(!has_own_range && line_vaddr_rng.min < line_vaddr_rng.max)
+    {
+      rng1u64_list_push(scratch.arena, &all_vaddr_ranges_on_same_line, line_vaddr_rng);
+    }
   }
   
   // extend trap-net range across contiguous same-source-line, possibly unsorted, ranges
@@ -655,6 +671,22 @@ d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread, U64 inlin
       }
       rng1u64_list_push(scratch.arena, &all_vaddr_ranges_on_same_line, vaddr_range);
       log_infof("same_line_range: {%S:%I64i, 0x%I64x, 0x%I64x}\n", n->v.file_path, n->v.pt.line, vaddr_range.min, vaddr_range.max);
+    }
+    
+    // rjf: the stepped line's own range is one of them (the lookup by file & line
+    // may have found an enclosing call site's range at its address instead)
+    B32 has_own_range = 0;
+    for EachNode(n, Rng1U64Node, all_vaddr_ranges_on_same_line.first)
+    {
+      if(n->v.min == line_vaddr_rng.min && n->v.max == line_vaddr_rng.max)
+      {
+        has_own_range = 1;
+        break;
+      }
+    }
+    if(!has_own_range && line_vaddr_rng.min < line_vaddr_rng.max)
+    {
+      rng1u64_list_push(scratch.arena, &all_vaddr_ranges_on_same_line, line_vaddr_rng);
     }
   }
   
