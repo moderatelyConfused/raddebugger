@@ -70,6 +70,24 @@ struct D2R_UnitDedupedTagMap
 };
 
 ////////////////////////////////
+//~ rjf: Container Lookup Types (see d2r_container_from_info_off)
+
+// the tables of d2r_convert which take a tag's .debug_info offset to the RDIM
+// namespace / UDT type which contains it
+typedef struct D2R_ContainerLookup D2R_ContainerLookup;
+struct D2R_ContainerLookup
+{
+  D2R_TagHashNode **tag_hash_slots;
+  U64 tag_hash_slots_count;
+  Rng1U64Array unit_info_tag_ranges_array;
+  D2R_UnitDedupedTagMap *unit_deduped_tag_maps;
+  D2R_UniqueTagNode **unique_tag_slots;
+  U64 unique_tag_slots_count;
+  RDIM_Type **type_from_idx_map;
+  RDIM_Namespace **namespace_from_idx_map;
+};
+
+////////////////////////////////
 //~ rjf: Conversion Stage Inputs (New)
 
 typedef struct D2R_ConvertParams D2R_ConvertParams;
@@ -130,7 +148,6 @@ struct D2R_LineSeq
   D2R_LineSeq *next;
   D2R_LineRowChunk *first_chunk;
   D2R_LineRowChunk *last_chunk;
-  U64 row_count;
   U64 voff_opl;
 };
 
@@ -139,7 +156,6 @@ struct D2R_UnitLineSeqs
 {
   D2R_LineSeq *first;
   D2R_LineSeq *last;
-  U64 count;
 };
 
 // per-unit map: src file -> the sequences built for it (for the source line maps)
@@ -196,7 +212,6 @@ struct D2R_InlineRange
 {
   U64 min;
   U64 max;
-  U64 depth;
   D2R_InlineNode *node;
   D2R_InlineRange *parent;
 };

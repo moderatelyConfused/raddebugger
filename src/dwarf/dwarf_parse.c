@@ -505,8 +505,11 @@ dw2_read_form_val(DW_Raw *raw, DW2_ParseCtx *ctx, String8 data, U64 off, DW_Form
       case DW_FormKind_Addr:
       bytes_to_read = ctx->addr_size; goto read_fixed_uint;
       
-      //- rjf: format-defined-size reads
+      //- rjf: address-sized in DWARF 2, format-defined-size since DWARF 3
       case DW_FormKind_RefAddr:
+      bytes_to_read = (ctx->version == DW_Version_2) ? ctx->addr_size : dw_addr_size_from_format(ctx->format); goto read_fixed_uint;
+
+      //- rjf: format-defined-size reads
       case DW_FormKind_SecOffset:
       case DW_FormKind_LineStrp:
       case DW_FormKind_Strp:
