@@ -19,6 +19,203 @@ d2r_unique_tag_node_is_less_than(D2R_UniqueTagNode **l, D2R_UniqueTagNode **r)
 }
 
 ////////////////////////////////
+//~ rjf: Line Table Building Helpers (see d2r_convert)
+
+internal int
+d2r_inline_range_compare(D2R_InlineRange *a, D2R_InlineRange *b)
+{
+  // rjf: by start; among equal starts, the enclosing (longer) range first;
+  // among equal ranges (an inlined call making up the whole of the function
+  // it was inlined into), the enclosing (less deeply nested) one first
+  int result = 0;
+  if(a->min != b->min)        { result = (a->min < b->min) ? -1 : +1; }
+  else if(a->max != b->max)   { result = (a->max > b->max) ? -1 : +1; }
+  else if(a->depth != b->depth) { result = (a->depth < b->depth) ? -1 : +1; }
+  return result;
+}
+
+internal D2R_InlineRange *
+d2r_inline_range_from_voff(D2R_InlineRange *ranges, U64 count, U64 voff, U64 *next_range_min_out)
+{
+  // rjf: binary search for the first range beginning after voff
+  U64 lo = 0;
+  U64 hi = count;
+  while(lo < hi)
+  {
+    U64 mid = lo + (hi-lo)/2;
+    if(ranges[mid].min <= voff) { lo = mid+1; }
+    else                        { hi = mid; }
+  }
+  *next_range_min_out = (lo < count) ? ranges[lo].min : max_U64;
+  
+  // rjf: the last range beginning at or before voff, or the nearest of the
+  // ranges enclosing it, which still contains voff (ranges nest, so any range
+  // containing voff encloses that last range)
+  D2R_InlineRange *result = (lo > 0) ? &ranges[lo-1] : 0;
+  for(; result != 0 && result->max <= voff; result = result->parent) {}
+  return result;
+}
+
+internal void
+d2r_line_table_builder_flush(Arena *arena, RDIM_LineTableChunkList *line_tables, D2R_FileSeqMap *file_seq_map, D2R_LineTableBuilder *b)
+{
+  if(b->line_count != 0 && b->src_file != 0)
+  {
+    // rjf: combine voffs/lines/cols
+    U64 *voffs = push_array_no_zero(arena, U64, b->line_count+1);
+    U32 *lines = push_array_no_zero(arena, U32, b->line_count);
+    U16 *cols  = push_array(arena, U16, 2*b->line_count);
+    MemoryCopy(voffs, b->voffs, sizeof(voffs[0])*b->line_count);
+    MemoryCopy(lines, b->line_nums, sizeof(lines[0])*b->line_count);
+    MemoryCopy(cols,  b->col_nums, sizeof(cols[0])*b->line_count);
+    voffs[b->line_count] = b->voff_opl;
+    
+    // rjf: push sequence to line table
+    RDIM_LineSequence *seq = rdim_line_table_push_sequence(arena, line_tables, b->table, b->src_file, voffs, lines, cols, b->line_count);
+    
+    // rjf: map src file -> file seq node
+    D2R_FileSeqNode *file_seq_n = 0;
+    {
+      U64 hash = u64_hash_from_str8(str8_struct(&b->src_file));
+      U64 slot_idx = hash%file_seq_map->slots_count;
+      for(D2R_FileSeqNode *n = file_seq_map->slots[slot_idx]; n != 0; n = n->next)
+      {
+        if(n->src_file == b->src_file)
+        {
+          file_seq_n = n;
+          break;
+        }
+      }
+      if(file_seq_n == 0)
+      {
+        file_seq_n = push_array(arena, D2R_FileSeqNode, 1);
+        SLLStackPush(file_seq_map->slots[slot_idx], file_seq_n);
+        file_seq_n->src_file = b->src_file;
+      }
+    }
+    
+    // rjf: record sequence in file seq node
+    {
+      RDIM_SrcFileLineMapFragment *f = push_array(arena, RDIM_SrcFileLineMapFragment, 1);
+      SLLQueuePush(file_seq_n->first_line_map_fragment, file_seq_n->last_line_map_fragment, f);
+      f->seq = seq;
+    }
+  }
+  b->line_count = 0;
+  b->src_file = 0;
+}
+
+internal void
+d2r_line_table_builder_append(Arena *arena, Arena *scratch_arena, RDIM_LineTableChunkList *line_tables, D2R_FileSeqMap *file_seq_map, D2R_LineTableBuilder *b, D2R_LineTableBuilder **first_open_builder, U64 voff_min, U64 voff_max, RDIM_SrcFile *src_file, U32 line_num, U16 col_num)
+{
+  if(voff_max <= voff_min || src_file == 0 || line_num == 0)
+  {
+    return;
+  }
+  
+  // rjf: continuing the previous line? -> extend it
+  if(b->line_count != 0 && b->voff_opl == voff_min && b->src_file == src_file && b->line_nums[b->line_count-1] == line_num)
+  {
+    b->voff_opl = voff_max;
+    return;
+  }
+  
+  // rjf: not contiguous with the previous line, or in another file? -> end the sequence
+  if(b->line_count != 0 && (b->voff_opl != voff_min || b->src_file != src_file))
+  {
+    d2r_line_table_builder_flush(arena, line_tables, file_seq_map, b);
+  }
+  
+  // rjf: grow
+  if(b->line_count >= b->line_cap)
+  {
+    U64 new_cap = Max(64, b->line_cap*2);
+    U64 *new_voffs = push_array_no_zero(scratch_arena, U64, new_cap);
+    U32 *new_lines = push_array_no_zero(scratch_arena, U32, new_cap);
+    U16 *new_cols  = push_array_no_zero(scratch_arena, U16, new_cap);
+    if(b->line_count != 0)
+    {
+      MemoryCopy(new_voffs, b->voffs,     sizeof(new_voffs[0])*b->line_count);
+      MemoryCopy(new_lines, b->line_nums, sizeof(new_lines[0])*b->line_count);
+      MemoryCopy(new_cols,  b->col_nums,  sizeof(new_cols[0])*b->line_count);
+    }
+    b->voffs     = new_voffs;
+    b->line_nums = new_lines;
+    b->col_nums  = new_cols;
+    b->line_cap  = new_cap;
+  }
+  
+  // rjf: push line
+  b->voffs[b->line_count]     = voff_min;
+  b->line_nums[b->line_count] = line_num;
+  b->col_nums[b->line_count]  = col_num;
+  b->line_count += 1;
+  b->src_file = src_file;
+  b->voff_opl = voff_max;
+  
+  // rjf: remember as begun from the current DWARF sequence, so that it ends with it
+  if(!b->is_open)
+  {
+    b->is_open = 1;
+    b->next_open = *first_open_builder;
+    *first_open_builder = b;
+  }
+}
+
+internal void
+d2r_distribute_line_row(Arena *arena, Arena *scratch_arena, RDIM_LineTableChunkList *line_tables, D2R_FileSeqMap *file_seq_map, D2R_LineTableBuilder *unit_builder, D2R_LineTableBuilder **first_open_builder, D2R_InlineRange *inline_ranges, U64 inline_range_count, D2R_LineRow *row, U64 row_voff_opl)
+{
+  U64 row_next_range_min = 0;
+  D2R_InlineRange *row_inner = d2r_inline_range_from_voff(inline_ranges, inline_range_count, row->voff, &row_next_range_min);
+  for(U64 voff = row->voff; voff < row_voff_opl;)
+  {
+    // rjf: find the innermost inline site at voff, and where this piece of the row ends
+    U64 next_range_min = 0;
+    D2R_InlineRange *inner = d2r_inline_range_from_voff(inline_ranges, inline_range_count, voff, &next_range_min);
+    U64 piece_opl = Min(row_voff_opl, next_range_min);
+    if(inner != 0)
+    {
+      piece_opl = Min(piece_opl, inner->max);
+    }
+    
+    //
+    // NOTE: the enclosing sites are taken from the tag tree (node->parent), not
+    // from range containment (range->parent): compilers emit nested inlined
+    // subroutines whose ranges are not within their parents' ranges, and the
+    // debugger walks the scope tree (also built from the tags) from the
+    // innermost scope at an address to find the tables to consult. the
+    // containment tree only serves to find the innermost site at an address.
+    //
+    if(inner == 0 && row_inner != 0)
+    {
+      // rjf: the row began inside an inline site, but runs past its end (the
+      // last row of inlined code commonly extends to the next row, across the
+      // "no source" rows which follow it): from the unit's perspective this
+      // is still the inlined call, so the unit's table gets the line of the
+      // outermost call, rather than the inlined function's line
+      D2R_InlineNode *outermost = row_inner->node;
+      for(; outermost->parent != 0; outermost = outermost->parent) {}
+      d2r_line_table_builder_append(arena, scratch_arena, line_tables, file_seq_map, unit_builder, first_open_builder, voff, piece_opl, outermost->call_src_file, outermost->call_line, outermost->call_col);
+    }
+    else
+    {
+      // rjf: the innermost site's table (or the unit's) gets the row's own line
+      D2R_LineTableBuilder *inner_builder = inner ? inner->node->builder : unit_builder;
+      d2r_line_table_builder_append(arena, scratch_arena, line_tables, file_seq_map, inner_builder, first_open_builder, voff, piece_opl, row->src_file, row->line_num, row->col_num);
+      
+      // rjf: each enclosing site's table (and finally the unit's) gets the line of the call it inlined
+      for(D2R_InlineNode *child = inner ? inner->node : 0; child != 0; child = child->parent)
+      {
+        D2R_LineTableBuilder *outer_builder = child->parent ? child->parent->builder : unit_builder;
+        d2r_line_table_builder_append(arena, scratch_arena, line_tables, file_seq_map, outer_builder, first_open_builder, voff, piece_opl, child->call_src_file, child->call_line, child->call_col);
+      }
+    }
+    
+    voff = piece_opl;
+  }
+}
+
+////////////////////////////////
 //~ rjf: Main Conversion Entry Point (New)
 
 internal RDIM_BakeParams
@@ -76,8 +273,21 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
     top_level_info.voff_max = acceptable_vaddr_range.max - base_vaddr;
     if(!params->deterministic)
     {
-      // TODO(rjf): top_level_info.guid = ...;
       top_level_info.producer_name = str8_lit(BUILD_TITLE_STRING_LITERAL);
+    }
+    // rjf: Mach-O images carry an LC_UUID that changes with every relink. record it, so that
+    // the debugger can tell an RDI converted from another build of the same executable path
+    // apart from a fresh one even when file timestamps cannot (see the staleness check in
+    // `dbg_info.c`; Zig, for one, installs executables with the timestamp of its cached copy).
+    if(params->exe_kind == ExecutableImageKind_Macho && params->exe_data.size != 0)
+    {
+      Temp scratch = scratch_begin(0, 0);
+      MACHO_Bin exe_bin = macho_bin_from_data(scratch.arena, params->exe_data);
+      if(exe_bin.has_uuid)
+      {
+        MemoryCopy(&top_level_info.guid, &exe_bin.uuid, sizeof(top_level_info.guid));
+      }
+      scratch_end(scratch);
     }
   }
   
@@ -491,44 +701,28 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
   ////////////////////////////
   //- rjf: parse each unit's line info; produce line tables
   //
+  //
+  // NOTE(rjf): the rows are only decoded here; the line tables are built from
+  // them once the inline sites are known (see "produce line tables from line
+  // rows & inline sites", after the symbols are converted).
+  //
   RDIM_LineTableChunkList *unit_line_table_chunk_lists = 0;
   RDIM_LineTable **unit_line_tables = 0;
-  ProfScope("parse each unit's line info; produce line tables")
+  D2R_UnitLineSeqs *unit_line_seqs = 0;
+  D2R_FileSeqMap *unit_file_seq_maps = 0;
+  ProfScope("parse each unit's line info; decode line rows")
   {
     //- rjf: prep outputs
-    typedef struct LineSeqChunk LineSeqChunk;
-    struct LineSeqChunk
-    {
-      LineSeqChunk *next;
-      U64 *voffs;
-      U32 *line_nums;
-      U16 *col_nums;
-      U64 line_count;
-      U64 line_cap;
-    };
-    typedef struct FileSeqNode FileSeqNode;
-    struct FileSeqNode
-    {
-      FileSeqNode *next;
-      RDIM_SrcFile *src_file;
-      RDIM_SrcFileLineMapFragment *first_line_map_fragment;
-      RDIM_SrcFileLineMapFragment *last_line_map_fragment;
-    };
-    typedef struct FileSeqMap FileSeqMap;
-    struct FileSeqMap
-    {
-      U64 slots_count;
-      FileSeqNode **slots;
-    };
-    FileSeqMap *unit_file_seq_maps = 0;
     if(lane_idx() == 0)
     {
       unit_line_table_chunk_lists = push_array(scratch.arena, RDIM_LineTableChunkList, unit_count);
       unit_line_tables = push_array(scratch.arena, RDIM_LineTable *, unit_count);
-      unit_file_seq_maps = push_array(scratch.arena, FileSeqMap, unit_count);
+      unit_line_seqs = push_array(scratch.arena, D2R_UnitLineSeqs, unit_count);
+      unit_file_seq_maps = push_array(scratch.arena, D2R_FileSeqMap, unit_count);
     }
     lane_sync_u64(&unit_line_table_chunk_lists, 0);
     lane_sync_u64(&unit_line_tables, 0);
+    lane_sync_u64(&unit_line_seqs, 0);
     lane_sync_u64(&unit_file_seq_maps, 0);
     
     //- rjf: wide per-unit parse
@@ -560,7 +754,7 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
       
       //- rjf: set up per-unit file sequence map
       unit_file_seq_maps[unit_idx].slots_count = line_table_header->files.count + 1;
-      unit_file_seq_maps[unit_idx].slots = push_array(scratch.arena, FileSeqNode *, unit_file_seq_maps[unit_idx].slots_count);
+      unit_file_seq_maps[unit_idx].slots = push_array(scratch.arena, D2R_FileSeqNode *, unit_file_seq_maps[unit_idx].slots_count);
       
       //- rjf: set up vm registers
       DW2_LineVMRegs vm_regs = {0};
@@ -572,10 +766,7 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
       
       //- rjf: run the line opcode program
       B32 emit_line = 0;
-      RDIM_SrcFile *line_seq_src_file = 0;
-      LineSeqChunk *first_line_seq_chunk = 0;
-      LineSeqChunk *last_line_seq_chunk = 0;
-      U64 total_line_seq_count = 0;
+      D2R_LineSeq *line_seq = 0;
       for(U64 off = 0, next_off = 0; off <= unit_line_table_data.size; off = next_off)
       {
         next_off = unit_line_table_data.size;
@@ -766,77 +957,19 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
           src_file = unit_src_file_maps[unit_idx].v[vm_regs.file_index];
         }
         
-        //- rjf: sequence ended explicitly, or a line is being emitted for a different
-        // file, or end of stream? -> push to line table
+        //- rjf: sequence ended explicitly, or end of stream? -> close the sequence
         //
-        // NOTE(rjf): the file change must only be applied when a row is actually being
-        // emitted. compilers set the file (DW_LNS_set_file) *before* the opcode which
-        // advances the address & emits the row, so splitting when the register changes
-        // would terminate the previous sequence at the previous row's address, leaving
-        // its last line as a zero-length range, and the code up to the next row without
-        // any line info. rows with line 0 (no source), and rows which are not
-        // statements (is_stmt == 0), never split nor begin a line, so that their
-        // code stays attributed to the preceding line (see below).
+        // NOTE(rjf): the row emitted by DW_LNE_end_sequence only marks where
+        // the sequence's last line ends; it does not begin a line (the register
+        // reset below sees to that).
         //
-        B32 emitting_row_in_new_file = (emit_line && vm_regs.line != 0 && vm_regs.is_stmt && src_file != line_seq_src_file && first_line_seq_chunk != 0);
-        if(line_seq_src_file != 0 && (vm_regs.end_sequence || emitting_row_in_new_file || off >= unit_line_table_data.size))
+        if(vm_regs.end_sequence || off >= unit_line_table_data.size)
         {
-          // rjf: combine voffs/lines/cols
-          U64 seq_line_count = total_line_seq_count;
-          U64 *seq_voffs = push_array(arena, U64, seq_line_count+1);
-          U32 *seq_lines = push_array(arena, U32, seq_line_count);
-          U16 *seq_cols = push_array(arena, U16, 2*seq_line_count);
+          if(line_seq != 0)
           {
-            U64 voff_idx = 0;
-            U64 line_idx = 0;
-            U64 col_idx = 0;
-            for(LineSeqChunk *c = first_line_seq_chunk; c != 0; c = c->next)
-            {
-              MemoryCopy(seq_voffs + voff_idx, c->voffs, sizeof(c->voffs[0]) * c->line_count);
-              MemoryCopy(seq_lines + line_idx, c->line_nums, sizeof(c->line_nums[0]) * c->line_count);
-              MemoryCopy(seq_cols + col_idx, c->col_nums, sizeof(c->col_nums[0]) * 2 * c->line_count);
-              voff_idx += c->line_count;
-              line_idx += c->line_count;
-              col_idx += 2*c->line_count;
-            }
-            seq_voffs[seq_line_count] = vm_regs.address - base_vaddr;
+            line_seq->voff_opl = vm_regs.address - base_vaddr;
+            line_seq = 0;
           }
-          
-          // rjf: push sequence to line table
-          RDIM_LineSequence *seq = rdim_line_table_push_sequence(arena, dst_line_tables, dst_line_table, line_seq_src_file, seq_voffs, seq_lines, seq_cols, seq_line_count);
-          
-          // rjf: map src file -> file seq node
-          FileSeqNode *file_seq_n = 0;
-          {
-            U64 hash = u64_hash_from_str8(str8_struct(&line_seq_src_file));
-            U64 slot_idx = hash%unit_file_seq_maps[unit_idx].slots_count;
-            for(FileSeqNode *n = unit_file_seq_maps[unit_idx].slots[slot_idx]; n != 0; n = n->next)
-            {
-              if(n->src_file == line_seq_src_file)
-              {
-                file_seq_n = n;
-                break;
-              }
-            }
-            if(file_seq_n == 0)
-            {
-              file_seq_n = push_array(scratch.arena, FileSeqNode, 1);
-              SLLStackPush(unit_file_seq_maps[unit_idx].slots[slot_idx], file_seq_n);
-              file_seq_n->src_file = line_seq_src_file;
-            }
-          }
-          
-          // rjf: record sequence in file seq node
-          {
-            RDIM_SrcFileLineMapFragment *f = push_array(scratch.arena, RDIM_SrcFileLineMapFragment, 1);
-            SLLQueuePush(file_seq_n->first_line_map_fragment, file_seq_n->last_line_map_fragment, f);
-            f->seq = seq;
-          }
-          
-          // rjf: reset
-          first_line_seq_chunk = last_line_seq_chunk = 0;
-          total_line_seq_count = 0;
-          line_seq_src_file = 0;
           if(vm_regs.end_sequence)
           {
             MemoryZeroStruct(&vm_regs);
@@ -846,18 +979,16 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
           }
         }
         
-        //- rjf: emit lines (rows with no address, or with line 0, are consumed but not emitted)
-        B32 emit_row = (emit_line && vm_regs.address != 0 && vm_regs.line != 0);
+        //- rjf: emit lines (rows with no address, with line 0, or in an unknown file, are consumed but not emitted)
+        B32 emit_row = (emit_line && vm_regs.address != 0 && vm_regs.line != 0 && src_file != 0);
         emit_line = 0;
         if(emit_row)
         {
-          // rjf: grab the last emitted line info
-          U32 last_line = 0;
-          U16 last_col = 0;
-          if(last_line_seq_chunk != 0 && last_line_seq_chunk->line_count > 0)
+          // rjf: grab the last emitted row
+          D2R_LineRow *last_row = 0;
+          if(line_seq != 0 && line_seq->last_chunk != 0 && line_seq->last_chunk->count > 0)
           {
-            last_line = last_line_seq_chunk->line_nums[last_line_seq_chunk->line_count-1];
-            last_col = last_line_seq_chunk->col_nums[last_line_seq_chunk->line_count-1];
+            last_row = &line_seq->last_chunk->v[line_seq->last_chunk->count-1];
           }
           
           // rjf: determine if we need a new line
@@ -871,32 +1002,35 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
           // scheduled & merged code, heavily in optimized builds). They do not begin
           // a new line here, so that their code is stepped through as part of the
           // preceding statement, as other debuggers do; only the first row of a
-          // sequence always begins one.
+          // sequence always begins one. a statement row in another file always
+          // begins a line, even at the same line number.
           //
-          B32 need_new_line = (last_line_seq_chunk == 0 || (vm_regs.is_stmt && last_line != (U32)vm_regs.line));
+          B32 need_new_line = (last_row == 0 || (vm_regs.is_stmt && (last_row->line_num != (U32)vm_regs.line || last_row->src_file != src_file)));
           
-          // rjf: need new line -> grab chunk
-          LineSeqChunk *chunk = last_line_seq_chunk;
-          if(need_new_line && (chunk == 0 || chunk->line_count >= chunk->line_cap))
-          {
-            chunk = push_array(scratch.arena, LineSeqChunk, 1);
-            SLLQueuePush(first_line_seq_chunk, last_line_seq_chunk, chunk);
-            chunk->line_cap = 64;
-            chunk->voffs = push_array(scratch.arena, U64, chunk->line_cap + 1);
-            chunk->line_nums = push_array(scratch.arena, U32, chunk->line_cap);
-            chunk->col_nums = push_array(scratch.arena, U16, 2*chunk->line_cap);
-          }
-          
-          // rjf: need new line -> push
+          // rjf: need new line -> push row (beginning a sequence, if needed)
           if(need_new_line)
           {
-            U64 chunk_line_idx = chunk->line_count;
-            chunk->voffs[chunk_line_idx] = vm_regs.address - base_vaddr;
-            chunk->line_nums[chunk_line_idx] = (U32)vm_regs.line;
-            chunk->col_nums[chunk_line_idx] = (U16)vm_regs.column;
-            chunk->line_count += 1;
-            total_line_seq_count += 1;
-            line_seq_src_file = src_file;
+            if(line_seq == 0)
+            {
+              line_seq = push_array(scratch.arena, D2R_LineSeq, 1);
+              SLLQueuePush(unit_line_seqs[unit_idx].first, unit_line_seqs[unit_idx].last, line_seq);
+              unit_line_seqs[unit_idx].count += 1;
+            }
+            D2R_LineRowChunk *chunk = line_seq->last_chunk;
+            if(chunk == 0 || chunk->count >= chunk->cap)
+            {
+              chunk = push_array(scratch.arena, D2R_LineRowChunk, 1);
+              chunk->cap = 64;
+              chunk->v = push_array_no_zero(scratch.arena, D2R_LineRow, chunk->cap);
+              SLLQueuePush(line_seq->first_chunk, line_seq->last_chunk, chunk);
+            }
+            D2R_LineRow *row = &chunk->v[chunk->count];
+            chunk->count += 1;
+            line_seq->row_count += 1;
+            row->voff     = vm_regs.address - base_vaddr;
+            row->src_file = src_file;
+            row->line_num = (U32)vm_regs.line;
+            row->col_num  = (U16)vm_regs.column;
             // NOTE(rjf): use for comparing against llvm-dwarfdump --debug-line
 #if 0
             printf("0x%016I64x %6i %6i %6i %3i %13I64x %7i %s%s%s%s\n",
@@ -924,47 +1058,7 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
     }
     lane_sync();
     
-    //- rjf: equip source files with their fragments
-    //
-    // TODO(rjf): this can *almost* be wide, but we are relying on a few top-level
-    // summations inside the RDIM_SrcFileChunkList when we push a sequence to a src
-    // file. if we just summed those later when baking (probably fine), then this
-    // could go wide across all src files, which would be very nice. just lane-0ing
-    // for now. when possible, we can probably do the same thing in PDB too.
-    //
-    if(lane_idx() == 0)
-    {
-      for EachIndex(unit_idx, unit_count)
-      {
-        FileSeqMap *file_seq_map = &unit_file_seq_maps[unit_idx];
-        for EachIndex(slot_idx, file_seq_map->slots_count)
-        {
-          for(FileSeqNode *n = file_seq_map->slots[slot_idx]; n != 0; n = n->next)
-          {
-            for(RDIM_SrcFileLineMapFragment *f = n->first_line_map_fragment; f != 0; f = f->next)
-            {
-              rdim_src_file_push_line_sequence(arena, all_src_files, n->src_file, f->seq);
-            }
-          }
-        }
-      }
-    }
-    lane_sync();
   }
-  
-  ////////////////////////////
-  //- rjf: join all line tables
-  //
-  RDIM_LineTableChunkList *all_line_tables = 0;
-  if(lane_idx() == 0)
-  {
-    all_line_tables = push_array(scratch.arena, RDIM_LineTableChunkList, 1);
-    for EachIndex(unit_idx, unit_count)
-    {
-      rdim_line_table_chunk_list_concat_in_place(all_line_tables, &unit_line_table_chunk_lists[unit_idx]);
-    }
-  }
-  lane_sync_u64(&all_line_tables, 0);
   
   ////////////////////////////
   //- rjf: find all offsets of top-level tag trees across all units
@@ -3071,6 +3165,10 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
     RDIM_SymbolChunkList procedures;
     RDIM_ScopeChunkList scopes;
     RDIM_InlineSiteChunkList inline_sites;
+    RDIM_LineTableChunkList line_tables; // the inline sites' line tables
+    D2R_InlineNode *first_inline_node;
+    D2R_InlineNode *last_inline_node;
+    U64 inline_node_count;
   };
   D2R_ScopeContainerMap *scope_container_map = 0;
   D2R_SubUnitWorkArtifacts *sub_unit_work_artifacts = 0;
@@ -3119,6 +3217,7 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
           RDIM_Type *container_type;
           RDIM_Namespace *container_namespace;
           RDIM_LocationCaseList framebase_location_cases;
+          D2R_InlineNode *inline_node; // when the tag is an inlined subroutine
         };
         D2R_ParentNode *top_parent = 0;
         D2R_ParentNode *free_parent = 0;
@@ -3150,6 +3249,10 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
           DW2_Attrib *framebase_attrib = &dw2_attrib_nil;
           DW2_Attrib *external_attrib = &dw2_attrib_nil;
           DW2_Attrib *decl_attrib = &dw2_attrib_nil;
+          DW2_Attrib *abstract_origin_attrib = &dw2_attrib_nil;
+          DW2_Attrib *call_file_attrib = &dw2_attrib_nil;
+          DW2_Attrib *call_line_attrib = &dw2_attrib_nil;
+          DW2_Attrib *call_column_attrib = &dw2_attrib_nil;
           for EachNode(n, DW2_AttribNode, tag.attribs.first)
           {
             switch(n->v.attrib_kind)
@@ -3168,6 +3271,10 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
               Case(framebase, FrameBase);
               Case(external,  External);
               Case(decl,      Declaration);
+              Case(abstract_origin, AbstractOrigin);
+              Case(call_file,       CallFile);
+              Case(call_line,       CallLine);
+              Case(call_column,     CallColumn);
 #undef Case
             }
           }
@@ -3182,6 +3289,43 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
           B32 is_decl = (decl_attrib != &dw2_attrib_nil);
           
           ////////////////////////
+          //- rjf: resolve abstract origins
+          //
+          // inlined subroutines, their parameters & variables, and out-of-line
+          // instances of functions which were also inlined, carry no name or type
+          // of their own; they refer to the abstract instance, which carries them.
+          //
+          if(abstract_origin_attrib != &dw2_attrib_nil &&
+             (tag.kind == DW_TagKind_InlinedSubroutine ||
+              tag.kind == DW_TagKind_SubProgram ||
+              tag.kind == DW_TagKind_Variable ||
+              tag.kind == DW_TagKind_FormalParameter))
+          {
+            U64 origin_off = dw2_reference_info_off_from_form_val(unit_parse_ctx, &abstract_origin_attrib->val);
+            for(U64 hop_idx = 0; hop_idx < 8 && origin_off != 0 && contains_1u64(unit_info_tag_range, origin_off); hop_idx += 1)
+            {
+              DW2_Tag *origin_tag = push_array(scratch2.arena, DW2_Tag, 1);
+              dw2_read_tag(scratch2.arena, raw, unit_parse_ctx, raw->sec[DW_SectionKind_Info].data, origin_off, origin_tag);
+              if(name.size == 0)      { name      = dw2_attrib_from_kind(origin_tag, DW_AttribKind_Name)->val.string; }
+              if(link_name.size == 0) { link_name = dw2_attrib_from_kind(origin_tag, DW_AttribKind_LinkageName)->val.string; }
+              if(type_attrib == &dw2_attrib_nil)
+              {
+                DW2_Attrib *origin_type_attrib = dw2_attrib_from_kind(origin_tag, DW_AttribKind_Type);
+                if(origin_type_attrib != &dw2_attrib_nil)
+                {
+                  type_attrib = origin_type_attrib;
+                }
+              }
+              DW2_Attrib *next_origin_attrib = dw2_attrib_from_kind(origin_tag, DW_AttribKind_AbstractOrigin);
+              if(next_origin_attrib == &dw2_attrib_nil)
+              {
+                next_origin_attrib = dw2_attrib_from_kind(origin_tag, DW_AttribKind_Specification);
+              }
+              origin_off = (next_origin_attrib != &dw2_attrib_nil) ? dw2_reference_info_off_from_form_val(unit_parse_ctx, &next_origin_attrib->val) : 0;
+            }
+          }
+          
+          ////////////////////////
           //- rjf: unpack ranges
           //
           RDIM_Rng1U64List ranges = {0};
@@ -3192,7 +3336,10 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
               Rng1U64List tag_ranges = dw2_rnglist_from_form_val(temp.arena, unit_parse_ctx, raw, ranges_attrib->val);
               for EachNode(n, Rng1U64Node, tag_ranges.first)
               {
-                rdim_rng1u64_list_push(arena, &ranges, (RDIM_Rng1U64){.min = n->v.min, .max = n->v.max});
+                // NOTE: range lists resolve to vaddrs (relative to the unit's base
+                // address); scopes are keyed by voff, like the low_pc/high_pc path
+                // below. (only visible where the image base is not 0, e.g. Mach-O)
+                rdim_rng1u64_list_push(arena, &ranges, (RDIM_Rng1U64){.min = n->v.min - base_vaddr, .max = n->v.max - base_vaddr});
               }
               temp_end(temp);
             }
@@ -4061,6 +4208,7 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
           //
           RDIM_Symbol *new_symbol = 0;
           RDIM_Scope *new_scope_open = 0;
+          D2R_InlineNode *new_inline_node = 0;
           B32 parent_tag_is_container_to_deduped_tags = 0;
           switch(tag.kind)
           {
@@ -4098,7 +4246,45 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
             //- rjf: inline site
             case DW_TagKind_InlinedSubroutine:
             {
-              // TODO(rjf)
+              // rjf: the scope of the inlined code, marked as an inline site
+              RDIM_Scope *scope = rdim_scope_chunk_list_push(arena, &dst_artifacts->scopes, chunk_count);
+              scope->voff_ranges = ranges;
+              dst_artifacts->scopes.scope_voff_count += 2*ranges.count;
+              RDIM_InlineSite *inline_site = rdim_inline_site_chunk_list_push(arena, &dst_artifacts->inline_sites, chunk_count);
+              inline_site->name = (name.size != 0) ? name : link_name;
+              inline_site->type = type;
+              inline_site->line_table = rdim_line_table_chunk_list_push(arena, &dst_artifacts->line_tables, chunk_count);
+              scope->inline_site = inline_site;
+              new_scope_open = scope;
+              
+              // rjf: the call site, for the unit's line table (see "produce line tables from line rows & inline sites")
+              D2R_InlineNode *node = push_array(arena, D2R_InlineNode, 1);
+              SLLQueuePush(dst_artifacts->first_inline_node, dst_artifacts->last_inline_node, node);
+              dst_artifacts->inline_node_count += 1;
+              node->site = inline_site;
+              node->ranges = ranges;
+              if(call_file_attrib != &dw2_attrib_nil)
+              {
+                U64 call_file_idx = call_file_attrib->val.u128.u64[0];
+                if(call_file_idx < unit_line_table_headers[unit_idx].files.count)
+                {
+                  node->call_src_file = unit_src_file_maps[unit_idx].v[call_file_idx];
+                }
+              }
+              node->call_line = (U32)call_line_attrib->val.u128.u64[0];
+              node->call_col  = (U16)call_column_attrib->val.u128.u64[0];
+              for(D2R_ParentNode *p = top_parent; p != 0; p = p->next)
+              {
+                if(p->tag_kind == DW_TagKind_InlinedSubroutine)
+                {
+                  if(node->parent == 0)
+                  {
+                    node->parent = p->inline_node;
+                  }
+                  node->depth += 1;
+                }
+              }
+              new_inline_node = node;
             }break;
             
             //- rjf: variables
@@ -4271,6 +4457,7 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
             }
             n->tag_kind = tag.kind;
             n->info_off = start_off;
+            n->inline_node = new_inline_node;
             n->scope = new_scope_open ? new_scope_open : top_parent ? top_parent->scope : 0;
             n->container_type = new_scope_open ? 0 : container_type;
             n->container_namespace = new_scope_open ? 0 : container_namespace;
@@ -4344,10 +4531,178 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
           rdim_symbol_chunk_list_concat_in_place(&dst_unit->procedures, &sub_unit_work_artifacts[work_idx].procedures);
           rdim_scope_chunk_list_concat_in_place(&dst_unit->scopes, &sub_unit_work_artifacts[work_idx].scopes);
           rdim_inline_site_chunk_list_concat_in_place(&dst_unit->inline_sites, &sub_unit_work_artifacts[work_idx].inline_sites);
+          rdim_line_table_chunk_list_concat_in_place(&unit_line_table_chunk_lists[unit_idx], &sub_unit_work_artifacts[work_idx].line_tables);
         }
       }
     }
     lane_sync();
+  }
+  
+  ////////////////////////////
+  //- rjf: produce line tables from line rows & inline sites
+  //
+  // DWARF line programs attribute the code of an inlined call to the inlined
+  // function's own source lines, and record the call site's line only on the
+  // DW_TAG_inlined_subroutine. RDI expects it the other way around, the way
+  // PDBs store it: a unit's line table carries the call site's line across
+  // the inlined code (so that stepping, which consults the unit's table only,
+  // steps over an inlined call like any other call), and each inline site's
+  // own line table carries the inlined function's lines (shown as inline
+  // frames). so, now that the inline sites are known, each unit's rows are
+  // split at inline site boundaries and distributed into the unit's table
+  // and the sites' tables.
+  //
+  RDIM_LineTableChunkList *all_line_tables = 0;
+  ProfScope("produce line tables from line rows & inline sites")
+  {
+    //- rjf: wide per-unit distribution
+    U64 unit_take_idx = 0;
+    U64 *unit_take_idx_ptr = &unit_take_idx;
+    lane_sync_u64(&unit_take_idx_ptr, 0);
+    for(;;)
+    {
+      U64 unit_idx = ins_atomic_u64_inc_eval(unit_take_idx_ptr) - 1;
+      if(unit_idx >= unit_count)
+      {
+        break;
+      }
+      Temp scratch2 = scratch_begin(&scratch.arena, 1);
+      RDIM_LineTableChunkList *dst_line_tables = &unit_line_table_chunk_lists[unit_idx];
+      D2R_FileSeqMap *file_seq_map = &unit_file_seq_maps[unit_idx];
+      
+      //- rjf: gather this unit's inline sites, as sorted ranges
+      D2R_InlineRange *inline_ranges = 0;
+      U64 inline_range_count = 0;
+      {
+        for EachIndex(work_idx, sub_unit_works_count)
+        {
+          if(sub_unit_works[work_idx].unit_idx == unit_idx)
+          {
+            for EachNode(node, D2R_InlineNode, sub_unit_work_artifacts[work_idx].first_inline_node)
+            {
+              inline_range_count += node->ranges.count;
+            }
+          }
+        }
+        inline_ranges = push_array_no_zero(scratch2.arena, D2R_InlineRange, inline_range_count);
+        U64 inline_range_idx = 0;
+        for EachIndex(work_idx, sub_unit_works_count)
+        {
+          if(sub_unit_works[work_idx].unit_idx == unit_idx)
+          {
+            for EachNode(node, D2R_InlineNode, sub_unit_work_artifacts[work_idx].first_inline_node)
+            {
+              node->builder = push_array(scratch2.arena, D2R_LineTableBuilder, 1);
+              node->builder->table = node->site->line_table;
+              for EachNode(r, RDIM_Rng1U64Node, node->ranges.first)
+              {
+                D2R_InlineRange *range = &inline_ranges[inline_range_idx];
+                inline_range_idx += 1;
+                range->min = r->v.min;
+                range->max = r->v.max;
+                range->depth = node->depth;
+                range->node = node;
+                range->parent = 0;
+              }
+            }
+          }
+        }
+        quick_sort(inline_ranges, inline_range_count, sizeof(D2R_InlineRange), d2r_inline_range_compare);
+        
+        // rjf: link each range to the innermost range enclosing it (the sites
+        // nest like the tags they came from; a range which overlaps, but does
+        // not lie within, the one before it is treated as top-level)
+        {
+          Temp temp = temp_begin(scratch2.arena);
+          D2R_InlineRange **stack = push_array_no_zero(temp.arena, D2R_InlineRange *, inline_range_count);
+          U64 stack_count = 0;
+          for EachIndex(idx, inline_range_count)
+          {
+            D2R_InlineRange *range = &inline_ranges[idx];
+            for(; stack_count > 0 && stack[stack_count-1]->max <= range->min; stack_count -= 1) {}
+            range->parent = (stack_count > 0 && range->max <= stack[stack_count-1]->max) ? stack[stack_count-1] : 0;
+            stack[stack_count] = range;
+            stack_count += 1;
+          }
+          temp_end(temp);
+        }
+      }
+      
+      //- rjf: distribute the unit's rows
+      D2R_LineTableBuilder *unit_builder = push_array(scratch2.arena, D2R_LineTableBuilder, 1);
+      unit_builder->table = unit_line_tables[unit_idx];
+      for EachNode(seq, D2R_LineSeq, unit_line_seqs[unit_idx].first)
+      {
+        D2R_LineTableBuilder *first_open_builder = 0;
+        D2R_LineRow *prev_row = 0;
+        for(D2R_LineRowChunk *chunk = seq->first_chunk; chunk != 0; chunk = chunk->next)
+        {
+          for EachIndex(chunk_row_idx, chunk->count)
+          {
+            D2R_LineRow *row = &chunk->v[chunk_row_idx];
+            if(prev_row != 0)
+            {
+              d2r_distribute_line_row(arena, scratch2.arena, dst_line_tables, file_seq_map, unit_builder, &first_open_builder, inline_ranges, inline_range_count, prev_row, row->voff);
+            }
+            prev_row = row;
+          }
+        }
+        if(prev_row != 0)
+        {
+          d2r_distribute_line_row(arena, scratch2.arena, dst_line_tables, file_seq_map, unit_builder, &first_open_builder, inline_ranges, inline_range_count, prev_row, seq->voff_opl);
+        }
+        
+        // rjf: end of the DWARF sequence -> end every sequence begun from it
+        for(D2R_LineTableBuilder *b = first_open_builder, *next = 0; b != 0; b = next)
+        {
+          next = b->next_open;
+          b->next_open = 0;
+          b->is_open = 0;
+          d2r_line_table_builder_flush(arena, dst_line_tables, file_seq_map, b);
+        }
+      }
+      
+      scratch_end(scratch2);
+    }
+    lane_sync();
+    
+    //- rjf: equip source files with their fragments
+    //
+    // TODO(rjf): this can *almost* be wide, but we are relying on a few top-level
+    // summations inside the RDIM_SrcFileChunkList when we push a sequence to a src
+    // file. if we just summed those later when baking (probably fine), then this
+    // could go wide across all src files, which would be very nice. just lane-0ing
+    // for now. when possible, we can probably do the same thing in PDB too.
+    //
+    if(lane_idx() == 0)
+    {
+      for EachIndex(unit_idx, unit_count)
+      {
+        D2R_FileSeqMap *file_seq_map = &unit_file_seq_maps[unit_idx];
+        for EachIndex(slot_idx, file_seq_map->slots_count)
+        {
+          for(D2R_FileSeqNode *n = file_seq_map->slots[slot_idx]; n != 0; n = n->next)
+          {
+            for(RDIM_SrcFileLineMapFragment *f = n->first_line_map_fragment; f != 0; f = f->next)
+            {
+              rdim_src_file_push_line_sequence(arena, all_src_files, n->src_file, f->seq);
+            }
+          }
+        }
+      }
+    }
+    lane_sync();
+    
+    //- rjf: join all line tables
+    if(lane_idx() == 0)
+    {
+      all_line_tables = push_array(scratch.arena, RDIM_LineTableChunkList, 1);
+      for EachIndex(unit_idx, unit_count)
+      {
+        rdim_line_table_chunk_list_concat_in_place(all_line_tables, &unit_line_table_chunk_lists[unit_idx]);
+      }
+    }
+    lane_sync_u64(&all_line_tables, 0);
   }
   
   ////////////////////////////

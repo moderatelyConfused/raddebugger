@@ -810,6 +810,49 @@ di_async_tick(void)
             {
               t->rdi_is_stale = (header.encoding_version != RDI_ENCODING_VERSION);
             }
+            
+            // rjf: converted from another build of the executable? the timestamps cannot
+            // always tell: build systems install cached binaries with their old modification
+            // times (Zig does), so switching e.g. a release build back to a debug build at
+            // the same path leaves an RDI which is newer than the executable, yet describes
+            // other code. Mach-O images carry an LC_UUID, which the converter records in the
+            // RDI's guid; compare them.
+            if(!t->rdi_is_stale && !og_is_rdi)
+            {
+              Guid og_uuid = {0};
+              if(macho_uuid_from_file_path(og_path, &og_uuid))
+              {
+                Temp temp = temp_begin(scratch.arena);
+                t->rdi_is_stale = 1;
+                U64 sections_off = header.data_section_off;
+                U64 sections_size = sizeof(RDI_Section)*header.data_section_count;
+                RDI_Section *sections = push_array(temp.arena, RDI_Section, header.data_section_count);
+                if(RDI_SectionKind_TopLevelInfo < header.data_section_count &&
+                   file_read(file, r1u64(sections_off, sections_off+sections_size), sections) == sections_size)
+                {
+                  RDI_Section *tli_section = &sections[RDI_SectionKind_TopLevelInfo];
+                  RDI_TopLevelInfo tli = {0};
+                  if(tli_section->encoding == RDI_SectionEncoding_Unpacked &&
+                     tli_section->encoded_size >= sizeof(tli) &&
+                     file_read_struct(file, tli_section->off, &tli) == sizeof(tli))
+                  {
+                    t->rdi_is_stale = !MemoryMatch(&tli.guid, &og_uuid, sizeof(og_uuid));
+                  }
+                }
+                temp_end(temp);
+              }
+            }
+            
+            // rjf: converted by an older build of the debugger than this one? converter fixes
+            // which do not change the encoding would otherwise never reach existing RDIs.
+            if(!t->rdi_is_stale && !og_is_rdi)
+            {
+              FileProperties debugger_props = properties_from_file_path(get_process_info()->binary_file_path);
+              if(debugger_props.modified != 0 && props.modified < debugger_props.modified)
+              {
+                t->rdi_is_stale = 1;
+              }
+            }
           }
           file_close(file);
         }

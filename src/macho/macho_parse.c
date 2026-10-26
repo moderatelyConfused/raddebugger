@@ -267,13 +267,7 @@ macho_bin_from_data(Arena *arena, String8 data)
             MACHO_UUIDCommand uuid_cmd = {0};
             str8_deserial_read_struct(slice, off, &uuid_cmd);
             bin.has_uuid = 1;
-            // NOTE: Mach-O UUIDs are raw 16-byte arrays. we unpack them such
-            // that the canonical (big-endian) textual form matches what Apple
-            // tools print, when formatted via data1/data2/data3/data4.
-            bin.uuid.data1 = ((U32)uuid_cmd.uuid[0] << 24) | ((U32)uuid_cmd.uuid[1] << 16) | ((U32)uuid_cmd.uuid[2] << 8) | (U32)uuid_cmd.uuid[3];
-            bin.uuid.data2 = (U16)(((U16)uuid_cmd.uuid[4] << 8) | (U16)uuid_cmd.uuid[5]);
-            bin.uuid.data3 = (U16)(((U16)uuid_cmd.uuid[6] << 8) | (U16)uuid_cmd.uuid[7]);
-            MemoryCopy(bin.uuid.data4, &uuid_cmd.uuid[8], 8);
+            bin.uuid = macho_guid_from_uuid_bytes(uuid_cmd.uuid);
           }break;
 
           //- rjf: entry points
@@ -652,5 +646,79 @@ macho_dsym_path_from_exe_path(Arena *arena, String8 exe_path)
 {
   String8 exe_name = str8_skip_last_slash(exe_path);
   String8 result = str8f(arena, "%S.dSYM/Contents/Resources/DWARF/%S", exe_path, exe_name);
+  return result;
+}
+
+////////////////////////////////
+//~ rjf: Identity (LC_UUID)
+
+internal Guid
+macho_guid_from_uuid_bytes(U8 *uuid)
+{
+  // NOTE: Mach-O UUIDs are raw 16-byte arrays. we unpack them such
+  // that the canonical (big-endian) textual form matches what Apple
+  // tools print, when formatted via data1/data2/data3/data4.
+  Guid result = {0};
+  result.data1 = ((U32)uuid[0] << 24) | ((U32)uuid[1] << 16) | ((U32)uuid[2] << 8) | (U32)uuid[3];
+  result.data2 = (U16)(((U16)uuid[4] << 8) | (U16)uuid[5]);
+  result.data3 = (U16)(((U16)uuid[6] << 8) | (U16)uuid[7]);
+  MemoryCopy(result.data4, &uuid[8], 8);
+  return result;
+}
+
+internal B32
+macho_uuid_from_file_path(String8 path, Guid *out)
+{
+  B32 result = 0;
+  Temp scratch = scratch_begin(0, 0);
+  File file = file_open(AccessFlag_Read|AccessFlag_ShareRead, path);
+  if(!file_match(file, file_zero()))
+  {
+    //- rjf: select slice (thin file, or best slice of a fat file)
+    U64 slice_off = 0;
+    {
+      U8 fat_buf[sizeof(MACHO_FatHeader) + MACHO_FAT_ARCH_MAX_COUNT*sizeof(MACHO_FatArch64)];
+      U64 fat_read_size = file_read(file, r1u64(0, sizeof(fat_buf)), fat_buf);
+      MACHO_FatArchArray fat_arches = macho_fat_arch_array_from_data(scratch.arena, str8(fat_buf, fat_read_size));
+      if(fat_arches.count != 0)
+      {
+        U64 idx = macho_fat_arch_idx_from_array(&fat_arches);
+        slice_off = (idx < fat_arches.count) ? fat_arches.v[idx].offset : max_U64;
+      }
+    }
+    
+    //- rjf: read header
+    MACHO_Header64 hdr = {0};
+    if(slice_off != max_U64 &&
+       file_read_struct(file, slice_off, &hdr) == sizeof(hdr) &&
+       hdr.magic == MACHO_MH_MAGIC_64)
+    {
+      //- rjf: read load commands; scan for LC_UUID (bounds-checked; never trust cmdsize)
+      U64 cmds_off = slice_off + sizeof(hdr);
+      U64 cmds_size = ClampTop((U64)hdr.sizeofcmds, MB(16));
+      U8 *cmds = push_array_no_zero(scratch.arena, U8, cmds_size);
+      String8 cmds_data = str8(cmds, file_read(file, r1u64(cmds_off, cmds_off + cmds_size), cmds));
+      for(U64 off = 0, lc_idx = 0; lc_idx < hdr.ncmds && off + sizeof(MACHO_LoadCommand) <= cmds_data.size; lc_idx += 1)
+      {
+        MACHO_LoadCommand lc = {0};
+        str8_deserial_read_struct(cmds_data, off, &lc);
+        if(lc.cmdsize < sizeof(MACHO_LoadCommand))
+        {
+          break;
+        }
+        if(lc.cmd == MACHO_LC_UUID && lc.cmdsize >= sizeof(MACHO_UUIDCommand) && off + sizeof(MACHO_UUIDCommand) <= cmds_data.size)
+        {
+          MACHO_UUIDCommand uuid_cmd = {0};
+          str8_deserial_read_struct(cmds_data, off, &uuid_cmd);
+          *out = macho_guid_from_uuid_bytes(uuid_cmd.uuid);
+          result = 1;
+          break;
+        }
+        off += lc.cmdsize;
+      }
+    }
+    file_close(file);
+  }
+  scratch_end(scratch);
   return result;
 }

@@ -1644,6 +1644,22 @@ make_directory(String8 path)
   {
     result = 1;
   }
+  else if(errno == ENOENT)
+  {
+    // a parent is missing (e.g. ~/Library/Logs/raddbg for the logs folder
+    // ~/Library/Logs/raddbg/logs): create the intermediate directories, then
+    // retry.
+    for(U64 idx = 1; idx < path_copy.size; idx += 1)
+    {
+      if(path_copy.str[idx] == '/')
+      {
+        path_copy.str[idx] = 0;
+        mkdir((char *)path_copy.str, 0755);
+        path_copy.str[idx] = '/';
+      }
+    }
+    result = (mkdir((char *)path_copy.str, 0755) != -1) || file_path_exists(path);
+  }
   else
   {
     // match windows behavior

@@ -11891,6 +11891,73 @@ rd_init(CmdLine *cmdln)
   scratch_end(scratch);
 }
 
+////////////////////////////////
+//~ rjf: Inline Frame Selection
+
+// the depth of the innermost inline frame at the thread's instruction pointer:
+// 0 when it is not in inlined code (or the debug info is not ready yet). lines
+// at an address are listed from the unit's (the outermost call site) to the
+// innermost inlined function's, and inline depths index that list, so this
+// is the depth which shows the thread in the function it is actually in.
+// (the number of lines - frames - at vaddr: 0 without line info, 1 outside
+// of inlined code, more inside; the innermost inline depth is one less)
+internal U64
+rd_line_count_from_thread_vaddr(D_Entity *thread, U64 vaddr)
+{
+  Temp scratch = scratch_begin(0, 0);
+  U64 result = 0;
+  D_Entity *process = d_entity_ancestor_from_kind(thread, D_EntityKind_Process);
+  D_Entity *module = d_module_from_process_vaddr(process, vaddr);
+  if(module != &d_entity_nil)
+  {
+    D_Entity *dbg_path = d_entity_child_from_kind(module, D_EntityKind_DebugInfoPath);
+    DI_Key dbgi_key = d_dbgi_key_from_debug_info_path(dbg_path);
+    U64 voff = d_voff_from_vaddr(module, vaddr);
+    D_LineList lines = d_lines_from_dbgi_key_path_voff(scratch.arena, dbgi_key, dbg_path->string, voff);
+    result = lines.count;
+  }
+  scratch_end(scratch);
+  return result;
+}
+
+internal U64
+rd_innermost_inline_depth_from_thread(D_Entity *thread)
+{
+  // NOTE: the cached registers may still be those of the previous stop while a
+  // stop event is being handled; the stop handler passes the event's address.
+  U64 line_count = rd_line_count_from_thread_vaddr(thread, d_cached_ip_from_thread(thread->handle));
+  U64 result = (line_count > 0) ? line_count-1 : 0;
+  return result;
+}
+
+// the address range of the procedure containing the thread's instruction
+// pointer (its root scope's first range), or an empty range
+internal Rng1U64
+rd_procedure_vaddr_range_from_thread(D_Entity *thread)
+{
+  Rng1U64 result = {0};
+  Access *access = access_open();
+  D_Entity *process = d_entity_ancestor_from_kind(thread, D_EntityKind_Process);
+  U64 ip_vaddr = d_cached_ip_from_thread(thread->handle);
+  D_Entity *module = d_module_from_process_vaddr(process, ip_vaddr);
+  if(module != &d_entity_nil)
+  {
+    DI_Key dbgi_key = d_dbgi_key_from_module(module);
+    RDI_Parsed *rdi = di_rdi_from_key(access, dbgi_key, 0, 0);
+    U64 ip_voff = d_voff_from_vaddr(module, ip_vaddr);
+    RDI_Symbol *procedure = rdi_procedure_from_voff(rdi, ip_voff);
+    RDI_Scope *root_scope = rdi_element_from_name_idx(rdi, Scopes, procedure->root_scope_idx);
+    U64 all_scope_voffs_count = 0;
+    U64 *all_scope_voffs = rdi_table_from_name(rdi, ScopeVOffData, &all_scope_voffs_count);
+    if(root_scope->voff_range_first+1 < root_scope->voff_range_opl && root_scope->voff_range_first+1 < all_scope_voffs_count)
+    {
+      result = d_vaddr_range_from_voff_range(module, r1u64(all_scope_voffs[root_scope->voff_range_first], all_scope_voffs[root_scope->voff_range_first+1]));
+    }
+  }
+  access_close(access);
+  return result;
+}
+
 internal void
 rd_frame(void)
 {
@@ -13737,6 +13804,20 @@ rd_frame(void)
               }
             }
             
+            // rjf: step into, while viewing a frame enclosing an inlined call which the
+            // thread is already inside of (e.g. a step over ended at the inlined call's
+            // first instruction)? -> enter it by selecting the next inline frame; nothing runs
+            if(kind == RD_CmdKind_StepInto && processes.count != 0 && !d_ctrl_targets_running() && rd_base_regs()->unwind_count == 0)
+            {
+              D_Entity *thread = d_entity_from_handle(rd_base_regs()->thread);
+              U64 innermost_inline_depth = rd_innermost_inline_depth_from_thread(thread);
+              if(rd_base_regs()->inline_depth < innermost_inline_depth)
+              {
+                rd_cmd(RD_CmdKind_SelectUnwind, .unwind_count = 0, .inline_depth = rd_base_regs()->inline_depth+1);
+                break;
+              }
+            }
+            
             // rjf: determine if we have active targets
             CFG_NodePtrList targets = cfg_node_top_level_list_from_string(scratch.arena, str8_lit("target"));
             B32 has_active_targets = 0;
@@ -13809,12 +13890,26 @@ rd_frame(void)
               params.line_num      = rd_regs()->line_num;
               params.column_num    = rd_regs()->column_num;
               params.vaddr         = rd_regs()->vaddr;
+              // NOTE: the inline frame to step at is the selected one (the base registers);
+              // a command's own registers may carry an older selection
+              params.inline_depth  = rd_base_regs()->inline_depth;
               params.prefer_disasm = rd_regs()->prefer_disasm;
               params.pid           = rd_regs()->pid;
               params.targets.count = 1;
               params.targets.v = push_array(scratch.arena, D_Target, params.targets.count);
               params.targets.v[0] = rd_target_from_cfg(scratch.arena, cfg_node_from_id(rd_regs()->cfg));
               d_push_cmd((D_CmdKind)kind, &params);
+              
+              // rjf: stepping? -> remember what was stepped, for selecting the frame to show when it finishes
+              if(kind == RD_CmdKind_StepOver || kind == RD_CmdKind_StepInto || kind == RD_CmdKind_StepOut ||
+                 kind == RD_CmdKind_StepOverInst || kind == RD_CmdKind_StepIntoInst)
+              {
+                D_Entity *thread = d_entity_from_handle(rd_regs()->thread);
+                rd_state->last_step_kind = kind;
+                rd_state->last_step_inline_depth = params.inline_depth;
+                rd_state->last_step_proc_vaddr_range = rd_procedure_vaddr_range_from_thread(thread);
+                log_infof("step %S: inline depth %I64u (command regs: %I64u)\n", rd_cmd_kind_info_table[kind].string, params.inline_depth, rd_regs()->inline_depth);
+              }
             }
             
             // rjf: run-to-line? -> remember where we're running to, so we can render
@@ -13963,7 +14058,13 @@ rd_frame(void)
                 }
                 primary_args_string = str8_list_join(scratch.arena, &primary_args_strings, &(StringJoin){.sep = str8_lit(" ")});
               }
-              rd_regs_fill_slot_from_string(cmd_kind_info->query.slot, cmd_kind_info->query.expr, primary_args_string);
+              // NOTE: only when there are primary arguments: filling a slot from an
+              // empty string resets the file path & line (to "" and 1) which the
+              // `--file_path:<path>:<line>` option above may just have set.
+              if(primary_args_string.size != 0)
+              {
+                rd_regs_fill_slot_from_string(cmd_kind_info->query.slot, cmd_kind_info->query.expr, primary_args_string);
+              }
               rd_regs()->disable_addresses = 1;
               rd_push_cmd(cmd_kind_name, rd_regs());
             }
@@ -13980,6 +14081,8 @@ rd_frame(void)
             str8_list_pushf(scratch.arena, &state_parts, " running: %i\n", d_ctrl_targets_running());
             str8_list_pushf(scratch.arena, &state_parts, " run_gen: %I64u\n", d_run_gen());
             str8_list_pushf(scratch.arena, &state_parts, " stop_count: %I64u\n", d_stop_count());
+            str8_list_pushf(scratch.arena, &state_parts, " unwind_count: %I64u\n", rd_base_regs()->unwind_count);
+            str8_list_pushf(scratch.arena, &state_parts, " inline_depth: %I64u\n", rd_base_regs()->inline_depth);
             str8_list_pushf(scratch.arena, &state_parts, " ip: 0x%I64x\n", d_ctrl_last_stop_event().rip_vaddr);
             {
               Access *access = access_open();
@@ -15793,7 +15896,7 @@ rd_frame(void)
                   {
                     rip_vaddr = ip_vaddr;
                     unwind_index = frame_idx;
-                    inline_depth = 0;
+                    inline_depth = lines.count-1; // innermost inline frame
                     need_unwind_selection = 1;
                     break;
                   }
@@ -15832,7 +15935,7 @@ rd_frame(void)
             if(need_unwind_selection)
             {
               rd_state->base_regs.v.unwind_count = unwind_index;
-              rd_state->base_regs.v.inline_depth = 0;
+              rd_state->base_regs.v.inline_depth = inline_depth;
             }
             
             //- rjf: find-code-location on each affected window
@@ -17105,6 +17208,7 @@ rd_frame(void)
             U64 column_num = rd_regs()->column_num;
             U64 vaddr = rd_regs()->vaddr;
             String8 expr = rd_regs()->expr;
+            log_infof("%S: file_path=\"%S\" line=%I64u expr=\"%S\" vaddr=0x%I64x\n", rd_cmd_kind_info_table[kind].string, file_path, line_num, expr, vaddr);
             if(expr.size == 0 && vaddr != 0)
             {
               expr = str8f(scratch.arena, "0x%I64x", vaddr);
@@ -17576,13 +17680,17 @@ rd_frame(void)
             D_Entity *process = d_entity_ancestor_from_kind(thread, D_EntityKind_Process);
             D_Entity *module = d_module_from_process_vaddr(process, d_cached_ip_from_thread(thread->handle));
             D_Entity *server = d_entity_ancestor_from_kind(process, D_EntityKind_Server);
+            // NOTE: select the innermost inline frame, so that a thread stopped
+            // in inlined code is shown in the function it is in, rather than at
+            // the outermost call site (which may be in another file entirely)
+            U64 inline_depth = rd_innermost_inline_depth_from_thread(thread);
             rd_state->base_regs.v.unwind_count = 0;
-            rd_state->base_regs.v.inline_depth = 0;
+            rd_state->base_regs.v.inline_depth = inline_depth;
             rd_state->base_regs.v.thread  = thread->handle;
             rd_state->base_regs.v.module  = module->handle;
             rd_state->base_regs.v.process = process->handle;
             rd_state->base_regs.v.server  = server->handle;
-            rd_cmd(RD_CmdKind_FindThread, .thread = thread->handle, .unwind_count = 0, .inline_depth = 0);
+            rd_cmd(RD_CmdKind_FindThread, .thread = thread->handle, .unwind_count = 0, .inline_depth = inline_depth);
           }break;
           case RD_CmdKind_SelectUnwind:
           {
@@ -18488,6 +18596,28 @@ rd_frame(void)
           if(need_refocus && thread->kind == D_EntityKind_Thread && evt->cause != D_EventCause_InterruptedByHalt)
           {
             rd_cmd(RD_CmdKind_SelectThread, .thread = thread->handle, .auto_unwind = auto_unwind);
+            
+            // rjf: select the inline frame to show, when the stop has line info (the cached
+            // registers SelectThread looks at may still be the previous stop's; this uses
+            // the event's address). normally the innermost one - the function the thread
+            // is actually in. a step (other than into) which finished within the procedure
+            // it stepped keeps showing the frame it stepped: a step over which ends at the
+            // first instruction of a call inlined into that frame is shown at the call site,
+            // not inside the inlined callee; a step into enters it.
+            U64 line_count = rd_line_count_from_thread_vaddr(thread, vaddr);
+            if(line_count > 0)
+            {
+              U64 inline_depth = line_count-1;
+              if(evt->cause == D_EventCause_Finished &&
+                 d_ctrl_last_run_kind() != D_RunKind_Run &&
+                 rd_state->last_step_kind != RD_CmdKind_StepInto &&
+                 rd_state->last_step_kind != RD_CmdKind_StepIntoInst &&
+                 contains_1u64(rd_state->last_step_proc_vaddr_range, vaddr))
+              {
+                inline_depth = Min(rd_state->last_step_inline_depth, inline_depth);
+              }
+              rd_cmd(RD_CmdKind_SelectUnwind, .unwind_count = 0, .inline_depth = inline_depth);
+            }
           }
           
           // rjf: no stop-causing thread, but have selected thread? -> snap to selected
@@ -18669,7 +18799,14 @@ rd_frame(void)
   //
   if(!d_handle_match(d_handle_zero(), find_thread_retry))
   {
-    rd_cmd(RD_CmdKind_FindThread, .thread = find_thread_retry);
+    // NOTE: the debug info may not have been ready when the thread was selected;
+    // pick the innermost inline frame again now
+    U64 inline_depth = rd_innermost_inline_depth_from_thread(d_entity_from_handle(find_thread_retry));
+    if(rd_state->base_regs.v.unwind_count == 0)
+    {
+      rd_state->base_regs.v.inline_depth = inline_depth;
+    }
+    rd_cmd(RD_CmdKind_FindThread, .thread = find_thread_retry, .unwind_count = rd_state->base_regs.v.unwind_count, .inline_depth = rd_state->base_regs.v.inline_depth);
   }
   
   //////////////////////////////

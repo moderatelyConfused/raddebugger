@@ -146,6 +146,8 @@ internal U64 macho_fat_arch_idx_from_array(MACHO_FatArchArray *arches); // picks
 //~ rjf: Top-Level Binary Parsing
 
 internal MACHO_Bin macho_bin_from_data(Arena *arena, String8 data);
+internal Guid macho_guid_from_uuid_bytes(U8 *uuid);              // LC_UUID's raw 16 bytes -> Guid (its textual form matches Apple's tools)
+internal B32 macho_uuid_from_file_path(String8 path, Guid *out); // reads only the header & load commands (of the preferred slice of a fat file); 0 if not a 64-bit Mach-O, or without an LC_UUID
 
 ////////////////////////////////
 //~ rjf: Segment / Section Helpers

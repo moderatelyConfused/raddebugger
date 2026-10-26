@@ -320,7 +320,7 @@ d_trap_net_from_thread__step_over_inst(Arena *arena, D_Entity *thread)
 }
 
 internal D_TrapNet
-d_trap_net_from_thread__step_over_line(Arena *arena, D_Entity *thread)
+d_trap_net_from_thread__step_over_line(Arena *arena, D_Entity *thread, U64 inline_depth)
 {
   Temp scratch = scratch_begin(&arena, 1);
   log_infof("step_over_line:\n{\n");
@@ -345,13 +345,24 @@ d_trap_net_from_thread__step_over_line(Arena *arena, D_Entity *thread)
     U64 ip_voff = d_voff_from_vaddr(module, ip_vaddr);
     D_LineList lines = d_lines_from_dbgi_key_path_voff(scratch.arena, dbgi_key, dbgi_path, ip_voff);
     Rng1U64 line_voff_rng = {0};
-    if(lines.first != 0)
+    //
+    // NOTE: the list begins with the unit's line (the outermost call site)
+    // and ends with the line of the innermost inlined function at ip; each
+    // is a frame of the thread. step at the granularity of the selected one
+    // (clamped to the innermost): that function's code is stepped line by
+    // line, and the calls it inlines (recorded as its call site lines in its
+    // line table) are stepped over, like any other call.
+    //
+    D_LineNode *line_n = lines.first;
+    U64 line_depth = 0;
+    for(; line_n != 0 && line_n->next != 0 && line_depth < inline_depth; line_n = line_n->next, line_depth += 1) {}
+    if(line_n != 0)
     {
-      line_voff_rng = lines.first->v.voff_range;
-      file_path = lines.first->v.file_path;
-      line_num = lines.first->v.pt.line;
+      line_voff_rng = line_n->v.voff_range;
+      file_path = line_n->v.file_path;
+      line_num = line_n->v.pt.line;
       line_vaddr_rng = d_vaddr_range_from_voff_range(module, line_voff_rng);
-      log_infof("line: {%S:%I64i}\n", lines.first->v.file_path, lines.first->v.pt.line);
+      log_infof("line: {%S:%I64i} (inline depth %I64u of %I64u)\n", line_n->v.file_path, line_n->v.pt.line, line_depth, lines.count ? lines.count-1 : 0);
     }
     log_infof("voff_range: {0x%I64x, 0x%I64x}\n", line_voff_rng.min, line_voff_rng.max);
     log_infof("vaddr_range: {0x%I64x, 0x%I64x}\n", line_vaddr_rng.min, line_vaddr_rng.max);
@@ -561,7 +572,7 @@ d_trap_net_from_thread__step_over_line(Arena *arena, D_Entity *thread)
 }
 
 internal D_TrapNet
-d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread)
+d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread, U64 inline_depth)
 {
   Temp scratch = scratch_begin(&arena, 1);
   D_TrapNet result = {0};
@@ -583,13 +594,24 @@ d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread)
     U64 ip_voff = d_voff_from_vaddr(module, ip_vaddr);
     D_LineList lines = d_lines_from_dbgi_key_path_voff(scratch.arena, dbgi_key, dbgi_path, ip_voff);
     Rng1U64 line_voff_rng = {0};
-    if(lines.first != 0)
+    //
+    // NOTE: the list begins with the unit's line (the outermost call site)
+    // and ends with the line of the innermost inlined function at ip; each
+    // is a frame of the thread. step at the granularity of the selected one
+    // (clamped to the innermost): that function's code is stepped line by
+    // line, and the calls it inlines (recorded as its call site lines in its
+    // line table) are stepped over, like any other call.
+    //
+    D_LineNode *line_n = lines.first;
+    U64 line_depth = 0;
+    for(; line_n != 0 && line_n->next != 0 && line_depth < inline_depth; line_n = line_n->next, line_depth += 1) {}
+    if(line_n != 0)
     {
-      line_voff_rng = lines.first->v.voff_range;
-      file_path = lines.first->v.file_path;
-      line_num = lines.first->v.pt.line;
+      line_voff_rng = line_n->v.voff_range;
+      file_path = line_n->v.file_path;
+      line_num = line_n->v.pt.line;
       line_vaddr_rng = d_vaddr_range_from_voff_range(module, line_voff_rng);
-      log_infof("line: {%S:%I64i}\n", lines.first->v.file_path, lines.first->v.pt.line);
+      log_infof("line: {%S:%I64i} (inline depth %I64u of %I64u)\n", line_n->v.file_path, line_n->v.pt.line, line_depth, lines.count ? lines.count-1 : 0);
     }
     log_infof("voff_range: {0x%I64x, 0x%I64x}\n", line_voff_rng.min, line_voff_rng.max);
     log_infof("vaddr_range: {0x%I64x, 0x%I64x}\n", line_vaddr_rng.min, line_vaddr_rng.max);
@@ -730,6 +752,85 @@ d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread)
       D_Trap trap = {flags, trap_addr};
       d_trap_list_push(arena, &result.traps, &trap);
     }
+  }
+  
+  // rjf: push traps at the beginnings of calls inlined into this line
+  //
+  // an inlined call has no call instruction to follow; the inlined function's
+  // scope (an inline site, nested in the scope of the function the thread is
+  // in) begins within the line's range instead. stop there, as at a call's
+  // destination, so that inlined calls are stepped into like any other.
+  //
+  if(good_line_info) LogInfoNamedBlockF("inlined_calls")
+  {
+    Access *access = access_open();
+    RDI_Parsed *rdi = di_rdi_from_key(access, dbgi_key, 1, 0);
+    if(rdi != &rdi_parsed_nil)
+    {
+      U64 ip_voff = d_voff_from_vaddr(module, ip_vaddr);
+      RDI_Scope *nil_scope = rdi_element_from_name_idx(rdi, Scopes, 0);
+      U64 all_scope_voffs_count = 0;
+      U64 *all_scope_voffs = rdi_table_from_name(rdi, ScopeVOffData, &all_scope_voffs_count);
+      
+      // rjf: the inline sites enclosing ip, innermost first, and the procedure's root scope
+      RDI_Scope *inline_scopes[64] = {0};
+      U64 inline_scope_count = 0;
+      RDI_Scope *root_scope = nil_scope;
+      for(RDI_Scope *s = rdi_scope_from_voff(rdi, ip_voff); s != nil_scope; s = rdi_element_from_name_idx(rdi, Scopes, s->parent_scope_idx))
+      {
+        if(s->inline_site_idx != 0 && inline_scope_count < ArrayCount(inline_scopes))
+        {
+          inline_scopes[inline_scope_count] = s;
+          inline_scope_count += 1;
+        }
+        root_scope = s;
+      }
+      
+      // rjf: the scope of the function being stepped: the inline site at the
+      // selected depth (1 = outermost), or the procedure's root scope
+      U64 depth = Min(inline_depth, inline_scope_count);
+      RDI_Scope *function_scope = (depth == 0) ? root_scope : inline_scopes[inline_scope_count - depth];
+      
+      // rjf: find inline sites among its descendants (not descending into
+      // them; calls they inline are theirs to step into), beginning in the line
+      typedef struct ScopeTask ScopeTask;
+      struct ScopeTask
+      {
+        ScopeTask *next;
+        RDI_Scope *scope;
+      };
+      ScopeTask start_task = {0, function_scope};
+      for(ScopeTask *t = (function_scope != nil_scope) ? &start_task : 0; t != 0; t = t->next)
+      {
+        for(RDI_Scope *child = rdi_element_from_name_idx(rdi, Scopes, t->scope->first_child_scope_idx);
+            child != nil_scope;
+            child = rdi_element_from_name_idx(rdi, Scopes, child->next_sibling_scope_idx))
+        {
+          if(child->inline_site_idx != 0)
+          {
+            // NOTE: scope voffs are stored as [min, opl) pairs
+            for(U64 voff_idx = child->voff_range_first; voff_idx+1 < child->voff_range_opl && voff_idx+1 < all_scope_voffs_count; voff_idx += 2)
+            {
+              U64 inline_begin_vaddr = d_vaddr_from_voff(module, all_scope_voffs[voff_idx]);
+              if(contains_1u64(line_vaddr_rng, inline_begin_vaddr) && inline_begin_vaddr != ip_vaddr)
+              {
+                log_infof("inlined call begins @ 0x%I64x\n", inline_begin_vaddr);
+                D_Trap trap = {D_TrapFlag_EndStepping|D_TrapFlag_IgnoreStackPointerCheck, inline_begin_vaddr};
+                d_trap_list_push(arena, &result.traps, &trap);
+              }
+            }
+          }
+          else
+          {
+            ScopeTask *task = push_array(scratch.arena, ScopeTask, 1);
+            task->scope = child;
+            task->next = t->next;
+            t->next = task;
+          }
+        }
+      }
+    }
+    access_close(access);
   }
   
   // rjf: push traps for natural linear flow
@@ -1008,11 +1109,19 @@ d_lines_from_dbgi_key_path_voff(Arena *arena, DI_Key dbgi_key, String8 dbgi_path
     rdi_parsed_from_line_table(rdi, unit_line_table, &start_line_table.parsed_line_table);
     LineTableNode *top_line_table = 0;
     RDI_Scope *scope = rdi_scope_from_voff(rdi, voff);
+    RDI_Scope *nil_scope = rdi_element_from_name_idx(rdi, Scopes, 0);
     {
+      // NOTE: inline sites are not necessarily nested directly in one another:
+      // the inlined function's lexical blocks lie between them (DWARF), so
+      // walk all ancestors, and take the sites among them.
       for(RDI_Scope *s = scope;
-          s->inline_site_idx != 0;
+          s != nil_scope;
           s = rdi_element_from_name_idx(rdi, Scopes, s->parent_scope_idx))
       {
+        if(s->inline_site_idx == 0)
+        {
+          continue;
+        }
         RDI_InlineSite *inline_site = rdi_element_from_name_idx(rdi, InlineSites, s->inline_site_idx);
         if(inline_site->line_table_idx != 0)
         {
@@ -1955,8 +2064,8 @@ d_tick(Arena *arena, D_TargetArray *targets, D_BreakpointArray *breakpoints, D_P
               default: break;
               case D_CmdKind_StepIntoInst: {trap_net.good_read = 1;}break;
               case D_CmdKind_StepOverInst: {trap_net = d_trap_net_from_thread__step_over_inst(scratch.arena, thread);}break;
-              case D_CmdKind_StepIntoLine: {trap_net = d_trap_net_from_thread__step_into_line(scratch.arena, thread);}break;
-              case D_CmdKind_StepOverLine: {trap_net = d_trap_net_from_thread__step_over_line(scratch.arena, thread);}break;
+              case D_CmdKind_StepIntoLine: {trap_net = d_trap_net_from_thread__step_into_line(scratch.arena, thread, cmd->params.inline_depth);}break;
+              case D_CmdKind_StepOverLine: {trap_net = d_trap_net_from_thread__step_over_line(scratch.arena, thread, cmd->params.inline_depth);}break;
               case D_CmdKind_StepOut:      {trap_net = d_trap_net_from_thread__step_out_scope(scratch.arena, thread);}break;
               case D_CmdKind_StepToExit:   {trap_net = d_trap_net_from_thread__step_to_exit(scratch.arena, thread);}break;
             }
@@ -2082,7 +2191,7 @@ d_tick(Arena *arena, D_TargetArray *targets, D_BreakpointArray *breakpoints, D_P
                                ? D_CmdKind_StepIntoInst
                                : D_CmdKind_StepOverInst);
             }
-            d_cmd(step_cmd_kind, .thread = params->thread);
+            d_cmd(step_cmd_kind, .thread = params->thread, .inline_depth = params->inline_depth);
           }
           else if(!d_ctrl_targets_running())
           {

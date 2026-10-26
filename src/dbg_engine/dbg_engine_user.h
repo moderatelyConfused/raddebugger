@@ -68,6 +68,7 @@ struct D_CmdParams
   U64 line_num;
   U64 column_num;
   U64 vaddr;
+  U64 inline_depth; // stepping: the inline frame (of the thread's top frame) to step at; 0 for the function itself
   B32 prefer_disasm;
   U32 pid;
   U32 rgba;
@@ -435,8 +436,8 @@ internal void d_cmd_list_push_new(Arena *arena, D_CmdList *cmds, D_CmdKind kind,
 //~ rjf: Stepping "Trap Net" Builders
 
 internal D_TrapNet d_trap_net_from_thread__step_over_inst(Arena *arena, D_Entity *thread);
-internal D_TrapNet d_trap_net_from_thread__step_over_line(Arena *arena, D_Entity *thread);
-internal D_TrapNet d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread);
+internal D_TrapNet d_trap_net_from_thread__step_over_line(Arena *arena, D_Entity *thread, U64 inline_depth);
+internal D_TrapNet d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread, U64 inline_depth);
 internal D_TrapNet d_trap_net_from_thread__step_out_scope(Arena *arena, D_Entity *thread);
 internal D_TrapNet d_trap_net_from_thread__step_to_exit(Arena *arena, D_Entity *thread);
 

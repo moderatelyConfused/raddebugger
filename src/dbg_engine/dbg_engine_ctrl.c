@@ -2148,15 +2148,25 @@ d_call_stack_from_unwind(Arena *arena, D_Entity *process, D_Unwind *base_unwind)
       DI_Key dbgi_key = d_dbgi_key_from_module(module);
       RDI_Parsed *rdi = di_rdi_from_key(access, dbgi_key, 0, 0);
       RDI_Scope *scope = rdi_scope_from_voff(rdi, rip_voff);
+      RDI_Scope *nil_scope = rdi_element_from_name_idx(rdi, Scopes, 0);
       
       // rjf: build inline frames (minus parent & inline depth)
+      //
+      // NOTE: inline sites are not necessarily nested directly in one another:
+      // the inlined function's lexical blocks lie between them (DWARF), so
+      // walk all ancestors, and take the sites among them.
+      //
       FrameNode *first_inline_frame = 0;
       FrameNode *last_inline_frame = 0;
       U64 inline_frame_count = 0;
       for(RDI_Scope *s = scope;
-          s->inline_site_idx != 0;
+          s != nil_scope;
           s = rdi_element_from_name_idx(rdi, Scopes, s->parent_scope_idx))
       {
+        if(s->inline_site_idx == 0)
+        {
+          continue;
+        }
         FrameNode *dst_inline = push_array(scratch.arena, FrameNode, 1);
         if(first_inline_frame == 0)
         {

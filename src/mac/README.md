@@ -110,47 +110,96 @@ directory when nothing has been stored yet.
 `task_for_pid` requires the `com.apple.security.cs.debugger` entitlement
 (`mac/raddbg.entitlements`); `build.sh` applies it with an ad-hoc signature.
 
-## Status and open issues (2026-10-25)
+## Status and open issues (2026-10-25, evening)
 
-Confirmed on an Apple Silicon Mac with a Zig 0.16 target (`generator`):
-building, launching, Retina scaling, breakpoints, single steps and line
-stepping in debug builds. Fixed from that testing: zero-length line ranges
-at every file change in the DWARF converter, frame skipping when unwinding
-at function entry / in epilogues, a `brk` left in the program when a step
-trap shared an address with a user breakpoint (seen as SIGTRAP), and
-non-statement line rows beginning lines (one stop per row in optimized code).
+Confirmed on an Apple Silicon Mac with a Zig 0.16 target (`generator`, a
+fiber-based coroutine demo): building, launching, Retina scaling,
+breakpoints, single steps and line stepping, in debug and `ReleaseFast`
+builds. The "erratic" release-build stepping was reproduced on hardware and
+had three causes, all fixed:
 
-Still reported as "erratic" after those fixes: line stepping, mostly in
-release builds. Not yet reproduced; nothing in this port has been exercised
-by its author on hardware. Where to look, on the Mac:
+* **Stale `.rdi`.** Zig installs executables with the modification time of
+  its cached copy, so switching a release build back to a debug build at the
+  same path leaves an `.rdi` *newer* than the executable, describing other
+  code; the user's debug binary was being stepped with a `ReleaseFast` line
+  table. The converter now records the Mach-O `LC_UUID` in the RDI's top
+  level info (`rdi_from_dwarf.c`), and `dbg_info.c` reconverts when it does
+  not match the executable's (`macho_uuid_from_file_path`), or when the
+  `.rdi` is older than the running debugger binary (so converter fixes reach
+  existing `.rdi`s). Deleting `.rdi`s by hand is no longer needed.
+* **Inlined code.** `DW_TAG_inlined_subroutine` was a TODO in the converter,
+  so inlined code kept the inlinee's file and line in the unit's line table,
+  and stepping hopped across `start.zig`, `Environ.zig`, `Thread.zig`, ...
+  in release builds (where Zig inlines `main` into `start.main`). The
+  converter now produces inline sites (name from the abstract origin, scope,
+  own line table) and redistributes each unit's line rows (see "produce line
+  tables from line rows & inline sites" in `rdi_from_dwarf.c`): the unit's
+  table carries the call site's line across inlined code, like PDBs, and
+  each site's table the inlined function's lines; nesting follows the tag
+  tree, and range containment only finds the innermost site at an address
+  (compilers emit nested sites whose ranges leave their parents'). Also
+  fixed there: scopes with `DW_AT_ranges` were keyed by vaddr instead of voff
+  (invisible on ELF, where the base is 0), and variables of inlined code,
+  which only have an abstract origin, now get their names and types.
+* **Stepping and frames with inline sites.** The engine stepped by the
+  unit's line (so a step in `start.main` stepped over all of `main`) and the
+  UI showed the outermost frame. Now `d_lines_from_dbgi_key_path_voff` and
+  the call stack walk all scope ancestors (DWARF puts lexical blocks between
+  nested sites); the trap net steps the line of the *selected* inline frame
+  (`D_CmdParams.inline_depth`, from `rd_base_regs()`; the generic step
+  command re-dispatches it); step-into also traps at the first instruction of
+  every call inlined into the line, so inlined calls are entered like real
+  ones; on a stop the UI selects the innermost inline frame (computed from
+  the stop event's address: the cached registers may still be the previous
+  stop's), except that a step over / out which finished in the procedure it
+  stepped keeps the frame it stepped (a step over ending at the first
+  instruction of an inlined call shows the call site; a step into from there
+  selects the next frame without running). `raddbg --ipc state` reports
+  `unwind_count` and `inline_depth`.
 
-* `~/Library/Logs/raddbg/logs/ctrl_thread.raddbg_log` records every step:
-  the line and voff/vaddr range the trap net was built from (`line:`,
-  `vaddr_range:`), `sp_check_value`, each demon event (`get_next_event`),
-  and which trap flags fired. Compare the stop locations against
-  `radbin --dump --only:line_tables <exe>.rdi` (delete the stale `.rdi` next
-  to the executable after converter changes; `dbg_info` regenerates it only
-  when it is older than the debug info or the encoding version changed).
-* `d_ctrl_thread__run` accepts a trap-net hit only when `sp` equals the
-  value saved at the step's start (`D_TrapFlag_IgnoreStackPointerCheck`
-  aside). Any sp-changing instruction the arm64 disassembler does not flag
-  with `DASM_InstFlag_ChangesStackPointer` (so no `SaveStackPointerAfter`
-  single step is scheduled) makes the line's end trap be ignored, and the
-  thread runs on to the next breakpoint. `sub/add sp`, pre/post-indexed
-  `stp/ldp` are flagged; check `mov sp, xN`, single-register `str/ldr`
-  with writeback, and anything optimized code emits.
-* Step-into stops at a call's destination even without line info (shared
-  cache functions have no symbols here); a step from there is an
-  instruction step. Step-over of a call relies on the callee returning to
-  the same `sp`, which recursion handles via the check above.
-* Optimized line tables: non-statement rows are merged into the preceding
-  statement (see `rdi_from_dwarf.c`); line 0 rows are merged too. If a stop
-  lands on an unexpected line, dump the DWARF rows of the object file
-  (`.zig-cache/o/<hash>/generator_zcu.o`, referenced by the executable's
-  `N_OSO` stab) and compare with the converted ranges.
-* A headless driver would help: the demon (`dmn_ctrl_launch`, `dmn_ctrl_run`
-  with a trap at `main`, `single_step_thread`) can be exercised from a small
-  console program the way `torture` does, without the UI.
+Also fixed while at it: `make_directory` creates missing parents on macOS
+(the log folder `~/Library/Logs/raddbg/logs` was never created, so no logs
+were written), and `--ipc` commands no longer lose option-provided registers
+(`add_breakpoint --file_path:<path>:<line>` works; the empty primary
+argument used to reset them).
+
+Verified by driving the debugger from a script (`raddbg --ipc
+launch_and_step_into`, `step_over`, `step_into`, `state`, with a scratch
+`--project:` / `--user:` / `--logs:`); the `ui_thread.raddbg_log` records
+each step's line and inline depth (`step_over_line:` blocks, `step ...:`
+lines), the `ctrl_thread.raddbg_log` the demon events. Mind that the IPC
+command runs with the focused tab's registers: once a disassembly tab is
+focused (the UI opens one when a stop has no source), `step_over` steps by
+instruction (`prefer_disasm`).
+
+Open:
+
+* **Step-into and code without line info.** Every Zig `threadlocal` access
+  calls dyld's TLV getter through an indirect `blr`, and a step into on such
+  a line lands there (the trap net cannot know an indirect call's destination
+  up front; direct calls to functions without line info are skipped unless
+  they are the line's last call, as upstream does). A step from there is an
+  instruction step, and the UI opens disassembly. The right fix is in
+  `d_ctrl_thread__run`: give those traps a flag meaning "after the single
+  step, end stepping only if the new pc has line info, else trap at the
+  return address (`lr`, or `[sp]` on x64) and keep stepping" (the module ->
+  `d_dbgi_key_from_module` -> `di_rdi_from_key` -> `rdi_line_info_idx_from_voff`
+  lookup is available on that thread). A UI-level "step out, then resume the
+  step into" was tried and removed: at the first instruction of a frameless
+  function without known unwind info the unwinder falls back to the frame
+  pointer chain and skips the callee's frame, so the step out returned one
+  frame too far (`range` -> `entryPoint`). That unwinder weakness is itself
+  worth fixing (prefer `lr` when nothing was pushed yet); shared-cache
+  modules may also lack unwind info because dyld's notification hook is not
+  found here ("dynamic library load events will be synthesized at stops").
+* `step_out` from an inlined function steps out of the concrete function; it
+  could use the selected inline site's ranges (`step_out_scope` already works
+  from scope ranges).
+* Optimized code attributes scheduled instructions to the function's
+  declaration line (`start.zig:641` fragments between other lines); stepping
+  visits them, as other debuggers do.
+* A headless driver (the demon from a console program, the way `torture`
+  does) would still be useful; the `--ipc` loop above is the next best thing.
 
 ## Known gaps / follow-ups
 
