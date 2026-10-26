@@ -249,6 +249,79 @@ check_analysis(Arena *arena)
     Check(test_state(tc, 0, f+0x04, sp, &cfa) == UWND_ARM64_CodeState_Body);
   }
 
+  //- rjf: a syscall stub (libsystem_kernel's `write`: no compact unwind entry): `mov x16, #4; svc #0x80; b.lo 1f; b cerror; 1: ret`.
+  // With the function start known (the RDI procedure), the replay finds nothing pushed at every instruction up to the
+  // error branch, and lr is the return address; without it the `b cerror` ahead of the `ret` hides the frameless leaf
+  {
+    U32 code[] = {0xd2800090, 0xd4001001, 0x54000043, 0x14000010, 0xd65f03c0};
+    U64 f = 0x100000800;
+    TestCode *tc = test_code(arena, f, code, ArrayCount(code));
+    Check(test_state(tc, f, f+0x00, sp, &cfa) == UWND_ARM64_CodeState_Prologue && cfa == sp);
+    Check(test_state(tc, f, f+0x04, sp, &cfa) == UWND_ARM64_CodeState_Prologue && cfa == sp);
+    Check(test_state(tc, f, f+0x08, sp, &cfa) == UWND_ARM64_CodeState_Prologue && cfa == sp);
+    Check(test_state(tc, f, f+0x10, sp, &cfa) == UWND_ARM64_CodeState_Epilogue && cfa == sp);
+    Check(test_state(tc, 0, f+0x00, sp, &cfa) == UWND_ARM64_CodeState_Body);
+  }
+
+  //- rjf: linker stubs (`__stubs`: `adrp x16; ldr x16, [x16, #off]; br x16`, two of them in a row), no symbol and no unwind
+  // entry, so the function start is unknown: at any of a stub's instructions lr holds the return address
+  {
+    U32 code[] = {0x90000030, 0xf9400210, 0xd61f0200, 0x90000030, 0xf9400610, 0xd61f0200};
+    U64 f = 0x100000b8c;
+    TestCode *tc = test_code(arena, f, code, ArrayCount(code));
+    Check(uwnd_arm64_stub_inst_count_from_code(code, ArrayCount(code)) == 3);
+    Check(uwnd_arm64_stub_inst_count_from_code(code+1, ArrayCount(code)-1) == 0);
+    Check(uwnd_arm64_stub_inst_count_from_code(code, 2) == 0);
+    Check(test_state(tc, 0, f+0x00, sp, &cfa) == UWND_ARM64_CodeState_Prologue && cfa == sp);
+    Check(test_state(tc, 0, f+0x04, sp, &cfa) == UWND_ARM64_CodeState_Prologue && cfa == sp);
+    Check(test_state(tc, 0, f+0x08, sp, &cfa) == UWND_ARM64_CodeState_Prologue && cfa == sp);
+    Check(test_state(tc, 0, f+0x0c, sp, &cfa) == UWND_ARM64_CodeState_Prologue && cfa == sp);
+    Check(test_state(tc, 0, f+0x10, sp, &cfa) == UWND_ARM64_CodeState_Prologue && cfa == sp);
+    Check(test_state(tc, 0, f+0x14, sp, &cfa) == UWND_ARM64_CodeState_Prologue && cfa == sp);
+  }
+
+  //- rjf: the arm64e stub form (`__auth_stubs`: `adrp x17; add x17, x17, #off; ldr x16, [x17]; braa x16, x17`)
+  {
+    U32 code[] = {0x90000011, 0x91004231, 0xf9400230, 0xd71f0a11};
+    U64 f = 0x100000b8c;
+    TestCode *tc = test_code(arena, f, code, ArrayCount(code));
+    Check(uwnd_arm64_stub_inst_count_from_code(code, ArrayCount(code)) == 4);
+    Check(test_state(tc, 0, f+0x00, sp, &cfa) == UWND_ARM64_CodeState_Prologue && cfa == sp);
+    Check(test_state(tc, 0, f+0x0c, sp, &cfa) == UWND_ARM64_CodeState_Prologue && cfa == sp);
+  }
+
+  //- rjf: an `adrp; ldr; br` through another register is not a stub (a jump table in a body)
+  {
+    U32 code[] = {0x90000029, 0xf9400129, 0xd61f0120};
+    U64 f = 0x100000800;
+    TestCode *tc = test_code(arena, f, code, ArrayCount(code));
+    Check(uwnd_arm64_stub_inst_count_from_code(code, ArrayCount(code)) == 0);
+    Check(test_state(tc, 0, f+0x00, sp, &cfa) == UWND_ARM64_CodeState_Body);
+  }
+
+  //- rjf: the function start the compact unwind entry gives is that of a run of same-encoding functions: `g` (ldr w8, [sp, #8];
+  // add w0, w8, #1; nop; ret) precedes the -O0 frame function `f`, and the entry says both start at g. The replay from g runs off
+  // at its `ret`; the frame setup ahead of pc then identifies f's prologue, and the pushes behind pc (up to g's `ret`) its depth
+  {
+    U32 code[] = {0xb9400be8, 0x11000500, 0xd503201f, 0xd65f03c0, 0xd10083ff, 0xa9017bfd, 0x910043fd, 0xb9000be0, 0x97ffffee, 0xb9400be8, 0x11000500, 0xa9417bfd, 0x910083ff, 0xd65f03c0};
+    U64 g = 0x100000800;
+    U64 f = g + 0x10;
+    TestCode *tc = test_code(arena, g, code, ArrayCount(code));
+    Check(test_state(tc, g, f+0x00, sp, &cfa) == UWND_ARM64_CodeState_Prologue && cfa == sp);
+    Check(test_state(tc, g, f+0x04, sp, &cfa) == UWND_ARM64_CodeState_Prologue && cfa == sp + 32);
+    Check(test_state(tc, g, f+0x08, sp, &cfa) == UWND_ARM64_CodeState_Prologue && cfa == sp + 32);
+    Check(test_state(tc, g, f+0x0c, sp, &cfa) == UWND_ARM64_CodeState_Body);
+    Check(test_state(tc, g, f+0x24, sp, &cfa) == UWND_ARM64_CodeState_Epilogue && cfa == sp);
+    // rjf: the same with the run's start beyond the replay window (basic_O0's `locals_frame`, 252 bytes after its entry's offset)
+    Check(test_state(tc, g - 0x100, f+0x00, sp, &cfa) == UWND_ARM64_CodeState_Prologue && cfa == sp);
+    Check(test_state(tc, g - 0x100, f+0x04, sp, &cfa) == UWND_ARM64_CodeState_Prologue && cfa == sp + 32);
+    Check(test_state(tc, g - 0x100, f+0x0c, sp, &cfa) == UWND_ARM64_CodeState_Body);
+    // rjf: and with f's real start (debug info): the replay alone answers
+    Check(test_state(tc, f, f+0x00, sp, &cfa) == UWND_ARM64_CodeState_Prologue && cfa == sp);
+    Check(test_state(tc, f, f+0x04, sp, &cfa) == UWND_ARM64_CodeState_Prologue && cfa == sp + 32);
+    Check(test_state(tc, f, f+0x0c, sp, &cfa) == UWND_ARM64_CodeState_Body);
+  }
+
   //- rjf: code not in the memory map -> the analysis asks for the window around pc; once read, it answers
   {
     U32 code[] = {0xd10083ff, 0xaa0103e8, 0xf90003e8};

@@ -155,10 +155,11 @@ echo "call stack: $stack"
 echo "frame modules: $frames_mods"
 if [[ "$sym" == write* && "$mod" == *libsystem_kernel* ]]; then echo "OK: write breakpoint hit in libsystem_kernel"
 else echo "FAIL: write breakpoint did not hit in libsystem_kernel (module=\"$mod\" symbol=\"$sym\")"; fails=$((fails+1)); fi
-# NOTE: `write` is a frameless syscall stub without a compact unwind entry; stopped at its entry the
-# unwinder falls back to the frame-pointer chain and skips the caller (stack "write start", no main),
-# where lldb applies its at-function-entry rule (pc = lr). An unwinder follow-up, recorded, not required.
-[[ "$stack" == *main* ]] && echo "OK: main on the call stack at write" || echo "NOTE: main missing from the call stack at write (unwinder: frameless stub at entry)"
+# `write` is a frameless syscall stub without a compact unwind entry; stopped at its entry the unwinder
+# used to fall back to the frame-pointer chain and skip the caller (stack "write start", no main). The
+# symbol-table RDI gives the engine the function's start, and at it lr is the return address (lldb's
+# at-function-entry rule), so main is on the stack.
+[[ "$stack" == *main* ]] && echo "OK: main on the call stack at write" || { echo "FAIL: main missing from the call stack at write (stack: $stack)"; fails=$((fails+1)); }
 # every frame is named: the shared-cache libraries' procedures come from their symbol tables
 unnamed=$(echo "$st" | sed -n '/^ call_stack:/,/^ breakpoints:/p' | grep '   symbol' | grep -c '???\|""')
 [[ "$unnamed" -eq 0 ]] || { echo "FAIL: $unnamed unnamed frame(s) in the call stack at write"; fails=$((fails+1)); }
