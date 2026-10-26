@@ -56,6 +56,7 @@ build inline_rec_O2 "$src/inline_rec.c" -O2
 build inl_main_O2   "$src/inl_main.c"   -O2 -I"$src"
 build bigframe_O2   "$src/bigframe.c"   -O2
 build noreturn_O2   "$src/noreturn.c"   -O2
+build stackswitch_O2 "$src/stackswitch.c" -O2
 # -O2 without frame pointers (call stack through compact-unwind / eh_frame only)
 echo "[basic_O2_nofp]"
 $cc -g -O2 -fomit-frame-pointer -Wall -c -o "$out/obj/basic_O2_nofp.o" "$src/basic.c"

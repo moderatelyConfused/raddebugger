@@ -230,7 +230,7 @@ below; then, since the first real target hit this many issues, a sweep over
 everything that routes through platform code, done as six parallel efforts
 with their own sections and scripted checks: the converter conformance corpus
 (70 Mach-O binaries, "Converter conformance corpus"), the torture driver
-ported to macOS ("Tests"), the scripted feature-flow suite (42 scenarios,
+ported to macOS ("Tests"), the scripted feature-flow suite (47 scenarios,
 "Scripted feature-flow suite"), IPC / dyld notification / `--pid` routing
 (this section), the arm64 unwinder ("Unwinding"), and the demon's process
 control (detach, fork, exec, signals, frozen threads, thread exits; "Demon"
@@ -483,28 +483,24 @@ impact:
   `write` breakpoint cannot hit on this macOS: `basic.c`'s `printf` reaches
   `write$NOCANCEL` (`__write_nocancel`), not `write`; the scenario needs a
   direct `write()` call, or `__write_nocancel` as the name.
-* **Step-into and code without line info.** Every Zig `threadlocal` access
-  calls dyld's TLV getter through an indirect `blr`, and a step into on such
-  a line lands there (the trap net cannot know an indirect call's destination
-  up front; direct calls to functions without line info are skipped unless
-  they are the line's last call, as upstream does). A step from there is an
-  instruction step, and the UI opens disassembly. The right fix is in
-  `d_ctrl_thread__run`: give those traps a flag meaning "after the single
-  step, end stepping only if the new pc has line info, else trap at the
-  return address (`lr`, or `[sp]` on x64) and keep stepping" (the module ->
-  `d_dbgi_key_from_module` -> `di_rdi_from_key` -> `rdi_line_info_idx_from_voff`
-  lookup is available on that thread). Related: a step into on a line calling
-  through a `__stubs` entry (`strlen`, a weak template instantiation) lands on
-  the stub, and a step over the stub's indirect jump runs to the process'
-  end; a step over a tail call (`b target` at -O2) ends in the callee's first
-  line (`stepping_O0`, `stepping_O2`). Step out of a signal handler, and a
-  step over `longjmp`, run to the process' end.
-* `step_out` from an inlined function steps out of the concrete function; it
-  could use the selected inline site's ranges (`step_out_scope` already works
-  from scope ranges). A step over at inline depth 1 from a line into which
-  LLVM scheduled a helper's instruction stops at that instruction (flows
-  `F1`/`F2`); a breakpoint on an inlined line stops first in whichever
-  instance comes first in the code (`F4b`).
+* **Step-into and code without line info: fixed** (2026-10-26, see "Stepping
+  into code without line info" under the flow suite's findings). A step into
+  no longer enters code without line info: an indirect call (`blr`; every Zig
+  `threadlocal` access calls dyld's TLV getter this way) is single-stepped
+  and ends the step only if the callee has line info, else the call runs and
+  returns into the line; a direct call to such code is skipped (as gdb and
+  lldb do; upstream enters the line's last one), after resolving a `__stubs`
+  / PLT entry to the function it jumps to (`strlen` is skipped, the weak
+  `twice<int>` behind a stub is entered); a tail call (`b` / `br` into
+  another function) is stepped over by a trap at the return address. Still
+  open: step out of a signal handler, and a step over `longjmp`, run to the
+  process' end (`signal_handler`, `longjmp`).
+* `step_out` from an inlined function: fixed (the trap net uses the inline
+  site at the selected depth, or the procedure's root scope, instead of the
+  innermost lexical scope at pc). Still open: a step over at inline depth 1
+  from a line into which LLVM scheduled a helper's instruction stops at that
+  instruction (flows `F1`/`F2`); a breakpoint on an inlined line stops first
+  in whichever instance comes first in the code (`F4b`).
 * Frame names of outer frames come from the raw return address (the UI and
   `d_call_stack_from_unwind` look symbols and scopes up at pc, not pc-1), so
   a frame whose call does not return (`fn a() void { @panic("x"); }`) is
@@ -537,8 +533,13 @@ impact:
   parent after the first yield, since the sibling executes the same code
   while the parent runs. Optimized code attributes scheduled instructions to
   the function's declaration line (`start.zig:641` fragments between other
-  lines); stepping visits them, as other debuggers do. After a step out onto
-  the middle of a line, the line's remaining rows count as a new line (`U5`).
+  lines); stepping visits them, as other debuggers do. A step over issued
+  after a stop without source (inside dyld's TLV getter, say) is an
+  instruction step: the stop focused a disassembly tab, and the frontend
+  turns steps into instruction steps while one is focused (`prefer_disasm`;
+  the UI log shows `step_over` without a `step_over_line:` trap net). That,
+  not the line table, kept `U5` on its line before the step-into fix made
+  the stop in the getter go away.
 * Converter: Swift functions directly under `DW_TAG_module` get no function
   type (their inline sites neither); C++ member functions are named without
   their class (`area`, not `Rect::area`); code the line program attributes to
@@ -663,11 +664,12 @@ and log every stop (lines, voff, symbol) until the process exits; the log is com
 with `local/test_data/exemplars/<test>/exemplar_mac`, which the first run creates (and
 `eval2_regressions` writes `exemplar_mac_arm64`). Inspect a new exemplar before trusting
 it: `basic_stepping_test_step_regressions_0` records main:49, 51, foo:33, 35, main:51, 55,
-then a stop at voff 0x4ac without lines, which is the `_printf` stub (`__stubs`): a step
-into the line's last call enters the stub, and the step out from there returns one
-frame too far (see "Step-into and code without line info" above), so the process runs
-to its exit. `step_into_for_goto` records 18, 19, 21, 22, 20, 24 (clang attributes the
-loop's back-jump to the `}` on line 22).
+58 (the step into on the `printf` line skips the `_printf` stub, see "Stepping into code
+without line info" below), then the process exits. An exemplar recorded before that fix
+has a stop at voff 0x4ac without lines (the stub; the step out from there returned one
+frame too far and the process ran to its exit) in place of main:58, and fails the test
+until it is deleted and recorded again. `step_into_for_goto` records 18, 19, 21, 22, 20,
+24 (clang attributes the loop's back-jump to the `}` on line 22).
 
 State on 2026-10-25, debug and release builds (158 registered tests): 144 pass, 13
 skip, 1 fail.
@@ -703,6 +705,8 @@ codes), plus `NOTE` lines for observations without a verdict.
   one-step `clang -g x.c -o x` deletes its object before `dsymutil` can link
   the dSYM, leaving only a debug map), plus `basic_O2_nofp`
   (`-fomit-frame-pointer`), single-variant debuggees for the review scenarios
+  (`stackswitch.c`: a VLA before a jump table, and fibers switched by an
+  inlined `mov sp; br`, for `F5c`/`F5d`)
   and the Zig generator (debug build; `--prefix`/`--cache-dir` under
   `build/flows`, the generator's directory is untouched). Lines the scenarios
   refer to carry `// @tag` comments; the runner looks the numbers up by tag.
@@ -743,9 +747,12 @@ codes), plus `NOTE` lines for observations without a verdict.
 
 ### Results and findings (2026-10-25, this branch)
 
-Last full run (with the breakpoint fixes below): 316 checks passed, 68
-failed, 45 scenario runs in 196 s (the same tree before them: 306 passed, 77
-failed; nothing that passed then fails now). Every failure below is a
+Last full run (2026-10-26, with the stepping fixes below): 403 checks passed,
+21 failed, 51 scenario runs in 210 s (the same tree before them: 362 passed,
+38 failed, 46 runs; nothing that passed then fails now; `U5`'s
+`tls_counter_after_access` is newly reached and fails for a reason of its own,
+see below). The run before the stepping work, with the breakpoint fixes: 316
+passed, 68 failed, 45 runs in 196 s. Every failure below is a
 recorded bug or observation; scenarios fully passing include
 launch/kill/restart/exit, the breakpoint flows (line, inline line, dylib
 before load, address, condition, hit counts, toggle/remove, function name
@@ -757,6 +764,68 @@ F4a, F5a, F5b, U1, U2, U3.
 Fixed here (the suite found them; the first and third were fixed independently
 on `macos-arm64-port` at the same time, and the merge kept that branch's
 implementation):
+
+* **Stepping into code without line info** (`stepping_O0`, `stepping_cpp`,
+  `U5`, the ReleaseFast generator). The step-into trap net
+  (`d_trap_net_from_thread__step_into_line`) never enters code without line
+  info anymore: a direct call to such code is not trapped (the line's traps
+  catch the thread when the call returns; upstream entered the line's last
+  such call, which here meant landing on a `__stubs` entry or in dyld, where
+  the UI switches to disassembly), after resolving a stub to the function it
+  jumps to (`d_stub_target_from_vaddr`: `adrp; ldr; br` / `jmp [rip+disp]`
+  and the pointer slot the loader bound), so `strlen` is skipped and the weak
+  `twice<int>` behind a stub is entered at its first line. An indirect call
+  (`blr`, `call rax`) gets `D_TrapFlag_EndSteppingIfLineInfo`: the control
+  thread single-steps it and ends the step only if the new pc has line info
+  (`d_ctrl_thread__code_info_from_vaddr`: module -> RDI -> unit line table),
+  else keeps stepping while the call runs and returns into the line. A tail
+  call (`b` into another function, `br` landing in one) is stepped over with
+  `D_TrapFlag_TrapReturnAddress`: after the single step, a trap at the return
+  address (`lr`; `[sp]` on x64), checked against the stack pointer the return
+  restores (`stepping_O2`'s `over_tail_call_returns_to_main`). A jump table
+  `br` whose case lies on the stepped line keeps stepping (the control thread
+  compares the unit's line at the new pc with the step's start). With the
+  ReleaseFast generator, 8 step-intos from `root.zig:84` now visit 86, 88, 95,
+  96, 99, 97 (the inlined contextSwitch), 102, 87 instead of 7 instructions of
+  `_tlv_get_addr`. The debug generator's 10 steps are unchanged.
+* **Step out from an inlined frame** steps out of the selected frame's
+  function: the trap net's scope is the inline site at the selected depth, or
+  the procedure's root scope, not the innermost lexical scope at pc (which
+  also made a step out from a block end at the block's exit).
+* **Traps within the stepped frame are stack pointer checked**: the step-into
+  net's jump destinations within the function and the inline-entry traps
+  carried `IgnoreStackPointerCheck`, so a deeper recursive activation running
+  through them ended the step in the wrong frame (`F6`, `F6b`: `visit`'s
+  callbacks recurse through `qsort_b`). Calls' destinations and returns keep
+  the flag. A step into from a function's first line works because the
+  prologue's stack pointer changes are stepped with `SaveStackPointerAfter`.
+* **Context switches are told from frame growth by the thread's stack**
+  (`d_ctrl_thread__stack_switched`): the thread's stack top is the stack
+  pointer at its creation (the engine reads it when the demon reports none),
+  a jump which keeps sp within 32 MB below it is not a switch (`F5c`: a 512
+  KB VLA followed by a jump table on one line), one which leaves or enters
+  that window is, and two off-stack addresses are two fiber stacks when they
+  lie 16 KB or more apart (`F5d`: two 64 KB fiber stacks from one malloc,
+  switched by an inlined `mov sp; br`). Before, the rule was "256 KB away
+  from the step's start": the VLA read as a switch and the step ran away, and
+  the fibers read as one stack and the step ended in the other fiber.
+* **Hits held back at a stop keep every kind and thread** (`D10`, `D11`): the
+  end of a run copies the other threads' queued `Breakpoint` events into a
+  list keyed by the thread's demon handle (`D_ServerState.held_bp_event_*`)
+  instead of marking thread entities: a watchpoint hit (`address != 0`; the
+  demon already stepped the thread past the access) is reported by the next
+  run if a watchpoint still covers the address, a hit of a thread whose
+  creation is still queued behind the stop waits for the run which knows the
+  thread, and a thread is exempt from the stuck-thread stepping only while it
+  sits at the held hit's pc. Before, those events were freed with the
+  converted ones (`D10` lost B's watchpoint hit: the process ran to its end).
+* **Watchpoint conditions are evaluated** (`D8`): the run loop matched a hit
+  to its user trap by `trap->vaddr == pc`; a watchpoint's trap lies at the
+  data address (the event's `address`, and the demon names the trap in
+  `user_data`), so its condition was never gathered and every hit stopped.
+* The two line trap nets share `d_step_line_from_thread` (the line at the
+  selected inline depth, its pieces, code and exit points) and the
+  natural-flow traps; the UI log shows the same blocks for both.
 
 * `--ipc` replies were cut at 4 KB: `mac_socket.c` hands received data out one
   `recv()` chunk at a time and the client in `raddbg_main.c` took the first
@@ -842,7 +911,11 @@ Policy, not bugs (the suite expects these):
   upstream does; the first statement is one step over away.
 * A `__thread` variable reads 0 until the thread has touched one of the
   image's thread-locals (dyld allocates the block lazily, so
-  `dmn_thread_get_module_tls_vaddr` finds none before).
+  `dmn_thread_get_module_tls_vaddr` finds none before). Open: `t_tls_counter`
+  also reads 0 at `main_static`, right after `t_tls_counter += 1` executed
+  (`U5/tls_counter_after_access`, four `eval`s over 1.2 s, with the tree
+  before the stepping work too: the check was never reached then, since the
+  step did not get there); the TLS lookup, not the stop, is wrong.
 
 Open, recorded with evidence by the suite (detach, fork, exec into a binary
 of our own, watchpoint attribution and other threads' call stacks have been
@@ -865,27 +938,21 @@ fixed since by the demon and unwinder work and are not repeated here):
   (`tests/dyld_module_events.sh`).
 * exec (`exec`, `D6`): `execv`/`execl` fail inside the debuggee (exit 5, the
   `perror` path; see the scenario's NOTE for errno).
-* Watchpoints (`D8`): the condition is not honored (the stop comes at the
-  first write, `D8_condition_honored_*`). The values the `watchpoint` scenario
-  saw lagging the write by one stop were the scripting caveat above (an
-  `eval` answered from a page whose refresh had not landed), not the stops:
-  with `ev` waiting for two agreeing answers the scenario passes. (The missing
-  attribution to the user breakpoint, `user_data`, is fixed by the demon work;
-  `tests/demon/watchpoint.sh`.)
+* Watchpoints (`D8`): the condition is honored now (see the fixes above). The
+  values the `watchpoint` scenario saw lagging the write by one stop were the
+  scripting caveat above (an `eval` answered from a page whose refresh had not
+  landed), not the stops: with `ev` waiting for two agreeing answers the
+  scenario passes. (The missing attribution to the user breakpoint,
+  `user_data`, is fixed by the demon work; `tests/demon/watchpoint.sh`.)
 * Step out of a signal handler runs to the process' end
   (`signal_handler/handler_step_out`); a step over `longjmp` as well
   (`longjmp`; gdb/lldb stop after `setjmp`).
-* Calls through stubs: a step into on a line calling `strlen` (through
-  `__stubs`) or a weak template instantiation (`twice<int>` in `cpp_O0` goes
-  through a stub too) lands on the stub's first instruction; there the
-  unwinder reports the caller's caller as frame 1 (`main` instead of
-  `libsystem_call`: the frame-pointer chain is used although nothing was
-  pushed yet), so the following step out returns one frame too far, and a step
-  over the stub's indirect jump runs to the process' end (`stepping_O0`,
-  `stepping_cpp`). The same frame-1 loss shows at any function's first
-  instruction after an instruction step into a call (`stepping_O0/inst_into_call_stack`).
-* Step over a tail call (`b tail_target` at -O2) ends in the callee's first
-  line instead of after the call in the caller (`stepping_O2`).
+* Calls through stubs and tail calls: fixed (see above); `stepping_O0`'s
+  strlen line and `stepping_cpp`'s `twice<int>` and lambda checks pass, as
+  does `stepping_O2`'s tail call. Open (unwinder): at a function's first
+  instruction after an instruction step into a call, frame 1 is the caller's
+  caller (`stepping_O0/inst_into_call_stack`, `inst_out`: the frame-pointer
+  chain is used although nothing was pushed yet).
 * After a watchpoint stop, `eval` reads inconsistent values (`i`, `sum`,
   `g_watched` that cannot coexist in program order) and the same ip is
   reported for consecutive stops: the registers the frontend reads after the
@@ -901,10 +968,13 @@ fixed since by the demon and unwinder work and are not repeated here):
 * `dylib_host_O0` ends with exit code 0 and without its final `printf` output
   under the debugger (natively: "host done 8", exit 8) after the second
   `dlclose` (`modules/exit_code`).
-* After stepping out of the TLS getter onto the middle of the `t_tls_counter
-  += 1` line, a step over stops on that same line again (`U5_next_line`): the
-  line's remaining rows after the call count as a new line, so two steps are
-  needed to reach the next line.
+* `U5_next_line` passes now that the step into skips the TLS getter. The
+  step over which stayed on the `t_tls_counter += 1` line after a step out of
+  the getter was an instruction step: the stop in the getter had focused a
+  disassembly tab, and the frontend turns steps into instruction steps while
+  one is focused (the UI log records `step_over` without a `step_over_line:`
+  trap net). A step over from the middle of a line otherwise reaches the
+  next line (`stepping_O0`'s step out / step over pairs).
 * Flaky: `eval signo` at the first line of a signal handler reads 0 in some
   runs and 30 in others (`signal_handler/handler_signo`); the registers or
   frame base used right after the stop differ between runs.
@@ -915,8 +985,10 @@ fixed since by the demon and unwinder work and are not repeated here):
   call line at depth 1), not at main's second call; identical on 20 runs.
   `F1b`: a step over `next`'s first line ends on the same line.
 * `F4b`: the breakpoint on `inl.h:3` first stops in the second inlined
-  instance (call site `inl_main.c:4`). `F6`: a step into on a line whose first
-  call goes into libSystem (`qsort_b`) stops there, without line info.
+  instance (call site `inl_main.c:4`). (`F6`'s step into, which stopped in
+  `qsort_b` without line info, ends in the inlined `tally` of the same
+  activation now; `visit` is out of line in the debuggee since, so that the
+  recursion through the callback re-enters its code, `F6b`.)
 
 ## Known gaps / follow-ups
 
