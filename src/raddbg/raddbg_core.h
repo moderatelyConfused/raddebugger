@@ -235,6 +235,18 @@ struct RD_CmdList
 ////////////////////////////////
 //~ rjf: Context Register Types
 
+////////////////////////////////
+//~ rjf: Inline Frame Selection Types
+
+typedef struct RD_InlineScopeChain RD_InlineScopeChain;
+struct RD_InlineScopeChain
+{
+  D_Handle module;
+  U64 root_scope_idx; // the procedure's root scope (0: no scope at the address)
+  U64 count;
+  U64 *scope_idxs;    // the inline sites' scopes, outermost first
+};
+
 typedef struct RD_RegsNode RD_RegsNode;
 struct RD_RegsNode
 {
@@ -423,7 +435,7 @@ struct RD_State
   B32 quit_after_success;
   RD_CmdKind last_step_kind;            // the last step command issued, and ...
   U64 last_step_inline_depth;           // ... the inline frame it stepped at, and ...
-  Rng1U64 last_step_proc_vaddr_range;   // ... the procedure the thread was in (for selecting the frame to show when it finishes)
+  U64 last_step_ip_vaddr;               // ... where the thread was (for selecting the frame to show when it finishes)
   B32 stop_inline_depth_selected;       // the last stop had line info, and an inline frame was selected for it
   B32 override_focus_on_stop;
   S32 frame_depth;
