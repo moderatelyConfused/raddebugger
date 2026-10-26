@@ -14,6 +14,7 @@ const char *const g_name = "cprog"; // const data
 static int32_t s_hidden = 11;       // static, internal linkage
 _Thread_local int32_t t_slot = 7;   // __DATA,__thread_vars / __thread_data
 _Thread_local int32_t t_zero;       // __thread_bss
+Packed g_packed = {1, 2, 3, 4, 1, 2, Color_Green, {5, 6}, {{{1, 2}, {3, 4}, {5, 6}}, {{7, 8}, {9, 10}, {11, 12}}}};
 
 typedef int32_t (*BinOp)(int32_t, int32_t);
 
@@ -84,7 +85,10 @@ main(int argc, char **argv)
   int32_t d3 = dispatch(argc + 5, end.x, end.y);
   int32_t acc = fill_table(seed);
   int32_t tl = thread_local_bump(argc);
-  printf("%s: seed=%d sum=%d h=%u end=(%d,%d) d=%d,%d,%d,%d acc=%d tl=%d\n",
-         g_name, seed, sum, h, end.x, end.y, d0, d1, d2, d3, acc, tl);
+  g_packed.count += (uint32_t)argc;
+  g_packed.color = (argc > 1) ? Color_Blue : g_packed.color;
+  int32_t pk = (int32_t)g_packed.count + g_packed.color + g_packed.pair[1] + g_packed.grid[1][2].y + g_packed.hi;
+  printf("%s: seed=%d sum=%d h=%u end=(%d,%d) d=%d,%d,%d,%d acc=%d tl=%d pk=%d\n",
+         g_name, seed, sum, h, end.x, end.y, d0, d1, d2, d3, acc, tl, pk);
   return (d0 + d1 + d2 + d3 + acc + tl) & 0x7f;
 }

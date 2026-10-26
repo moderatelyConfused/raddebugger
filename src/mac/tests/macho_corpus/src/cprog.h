@@ -13,6 +13,33 @@ struct Vec2
   int32_t y;
 };
 
+// a bitfield struct with an enum and array members: the checker's `types`
+// column compares the RDI's member offsets (DW_AT_data_member_location,
+// DW_AT_data_bit_offset), enumerator values and array counts with the DWARF
+typedef enum Color
+{
+  Color_None  = -1,
+  Color_Red   = 1,
+  Color_Green = 2,
+  Color_Blue  = 4,
+  Color_All   = 7,
+}
+Color;
+
+typedef struct Packed Packed;
+struct Packed
+{
+  uint32_t kind  : 3;
+  uint32_t flags : 5;
+  uint32_t count : 24;
+  uint8_t  tag;
+  uint8_t  lo    : 2;
+  uint8_t  hi    : 6;
+  Color    color;
+  int16_t  pair[2];
+  Vec2     grid[2][3];
+};
+
 static inline int32_t
 clamp_i32(int32_t v, int32_t lo, int32_t hi)
 {
