@@ -951,20 +951,44 @@ Open: locals (locations, types) and type byte sizes are not checked; see the
 Converter bullet of "Open" above.
 ## Tests
 
-Demon checks: `zsh src/mac/tests/demon/run_all.sh` (settings in `common.sh`:
-`IPC_PORT`, default 7950, `HARNESS_DIR`, `RADDBG`; `detach.sh` needs the Zig
-generator project and `zig`, see its header, and skips without them). Each
-script builds its debuggee with the host clang (two steps, so that the object
+The test scripts under `src/mac/tests` share one library, `lib.sh` (zsh;
+`ipc_harness.sh`, `demon/common.sh`, `flows/run_flows.sh` and the proofs
+source it): the private instance (`dbg_start <project> [port]`: an earlier
+instance on the port killed by pid, a fresh user file, readiness is the
+listener found with `lsof`, the pid in `RD_PID`; `dbg_stop`: `exit
+--force_confirm:1`, which flushes the logs and takes a live debuggee down, then
+kill by pid), `ipc`, the section-bounded `state` readers (`stop_symbol`,
+`stop_file_line`, `thread_count`, `thread_ids`, `module_names`, `process_ids`,
+`call_stack`, `bp_hit_count`, ...), the waits (`wait_stop`, `go_cmd`,
+`wait_exit`, `wait_no_threads`, ...: polls of `state`, never a fixed sleep),
+`line_of_tag` / `line_of_pattern`, the flow suite's `check` / `check_match` /
+`check_ne` / `note` / `check_summary`, `build_c` (two steps and a dSYM),
+`write_project` (`PROJECT_WORKING_DIR`, `PROJECT_STDOUT=1` for a
+`stdout_path`, extra cfg lines as the 4th argument or from stdin with `-`) and
+the Zig generator (`generator_locate`: `ZIG`, default `~/.zvm/bin/zig`, and
+`GENERATOR_DIR`, default `~/Desktop/Etc/October-2026/generator`;
+`generator_build <prefix>`; the generator scenarios skip when either is
+missing). Settings: `RADDBG` (default `build/raddbg`), `IPC_PORT` (default
+7500 + pid % 100; never the user's 7423), `HARNESS_DIR` (default a new temp
+dir; a proof removes a directory it made itself at exit, a given one is kept).
+`ipc_harness.sh` adds the stepping front end (`launch`, `bp`, `go`, `step`).
+
+Demon checks: `zsh src/mac/tests/demon/run_all.sh` (`common.sh` on top of
+`ipc_harness.sh`: `IPC_PORT` defaults to 7950 there; `detach.sh` needs the Zig
+generator and `zig`, see above, and skips without them). Each script builds
+its debuggee with the host clang (`build_c`: two steps, so that the object
 file the debug map points at survives; the debugger's converter then reads the
-dSYM), writes a project file (the `// raddbg ... project file` header line is
-required, or the file is taken for a new, empty project) and asserts on
-`--ipc state` through section-bounded readers (`stop_symbol`, `stop_line`,
-`thread_count`, ...; a whole-dump grep also matches thread names, breakpoint
-locations and call stack entries), the debuggee's `stdout_path` file and
-`ctrl_thread.raddbg_log`. `check` evaluates a single-quoted zsh expression in
-the script's shell (never a dump embedded in the expression). `finish` kills
-the debuggees the instance holds (`kill_all`), the instance, and the
-processes the script registered with `track_pid`. Scripts: `detach`,
+dSYM), writes a project file (`write_project`; the `// raddbg ... project
+file` header line is required, or the file is taken for a new, empty project)
+and asserts on `--ipc state` through the section-bounded readers (a whole-dump
+grep would also match thread names, breakpoint locations and call stack
+entries), the debuggee's `stdout_path` file and `ctrl_thread.raddbg_log`. The
+demon's `check <description> <expression>` evaluates a single-quoted zsh
+expression in the script's shell (never a dump embedded in the expression) and
+prints `  PASS  <description>` lines counted in `FAILS`; it shadows the flow
+suite's value-comparing `check` on purpose. `finish` kills the debuggees the
+instance holds (`kill_all`), the instance (`dbg_stop`), and the processes the
+script registered with `track_pid`. Scripts: `detach`,
 `detach_at_signal`, `fork_child`, `fork_stale_trap`, `signal_handler`,
 `frozen_thread`, `thread_exit`, `exec`, `watchpoint`, `watch_new_thread`,
 `bp_stress` (200 continues, `BP_STRESS_ROUNDS` to change).
@@ -983,23 +1007,41 @@ The `raddbg/*` tests launch `raddbg_non_graphical` instances and drive them over
 those instances listen on `-ipc_port:<n>` (default: 7700 + torture's pid modulo 100), so
 a debugger open on the default port is left alone. Each test's own user and project
 files, the debugger's console output and the built debuggees land in
-`build/torture_artifacts/<test>/`.
+`build/torture_artifacts/<test>/`, and the last invoked process' stdout in
+`build/torture_artifacts/torture.out`: torture writes next to its own binary wherever it
+is run from (an explicit `-out:<dir>` is used as given; `torture_artifacts/` and
+`torture.out` are gitignored for that case).
 
 The prebuilt test inputs (`local/test_data/inputs`, fetched by `run_tests.bat` from
 data.raddbg.com) are Windows executables and PDBs, so on macOS the stepping regressions
 run over `src/mule/old_test_debuggees/{basic_stepping_test,step_into_for_goto}.c`,
 compiled on the fly with the host clang (`-g -O0`, Mach-O + dSYM). They launch with
 `step_into` (stop at the entry point, `main`), then alternate `step_into` / `step_over`
-and log every stop (lines, voff, symbol) until the process exits; the log is compared
-with `local/test_data/exemplars/<test>/exemplar_mac`, which the first run creates (and
-`eval2_regressions` writes `exemplar_mac_arm64`). Inspect a new exemplar before trusting
-it: `basic_stepping_test_step_regressions_0` records main:49, 51, foo:33, 35, main:51, 55,
-58 (the step into on the `printf` line skips the `_printf` stub, see "Stepping into code
-without line info" below), then the process exits. An exemplar recorded before that fix
-has a stop at voff 0x4ac without lines (the stub; the step out from there returned one
-frame too far and the process ran to its exit) in place of main:58, and fails the test
-until it is deleted and recorded again. `step_into_for_goto` records 18, 19, 21, 22, 20,
-24 (clang attributes the loop's back-jump to the `}` on line 22).
+and log every stop until the process exits. Because the host clang decides the code
+layout, these logs record lines and symbols only, one line per stop (`stop: main @
+basic_stepping_test.c:49`; an inlined stop lists every frame's line, outermost first; a
+stop without line info says so), while the prebuilt inputs' tests keep the full record
+(`lines` dump, `ip_voff`, symbol). The exemplars are in the tree:
+`src/raddbg/tests/exemplars/<test>/exemplar_mac` (and
+`src/eval2/tests/exemplars/eval2_regressions/exemplar_mac_arm64`), looked up before
+`local/test_data/exemplars/<test>/`; a test with no exemplar anywhere records its run
+under `local/` and is *skipped*, naming the file and the in-tree path a reviewed copy
+belongs at (a run compared against nothing is not a pass; before this, a fresh checkout
+passed the three tests with whatever the debugger did that day). The in-tree records,
+checked against the sources' `/// N: at` annotations: `basic_stepping_test_step_regressions_0`
+main:49, 51, foo:33, 35, main:51, 55, 58 (the step into on the `printf` line skips the
+`_printf` stub, see "Stepping into code without line info" below), then the process
+exits; `_1` 49, 51, 55, 58; `step_into_for_goto` 18, 19, 21, 22, 20, 24 (clang attributes
+the loop's back-jump to the `}` on line 22). A stepping change that alters a sequence
+fails the test with a `diff` command in its output; update the in-tree file deliberately.
+The driver's fallback for a step the debugger could not perform (a step out of the
+outermost frame once `main` has returned into dyld) no longer waits a fixed 3 s, which
+fired early on a loaded machine and made the record timing-dependent: the `--ipc` reply
+comes after the frame that ran the command, and the engine marks the thread running in
+the frame that dispatches a run, so a step that runs shows `running: 1`, a new `run_gen`
+or a new `stop_count` at once; the one quiet case is a deferred step (the engine retries
+a trap net it cannot build yet for up to 100 frames), and since every `state` command
+renders a frame, 200 idle polls bound it in frames (a 30 s wall-clock ceiling remains).
 
 State on 2026-10-25, debug and release builds (158 registered tests): 144 pass, 13
 skip, 1 fail.
@@ -1044,21 +1086,32 @@ codes), plus `NOTE` lines for observations without a verdict.
   untouched). Lines the scenarios refer to carry `// @tag` comments; the
   runner looks the numbers up by tag.
 * Run: `zsh src/mac/tests/flows/run_flows.sh` (all, ~4 minutes),
-  `run_flows.sh -l` (list), `run_flows.sh stepping_O0 eval_O0` (some).
-  `IPC_PORT` defaults to 7500 + pid % 100 (two concurrent runs do not kill
-  each other's instances); the instance is found by its listener (`lsof`,
-  LISTEN on the port) and killed by that pid, never by a name pattern.
-  `HARNESS_DIR` (created if missing) keeps the project files, the user file
-  and `logs/` (`ui_thread.raddbg_log`: trap nets; `ctrl_thread.raddbg_log`:
-  demon events); `FLOWS_KEEP_LOGS=1` copies each scenario's logs and the
-  debuggee's output to `$HARNESS_DIR/logs_<scenario>/`. The debuggees are
-  rebuilt when a source under `debuggees/` is newer than the build. The Zig
-  generator is named as the demon scripts name it (`GENERATOR_SRC`, `ZIG`;
-  `FLOWS_ZIG_GENERATOR` / `FLOWS_ZIG` still work), and its lines are looked
-  up in `main.zig` by their text (`line_of_pattern`), not hard-coded. Scenario
-  names: plain = feature flows (`ipc_commands` / `ipc_transport` drive the
-  `--ipc` layer itself), `F*` = stepping/inline-frame review, `D*` = demon
-  review, `U*` = unwinder review.
+  `run_flows.sh -l` (list), `run_flows.sh stepping_O0 eval_O0` (some). The
+  runner sources `src/mac/tests/lib.sh` (through `ipc_harness.sh`, see
+  "Tests"): `IPC_PORT` defaults to 7500 + pid % 100 (two concurrent runs do
+  not kill each other's instances); the instance is found by its listener
+  (`lsof`, LISTEN on the port) and killed by that pid, never by a name
+  pattern (`dbg_start` / `dbg_stop`; a scenario's `finish` exits the instance
+  with `--force_confirm:1`, which flushes its logs, before killing what is
+  left). `HARNESS_DIR` (created if missing) keeps the project files, the user
+  file and `logs/` (`ui_thread.raddbg_log`: trap nets;
+  `ctrl_thread.raddbg_log`: demon events); `FLOWS_KEEP_LOGS=1` copies each
+  scenario's logs and the debuggee's output to `$HARNESS_DIR/logs_<scenario>/`.
+  The debuggees are rebuilt when a source under `debuggees/` is newer than the
+  build. The Zig generator is named as every test script names it (`lib.sh`'s
+  `generator_locate`: `ZIG`, default `~/.zvm/bin/zig`, and `GENERATOR_DIR`,
+  default `~/Desktop/Etc/October-2026/generator`; the former `GENERATOR_SRC` /
+  `FLOWS_ZIG_GENERATOR` / `FLOWS_ZIG` are gone), and its lines are looked up in
+  `main.zig` by their text (`line_of_pattern`), not hard-coded; the runner's
+  list-valued `state` readers print space-joined (`STATE_LIST_JOIN`), as the
+  checks record them. Scenario names: plain = feature flows (`ipc_commands` /
+  `ipc_transport` drive the `--ipc` layer itself), `F*` = stepping/inline-frame
+  review, `D*` = demon review, `U*` = unwinder review. Two checks of
+  `F1_inline_seq_O2` vary from run to run on the same binary (`F7_*`: whether
+  the step into after `go_to_disassembly` runs one instruction or only selects
+  the next inline frame, and `F1b_bp`: `restart_stop` can take the old
+  process' exit for the new one's first stop when the new process already
+  exists); both sit on the open F1 inline-sequence item.
 * `--ipc` additions for scripting: `state` reports the instance's `pid`, the
   `processes` (pids), `exited_process_count` / `last_exit_code`,
   `selected_thread`, each thread's
@@ -1461,3 +1514,7 @@ fixed since by the demon and unwinder work and are not repeated here):
   caches are not.
 * Hardware execute breakpoints are implemented as software `brk` traps;
   watchpoints use `DBGWCR`/`DBGWVR` (up to 16, 8-byte aligned ranges).
+* Test infrastructure: the demon checks (`tests/demon/*.sh`, their own
+  expression-style `check` and `finish`, one script per item) are not folded
+  into the flow runner yet; they share `lib.sh` with it, so the fold is a
+  matter of turning each script into a scenario with value checks.
