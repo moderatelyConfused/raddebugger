@@ -1957,6 +1957,7 @@ d_unwind_from_thread(Arena *arena, D_Handle thread, U64 endt_us)
   if(regs_block_good)
   {
     unwind.flags = 0;
+    B32 prev_step_is_signal_frame = 0;
     for(;!unwind.flags;)
     {
       U64 start_ip = arch_ip_from_reg_block(arch_info, regs_block);
@@ -1971,11 +1972,17 @@ d_unwind_from_thread(Arena *arena, D_Handle thread, U64 endt_us)
       //- rjf: open access for this step
       Access *access = access_open();
       
-      //- rjf: ip -> module / unpack
-      D_Entity *module_entity = d_module_from_process_vaddr(process_entity, start_ip);
+      //- rjf: ip -> module / unpack. an outer frame's ip is the return address
+      // of a call: the call itself (ip-1) selects the module and the unwind
+      // rule, since the return address may lie past the function (a call which
+      // does not return) - unless the frame below is a signal trampoline, whose
+      // "return address" is the interrupted instruction itself.
+      B32 pc_is_return_address = (frame_node_count > 1 && !prev_step_is_signal_frame);
+      U64 lookup_ip = start_ip - (pc_is_return_address ? 1 : 0);
+      D_Entity *module_entity = d_module_from_process_vaddr(process_entity, lookup_ip);
       D_ModuleInfo *module_info = d_info_from_module(access, module_entity->handle);
       UWND_Unwinder unwinder = module_info->unwinder;
-      UWND_ModuleInfo unwinder_module_info = {module_entity->vaddr_range.min, module_info->unwind_info};
+      UWND_ModuleInfo unwinder_module_info = {module_entity->vaddr_range.min, module_info->unwind_info, pc_is_return_address};
       
       //- rjf: thread * module -> tls vaddr
       U64 tls_vaddr = 0;
@@ -2010,7 +2017,8 @@ d_unwind_from_thread(Arena *arena, D_Handle thread, U64 endt_us)
       
       //- rjf: do one unwind step
       B32 step_is_good = 0;
-      for(;!unwind.flags && !step_is_good;)
+      B32 unwind_ended = 0;
+      for(;!unwind.flags && !step_is_good && !unwind_ended;)
       {
         // rjf: remember registers pre-step
         MemoryCopy(regs_block_restore, regs_block, arch_reg_block_size);
@@ -2027,7 +2035,10 @@ d_unwind_from_thread(Arena *arena, D_Handle thread, U64 endt_us)
         
         // rjf: if we failed to read memory, try to read that memory, equip to memory map.
         // if it is stale and we run out of time, we will need to mark the whole unwind as
-        // stale. if it can't be read, the unwind fails.
+        // stale. if it can't be read, the unwind fails - unless we already have outer
+        // frames (a frame pointer or return address off the stack ends the unwind with
+        // the frames found), or it is the code at the stop's ip which cannot be read (a
+        // call through a bad pointer, most likely: unwind without analyzing the code).
         if(step.status == UWND_StepStatus_FailedMemoryRead)
         {
           U64 size_desired = dim_1u64(step.missed_read_vaddr_range);
@@ -2037,16 +2048,32 @@ d_unwind_from_thread(Arena *arena, D_Handle thread, U64 endt_us)
           {
             memory_map_push(scratch.arena, &memory_map, step.missed_read_vaddr_range, data);
           }
+          else if(frame_node_count == 1 && !unwinder_module_info.pc_code_unreadable && contains_1u64(step.missed_read_vaddr_range, start_ip))
+          {
+            unwinder_module_info.pc_code_unreadable = 1;
+          }
+          else if(frame_node_count > 1)
+          {
+            unwind_ended = 1;
+          }
           else
           {
             unwind.flags |= D_UnwindFlag_Error;
           }
         }
         
-        // rjf: if the step itself failed, we just fail out.
+        // rjf: if the step itself failed, we just fail out - unless we already have
+        // outer frames, which stand on their own.
         else if(step.status == UWND_StepStatus_Error)
         {
-          unwind.flags |= D_UnwindFlag_Error;
+          if(frame_node_count > 1)
+          {
+            unwind_ended = 1;
+          }
+          else
+          {
+            unwind.flags |= D_UnwindFlag_Error;
+          }
         }
         
         // rjf: if the step worked, we're good. equip this step's CFA to the previously added frame,
@@ -2055,6 +2082,7 @@ d_unwind_from_thread(Arena *arena, D_Handle thread, U64 endt_us)
         {
           last_frame_node->v.cfa = cfa;
           step_is_good = 1;
+          prev_step_is_signal_frame = step.is_signal_frame;
         }
       }
       
