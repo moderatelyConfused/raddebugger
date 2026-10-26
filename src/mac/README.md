@@ -1137,8 +1137,8 @@ items recorded below and in "Status and open issues": step out of a signal
 handler and step over `longjmp` (4), the inline-sequence items `F1`/`F2`/`F4b`
 (6), `D3`'s `write` breakpoint (2: `printf` reaches `write$NOCANCEL`, and the
 unqualified name is ambiguous between dyld's and libsystem_kernel's `write`),
-`D6`'s exec of a platform binary (2, an OS limit), and `U5`'s thread-local
-read after the first access (1). Every failure below is a
+and `D6`'s exec of a platform binary (2, an OS limit); `U5`'s thread-local
+read (1 then) is fixed since (TLS evaluation, below). Every failure below is a
 recorded bug or observation; scenarios fully passing include
 launch/kill/restart/exit, the breakpoint flows (line, inline line, dylib
 before load, address, condition, hit counts, toggle/remove, function name
