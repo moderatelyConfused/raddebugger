@@ -2957,6 +2957,24 @@ d_ctrl_thread__server_run_ctrls_from_id(D_RunCtrls *ctrls, D_ServerID server_id)
   return result;
 }
 
+//- rjf: server state lookups
+
+internal D_ServerState *
+d_ctrl_thread__server_state_from_id(D_ServerID server_id)
+{
+  D_ServerState *result = 0;
+  U64 slot_idx = server_id%d_ctrl_state->server_slots_count;
+  for(D_ServerState *ss = d_ctrl_state->server_slots[slot_idx].first; ss != 0; ss = ss->hash_next)
+  {
+    if(ss->server_id == server_id)
+    {
+      result = ss;
+      break;
+    }
+  }
+  return result;
+}
+
 //- rjf: attached process running/event gathering
 
 internal DMN_Event *
@@ -5174,8 +5192,17 @@ d_ctrl_thread__run(DMN_CtrlCtx *ctrl_ctx, D_Msg *msg)
           // rjf: determine if thread is frozen
           B32 thread_is_frozen = thread->is_frozen;
           
-          // rjf: not frozen? -> check if stuck & gather if so
-          if(!thread_is_frozen)
+          // rjf: determine if thread sits on a trap it hit, with the hit not reported yet (another
+          // thread's hit stopped that run; see the run loop below): it is not stuck, its hit is
+          // the next stop
+          B32 thread_has_unreported_bp_hit = thread->has_unreported_bp_hit;
+          if(thread_has_unreported_bp_hit)
+          {
+            log_infof("thread [0x%I64x] holds an unreported breakpoint hit at 0x%I64x: not stepped off\n", d_dmn_from_handle(thread->handle).u64[0], rip);
+          }
+          
+          // rjf: not frozen, no pending hit? -> check if stuck & gather if so
+          if(!thread_is_frozen && !thread_has_unreported_bp_hit)
           {
             for(DMN_TrapChunkNode *n = user_traps.first; n != 0; n = n->next)
             {
@@ -5364,11 +5391,74 @@ d_ctrl_thread__run(DMN_CtrlCtx *ctrl_ctx, D_Msg *msg)
       run_ctrls.traps = *trap_list;
       
       //////////////////////////
+      //- rjf: report a breakpoint hit held back from an earlier run
+      //
+      // A thread marked by the end of an earlier run (see "hold back the other
+      // threads' unreported breakpoint hits" below) still sits on the trap it
+      // hit; nothing has moved it (it is exempt from the stuck-thread stepping
+      // above). If this run has a user trap there, its hit is the next event:
+      // the demon delivered that stop long ago, so nothing is resumed for it,
+      // and the regular breakpoint handling below (conditions, thread filters)
+      // decides about the stop. If the breakpoint is gone, or the thread was
+      // moved (by a single step of its own, say), the hit is dropped: the
+      // thread runs on from the original instruction. A frozen thread keeps
+      // its hit for the run which thaws it.
+      //
+      DMN_Event *event = 0;
+      for(D_Entity *machine = entity_ctx->root->first; machine != &d_entity_nil && event == 0; machine = machine->next)
+      {
+        if(machine->kind != D_EntityKind_Server) { continue; }
+        for(D_Entity *process = machine->first; process != &d_entity_nil && event == 0; process = process->next)
+        {
+          if(process->kind != D_EntityKind_Process) { continue; }
+          DMN_Handle process_dmn = d_dmn_from_handle(process->handle);
+          for(D_Entity *thread = process->first; thread != &d_entity_nil && event == 0; thread = thread->next)
+          {
+            if(thread->kind != D_EntityKind_Thread || !thread->has_unreported_bp_hit || thread->is_frozen) { continue; }
+            DMN_Handle thread_dmn = d_dmn_from_handle(thread->handle);
+            U64 rip = d_ip_from_thread(thread->handle);
+            DMN_Trap *hit_trap = 0;
+            if(rip == thread->unreported_bp_hit_vaddr)
+            {
+              for(DMN_TrapChunkNode *n = user_traps.first; n != 0 && hit_trap == 0; n = n->next)
+              {
+                for(DMN_Trap *trap = n->v, *opl = n->v + n->count; trap < opl; trap += 1)
+                {
+                  if(trap->flags == 0 && dmn_handle_match(trap->process, process_dmn) && trap->vaddr == rip)
+                  {
+                    hit_trap = trap;
+                    break;
+                  }
+                }
+              }
+            }
+            thread->has_unreported_bp_hit = 0;
+            if(hit_trap == 0)
+            {
+              log_infof("held_back_breakpoint_hit: thread [0x%I64x] at 0x%I64x (hit at 0x%I64x): no such trap anymore, dropped\n", thread_dmn.u64[0], rip, thread->unreported_bp_hit_vaddr);
+              continue;
+            }
+            log_infof("held_back_breakpoint_hit: thread [0x%I64x] at 0x%I64x -> reported now\n", thread_dmn.u64[0], rip);
+            event = push_array(scratch.arena, DMN_Event, 1);
+            event->kind                = DMN_EventKind_Breakpoint;
+            event->process             = process_dmn;
+            event->thread              = thread_dmn;
+            event->arch                = thread->arch;
+            event->instruction_pointer = rip;
+            event->user_data           = hit_trap->id;
+          }
+        }
+      }
+      
+      //////////////////////////
       //- rjf: get next run-related event
       //
-      log_infof("get_next_event:\n{\n");
-      DMN_Event *event = d_ctrl_thread__next_dmn_event(scratch.arena, ctrl_ctx, msg, &run_ctrls, run_spoof);
-      log_infof("}\n\n");
+      if(event == 0)
+      {
+        log_infof("get_next_event:\n{\n");
+        event = d_ctrl_thread__next_dmn_event(scratch.arena, ctrl_ctx, msg, &run_ctrls, run_spoof);
+        log_infof("}\n\n");
+      }
       
       //////////////////////////
       //- rjf: determine event handling
@@ -6181,6 +6271,59 @@ d_ctrl_thread__run(DMN_CtrlCtx *ctrl_ctx, D_Msg *msg)
         stop_event = event;
         stop_cause = stage_stop_cause;
         break;
+      }
+    }
+  }
+  
+  //////////////////////////////
+  //- rjf: hold back the other threads' unreported breakpoint hits
+  //
+  // A demon may report the hits of several threads from one run (threads
+  // which hit traps at the same time; the mac demon does, the win32 demon
+  // sees one debug event per run and leaves the others queued in the kernel,
+  // to be delivered by later runs). We stopped for one of them; the other
+  // threads' events are still queued, and those threads still sit on their
+  // trap, which the run's end restored to the original instruction. The
+  // events must not survive into a later run: their trap ids point into this
+  // message's breakpoint list, and the single-step runs which take stuck
+  // threads off their traps would consume them as noise. Instead the threads
+  // are marked: the next runs do not step them off their trap, and report
+  // their hits, one per run, before resuming anything (the run loop above).
+  //
+  if(stop_event != 0)
+  {
+    D_ServerState *ss = d_ctrl_thread__server_state_from_id(D_ServerID_LocalHost);
+    if(ss != 0)
+    {
+      DMN_EventNode *kept_first = 0;
+      DMN_EventNode *kept_last = 0;
+      for(DMN_EventNode *n = ss->first_dmn_event_node, *next = 0; n != 0; n = next)
+      {
+        next = n->next;
+        n->next = 0;
+        DMN_Event *ev = &n->v;
+        if(ev->kind == DMN_EventKind_Breakpoint)
+        {
+          D_Entity *thread = d_entity_from_handle(d_handle_from_dmn(D_ServerID_LocalHost, ev->thread));
+          if(thread != &d_entity_nil && ev->address == 0 && !dmn_handle_match(ev->thread, stop_event->thread))
+          {
+            thread->has_unreported_bp_hit = 1;
+            thread->unreported_bp_hit_vaddr = ev->instruction_pointer;
+            log_infof("unreported breakpoint hit of thread [0x%I64x] at 0x%I64x: held back for a later run\n", ev->thread.u64[0], ev->instruction_pointer);
+          }
+          SLLStackPush(ss->free_dmn_event_node, n);
+        }
+        else
+        {
+          SLLQueuePush(kept_first, kept_last, n);
+        }
+      }
+      ss->first_dmn_event_node = kept_first;
+      ss->last_dmn_event_node  = kept_last;
+      if(ss->first_dmn_event_node == 0)
+      {
+        ss->free_dmn_event_node = 0;
+        arena_clear(ss->dmn_event_arena);
       }
     }
   }
