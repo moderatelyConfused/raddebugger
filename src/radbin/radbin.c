@@ -18,6 +18,32 @@
 #endif
 
 ////////////////////////////////
+//~ rjf: Helpers
+
+#if OS_MAC
+internal void
+rb_remove_directory_tree(String8 path)
+{
+  // NOTE: the base layer has no recursive delete; only bundles this program
+  // generated in the user's cache directory are passed here
+  Temp scratch = scratch_begin(0, 0);
+  ProcessLaunchParams params = {0};
+  params.inherit_env = 1;
+  params.consoleless = 1;
+  str8_list_push(scratch.arena, &params.cmd_line, str8_lit("/bin/rm"));
+  str8_list_push(scratch.arena, &params.cmd_line, str8_lit("-rf"));
+  str8_list_push(scratch.arena, &params.cmd_line, path);
+  Process process = process_launch(&params);
+  if(!process_match(process, process_zero()))
+  {
+    U64 exit_code = 0;
+    process_join(process, now_time_us() + 60*Million(1), &exit_code);
+  }
+  scratch_end(scratch);
+}
+#endif
+
+////////////////////////////////
 //~ rjf: Top-Level Entry Points
 
 internal void
@@ -419,9 +445,28 @@ rb_thread_entry_point(void *p)
         MACHO_Bin bin = macho_bin_from_data(scratch.arena, file_data);
         if(bin.is_valid && bin.hdr.filetype != MACHO_MH_DSYM && !macho_is_dwarf_present_from_bin(&bin))
         {
-          //- rjf: look for a dSYM bundle next to the executable
+          //- rjf: look for a dSYM bundle next to the executable (`<exe>.dSYM`), or,
+          // for an executable inside an application bundle
+          // (`Foo.app/Contents/MacOS/Foo`), next to the application bundle
+          // (`Foo.app.dSYM`, where Xcode puts it)
+          String8 exe_name = str8_skip_last_slash(input_file_path);
           String8 dsym_path = macho_dsym_path_from_exe_path(arena, input_file_path);
           B32 dsym_path_is_found = file_path_exists(dsym_path);
+          if(!dsym_path_is_found)
+          {
+            String8 macos_dir = str8_chop_last_slash(input_file_path);
+            String8 contents_dir = str8_chop_last_slash(macos_dir);
+            if(str8_match(str8_skip_last_slash(macos_dir), str8_lit("MacOS"), 0) &&
+               str8_match(str8_skip_last_slash(contents_dir), str8_lit("Contents"), 0))
+            {
+              String8 app_dsym_path = str8f(arena, "%S.dSYM/Contents/Resources/DWARF/%S", str8_chop_last_slash(contents_dir), exe_name);
+              if(file_path_exists(app_dsym_path))
+              {
+                dsym_path = app_dsym_path;
+                dsym_path_is_found = 1;
+              }
+            }
+          }
           if(dsym_path_is_found)
           {
             log_infof("Found separate debug info file for %S (%S) at %S\n", n->string, rb_file_format_display_name_table[file_format], dsym_path);
@@ -438,7 +483,6 @@ rb_thread_entry_point(void *p)
             // links of the same code with different debug info (a comment added,
             // another -gdwarf-N, other source paths) share a UUID; the object files'
             // paths and modification times from the debug map tell them apart.
-            String8 exe_name = str8_skip_last_slash(input_file_path);
             String8 cache_root = get_process_info()->user_program_cache_data_path;
             String8 dsyms_dir = str8f(scratch.arena, "%S/raddbg/dsyms", cache_root);
             String8 bundle_name = str8f(scratch.arena, "%S-%016I64x", exe_name, bin.debug_map_hash);
@@ -452,15 +496,41 @@ rb_thread_entry_point(void *p)
             }
             String8 bundle_path = str8f(scratch.arena, "%S/%S.dSYM", dsyms_dir, bundle_name);
             dsym_path = str8f(arena, "%S/Contents/Resources/DWARF/%S", bundle_path, exe_name);
+
+            // rjf: reuse the cached bundle, if its DWARF file is a Mach-O carrying the
+            // executable's UUID (dsymutil copies it); an empty or truncated file (planted,
+            // or left by an older radbin which died mid-way) is removed instead
             if(file_path_exists(dsym_path))
             {
-              log_infof("Reusing previously generated dSYM at %S\n", dsym_path);
-              dsym_path_is_found = 1;
+              Guid cached_uuid = {0};
+              B32 cached_is_usable = macho_uuid_from_file_path(dsym_path, &cached_uuid);
+              if(cached_is_usable && bin.has_uuid && !MemoryMatch(&cached_uuid, &bin.uuid, sizeof(cached_uuid)))
+              {
+                cached_is_usable = 0;
+              }
+              if(cached_is_usable)
+              {
+                log_infof("Reusing previously generated dSYM at %S\n", dsym_path);
+                dsym_path_is_found = 1;
+              }
+              else
+              {
+                log_infof("Previously generated dSYM at %S is not usable (not a Mach-O with the executable's UUID); removing it\n", dsym_path);
+                rb_remove_directory_tree(bundle_path);
+              }
             }
-            else
+
+            // rjf: generate. dsymutil links into a private bundle, which a rename
+            // publishes at the cache path once it exited 0 and produced the DWARF
+            // file: a run killed by the timeout, a crash, or another radbin racing
+            // on the same executable never leaves a half-written bundle at the path
+            // that is reused (a `.tmp.<pid>` bundle is not a hit)
+            if(!dsym_path_is_found)
             {
               make_directory(str8f(scratch.arena, "%S/raddbg", cache_root));
               make_directory(dsyms_dir);
+              String8 temp_bundle_path = str8f(scratch.arena, "%S.tmp.%u", bundle_path, get_process_info()->pid);
+              String8 temp_dsym_path = str8f(scratch.arena, "%S/Contents/Resources/DWARF/%S", temp_bundle_path, exe_name);
               ProcessLaunchParams params = {0};
               params.inherit_env = 1;
               params.consoleless = 1;
@@ -468,8 +538,8 @@ rb_thread_entry_point(void *p)
               str8_list_push(scratch.arena, &params.cmd_line, str8_lit("dsymutil"));
               str8_list_push(scratch.arena, &params.cmd_line, input_file_path);
               str8_list_push(scratch.arena, &params.cmd_line, str8_lit("-o"));
-              str8_list_push(scratch.arena, &params.cmd_line, bundle_path);
-              log_infof("Running `xcrun dsymutil %S -o %S` from `%S` (relative object file paths in the debug map resolve from there)\n", input_file_path, bundle_path, get_current_path(scratch.arena));
+              str8_list_push(scratch.arena, &params.cmd_line, temp_bundle_path);
+              log_infof("Running `xcrun dsymutil %S -o %S` from `%S` (relative object file paths in the debug map resolve from there)\n", input_file_path, temp_bundle_path, get_current_path(scratch.arena));
               Process process = process_launch(&params);
               if(process_match(process, process_zero()))
               {
@@ -489,15 +559,29 @@ rb_thread_entry_point(void *p)
                 {
                   log_infof("dsymutil exited with code %I64u\n", exit_code);
                 }
-                else if(file_path_exists(dsym_path))
+                else if(!file_path_exists(temp_dsym_path))
+                {
+                  log_infof("dsymutil exited successfully, but %S was not produced\n", temp_dsym_path);
+                }
+                else if(move_file_path(bundle_path, temp_bundle_path))
                 {
                   log_infof("dsymutil generated %S\n", dsym_path);
                   dsym_path_is_found = 1;
                 }
+                else if(file_path_exists(dsym_path))
+                {
+                  // rjf: another process published its bundle first
+                  log_infof("dsymutil generated %S, but %S appeared meanwhile; using that\n", temp_dsym_path, dsym_path);
+                  dsym_path_is_found = 1;
+                }
                 else
                 {
-                  log_infof("dsymutil exited successfully, but %S was not produced\n", dsym_path);
+                  log_infof("dsymutil generated %S, but it could not be moved to %S\n", temp_dsym_path, bundle_path);
                 }
+              }
+              if(folder_path_exists(temp_bundle_path))
+              {
+                rb_remove_directory_tree(temp_bundle_path);
               }
             }
 #else
@@ -1163,6 +1247,13 @@ rb_thread_entry_point(void *p)
                 convert_params.deterministic = cmd_line_has_flag(cmdline, str8_lit("deterministic"));
               }
               ProfScope("convert") dwarf_bake_params = m2r_bake_params_from_macho_symtab(arena, &convert_params);
+
+              // rjf: mark the RDI as made from the symbol table alone, so that a
+              // consumer can tell it from a full conversion: written next to the
+              // executable, it is otherwise never upgraded once a dSYM or the
+              // objects of the debug map turn up (its UUID matches, it is newer; see
+              // dbg_info.c, "determine if RDI is stale")
+              dwarf_bake_params.top_level_info.producer_name = str8f(arena, "%S [symbol table only]", dwarf_bake_params.top_level_info.producer_name);
               scratch_end(scratch);
             }
           }
