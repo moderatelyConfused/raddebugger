@@ -164,7 +164,16 @@ macho_uwnd_step(Arch arch, MemoryMap *memory_map, UWND_ModuleInfo *module_info, 
   U64 function_voff = 0;
   B32 found = macho_uwnd_encoding_from_voff(info, lookup_voff, &encoding, &function_voff);
   U32 mode = encoding & MACHO_UWND_ARM64_MODE_MASK;
-  U64 function_vaddr = (encoding & MACHO_UWND_IS_NOT_FUNCTION_START) ? 0 : module_info->base_vaddr + function_voff;
+
+  //- rjf: the function's start, for the prologue replay: debug info's when
+  // known (the linker shares one entry among consecutive functions with the
+  // same encoding - every -O0 function, typically - so the entry's offset is
+  // the start of the run, not of the function), else the entry's
+  U64 function_vaddr = module_info->function_vaddr;
+  if(function_vaddr == 0 && found && !(encoding & MACHO_UWND_IS_NOT_FUNCTION_START))
+  {
+    function_vaddr = module_info->base_vaddr + function_voff;
+  }
   
   //- rjf: DWARF mode -> use the FDE referenced from the encoding
   B32 done = 0;

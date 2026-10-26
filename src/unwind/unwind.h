@@ -38,6 +38,7 @@ struct UWND_ModuleInfo
   void *unwind_info;
   B32 pc_is_return_address; // an outer frame: pc is the return address of a call, so the call's own address (pc-1) selects the unwind rule, and the code at pc has not executed
   B32 pc_code_unreadable;   // the code at pc could not be read: no prologue / epilogue analysis
+  U64 function_vaddr;       // the start of the function containing pc, from debug info (0: unknown). Preferred to the unwind info's start (compact unwind entries are shared by runs of same-encoding functions), and all there is for functions the unwind info does not describe (syscall stubs)
 };
 
 ////////////////////////////////
@@ -52,6 +53,7 @@ typedef enum UWND_ARM64_CodeState
   UWND_ARM64_CodeState_NeedRead, // the code around pc is not in the memory map; *missed_out is the range to read
 }
 UWND_ARM64_CodeState;
+internal U64 uwnd_arm64_stub_inst_count_from_code(U32 *code, U64 count);
 internal UWND_ARM64_CodeState uwnd_arm64_code_state_from_pc(MemoryMap *memory_map, U64 function_vaddr, U64 pc, U64 sp, U64 *cfa_out, Rng1U64 *missed_out);
 #endif
 

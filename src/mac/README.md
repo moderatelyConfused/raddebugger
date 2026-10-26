@@ -190,11 +190,45 @@ bundled with Zig: `zig cc -target aarch64-macos -fsyntax-only ...`).
   *stopped* pc cannot be read at all (a call through a bad pointer),
   `pc_code_unreadable` is set and the moduleless unwinder treats the stop as
   the callee's first instruction (return address in `lr`), as lldb does.
+* Function starts. `UWND_ModuleInfo.function_vaddr` carries the start of the
+  function containing the stopped frame's pc, which `d_unwind_from_thread`
+  takes from the RDI procedure containing it (`rdi_scope_from_voff` ->
+  `rdi_procedure_from_scope` -> root scope's first voff; nil while the debug
+  info is still converting). Both unwinders prefer it to the compact entry's
+  offset, because the linker shares one `__unwind_info` entry among
+  consecutive functions with the same encoding (at -O0 every function is
+  `0x04000000`, so `basic_O0` has one entry for `0x7a4..0xb5c`, and
+  `locals_frame` at `0x8a0` "started" 252 bytes earlier): the replay from the
+  entry's offset either did not run (too far) or ran off at the previous
+  function's `ret`, and a stop at a function's first instruction (an
+  instruction step into a call) showed `locals_frame start`. With the start
+  known the replay has nothing to replay at the entry and reports the prologue
+  state (lldb's rule: pc = lr, cfa = sp); the frame-setup-ahead heuristic now
+  also runs whenever the replay did not establish the prologue, so an unknown,
+  far or wrong start degrades to the old behaviour instead of to the frame
+  pointer chain. Functions the unwind info does not describe get the same
+  treatment through the moduleless fallback: libsystem_kernel's syscall stubs
+  (`write`: `mov x16, #N; svc; b.lo; b cerror; ret`, no compact entry; the
+  `b cerror` ahead of the `ret` hides the frameless leaf from the epilogue
+  scan, so the start from the symbol-table RDI is what makes `main` appear;
+  `tests/dyld_module_events.sh` checks it). Linker stubs have neither a symbol
+  nor an entry, so `uwnd_arm64_stub_inst_count_from_code` recognizes their
+  code (`adrp x16; ldr x16, [x16, #off]; br x16`, and the arm64e
+  `__auth_stubs` form) at any of its instructions: a step into a call through
+  `__stubs` (`strlen`) now shows the caller as frame 1, and a step out from the
+  stub or from a function's entry returns to it (flows
+  `stepping_O0/inst_into_call_stack`, `into_strlen_frame1_is_caller`,
+  `inst_out`). Not covered: a known start more than 128 bytes before pc with
+  the frame still unbuilt (the window is 32 instructions behind pc), and the
+  error path of a syscall stub past its `b.lo` (a conditional branch ends the
+  replay).
 * Decoder: `stp`/`ldp` to `[sp]` are recognized by `(code & 0x3a000000) ==
   0x28000000` (bit 25 clear); the old mask also matched logical
   shifted-register ops with `Rn = xzr`, so `mov xN, xM` counted as a 16-byte
   pair store. `src/mac/tests/unwind_arm64_test.c` checks the decoder and the
-  analysis on hand-assembled sequences (build line in its header).
+  analysis on hand-assembled sequences (build line in its header; 110 checks,
+  among them the syscall stub, the linker stubs and the shared entry above);
+  `./run_tests.sh` builds and runs it on macOS/arm64 before torture.
 
 ## Display scaling
 
@@ -475,14 +509,17 @@ impact:
   (`dyld_cache_local_symbols_info`, keyed by the cache UUID) is the
   follow-up. `eval` of a symbol-table procedure prints an empty value (it has
   no type).
-* Stopped at the entry of a frameless syscall stub (`write` has no compact
-  unwind entry) the call stack skips the caller (`write start`, no `main`):
-  the unwinder falls back to the frame-pointer chain, where lldb applies its
-  at-function-entry rule (pc = lr). The symbol-table RDI now tells the engine
-  where those functions start (`tests/dyld_module_events.sh`, NOTE). `D3`'s
-  `write` breakpoint cannot hit on this macOS: `basic.c`'s `printf` reaches
-  `write$NOCANCEL` (`__write_nocancel`), not `write`; the scenario needs a
-  direct `write()` call, or `__write_nocancel` as the name.
+* Fixed (see "Unwinding", function starts): stopped at the entry of a frameless
+  syscall stub (`write`), at a function's first instruction, or in a `__stubs`
+  entry, the call stack skipped the caller; the engine now hands the unwinder
+  the function's start from the RDI procedure, and stubs are recognized by
+  their code. Still open there: a step over after such a step out lands on
+  the middle of the call's line, and the next step over stays on it (the
+  stepping item below, `U5`; `stepping_O0`'s `into_strlen_skipped`,
+  `libsystem_len` and `at_main_locals` now fail that way rather than in
+  `main`). `D3`'s `write` breakpoint cannot hit on this macOS: `basic.c`'s
+  `printf` reaches `write$NOCANCEL` (`__write_nocancel`), not `write`; the
+  scenario needs a direct `write()` call, or `__write_nocancel` as the name.
 * **Step-into and code without line info.** Every Zig `threadlocal` access
   calls dyld's TLV getter through an indirect `blr`, and a step into on such
   a line lands there (the trap net cannot know an indirect call's destination

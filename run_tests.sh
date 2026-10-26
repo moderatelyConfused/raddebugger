@@ -62,6 +62,12 @@ for m in "${mode_values[@]}"; do
     # build targets
     ./build.sh meta "$c" "$m" "${target_values[@]}"
 
+    # macOS/arm64: the unwinder's prologue / epilogue analysis checks (a standalone program; exits with the failed count)
+    if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]]; then
+      clang -I src -D_DARWIN_C_SOURCE -g -Wno-unused-function -Wno-unused-variable -Wno-writable-strings -Wno-initializer-overrides -o build/unwind_arm64_test src/mac/tests/unwind_arm64_test.c -lm -ldl
+      build/unwind_arm64_test
+    fi
+
     # run torture from build folder
     if [[ "$run_torture" == "1" ]]; then
       torture_compiler_args=()

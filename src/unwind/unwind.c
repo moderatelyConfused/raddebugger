@@ -224,6 +224,33 @@ uwnd_arm64_inst_is_prologue(UWND_ARM64_Inst inst)
           inst.kind == UWND_ARM64_InstKind_Other);
 }
 
+// rjf: the instruction count of a linker stub starting at code[0], or 0 if it
+// is not one: `adrp x16, page; ldr x16, [x16, #off]; br x16` (__stubs), or the
+// arm64e form `adrp x17, page; add x17, x17, #off; ldr x16, [x17]; braa x16, x17`
+// (__auth_stubs). Stubs have no symbol and no unwind entry, and never touch
+// the stack: at any of their instructions lr holds the return address.
+internal U64
+uwnd_arm64_stub_inst_count_from_code(U32 *code, U64 count)
+{
+  U64 result = 0;
+  if(count >= 3 &&
+     (code[0] & 0x9f00001f) == 0x90000010 &&
+     (code[1] & 0xffc003ff) == 0xf9400210 &&
+     code[2] == 0xd61f0200)
+  {
+    result = 3;
+  }
+  else if(count >= 4 &&
+          (code[0] & 0x9f00001f) == 0x90000011 &&
+          (code[1] & 0xff8003ff) == 0x91000231 &&
+          code[2] == 0xf9400230 &&
+          code[3] == 0xd71f0a11)
+  {
+    result = 4;
+  }
+  return result;
+}
+
 internal UWND_ARM64_CodeState
 uwnd_arm64_code_state_from_pc(MemoryMap *memory_map, U64 function_vaddr, U64 pc, U64 sp, U64 *cfa_out, Rng1U64 *missed_out)
 {
@@ -288,13 +315,15 @@ uwnd_arm64_code_state_from_pc(MemoryMap *memory_map, U64 function_vaddr, U64 pc,
       }
       
       //////////////////////////////
-      //- rjf: prologue, unknown function start -> if a frame setup lies ahead
-      // of pc, reachable only through prologue instructions, then pc is inside
-      // a prologue; the prologue instructions immediately behind pc are the
-      // ones which have already executed (the previous function ends with a
-      // return, branch, or trap, which stops the backwards scan)
+      //- rjf: prologue, unknown function start (or one too far from pc to
+      // replay from, or one the replay ran off: an unwind entry's start is
+      // that of a run of same-encoding functions) -> if a frame setup lies
+      // ahead of pc, reachable only through prologue instructions, then pc is
+      // inside a prologue; the prologue instructions immediately behind pc are
+      // the ones which have already executed (the previous function ends with
+      // a return, branch, or trap, which stops the backwards scan)
       //
-      else if(function_vaddr == 0)
+      if(state == UWND_ARM64_CodeState_Body)
       {
         B32 setup_ahead = 0;
         for(U64 idx = 0; idx < ahead_count; idx += 1)
@@ -316,7 +345,26 @@ uwnd_arm64_code_state_from_pc(MemoryMap *memory_map, U64 function_vaddr, U64 pc,
           cfa = sp + depth;
         }
       }
-      
+
+      //////////////////////////////
+      //- rjf: linker stub -> pc is at one of the instructions of a stub, which
+      // has not touched the stack: lr holds the return address, sp is the
+      // entry stack pointer (a step into a call through __stubs lands here)
+      //
+      if(state == UWND_ARM64_CodeState_Body)
+      {
+        for(U64 back = 0; back < 4 && back <= behind_count; back += 1)
+        {
+          U64 inst_count = uwnd_arm64_stub_inst_count_from_code(pc_code - back, ahead_count + back);
+          if(inst_count != 0 && back < inst_count)
+          {
+            state = UWND_ARM64_CodeState_Prologue;
+            cfa = sp;
+            break;
+          }
+        }
+      }
+
       //////////////////////////////
       //- rjf: epilogue -> if a return (or a tail call, once the stack was
       // popped) lies ahead of pc, reachable without writing sp, x29 or x30
@@ -411,7 +459,8 @@ uwnd_step_moduleless(Arch arch, MemoryMap *memory_map, UWND_ModuleInfo *module_i
     }
     else if(module_info == 0 || !module_info->pc_is_return_address)
     {
-      code_state = uwnd_arm64_code_state_from_pc(memory_map, 0, regs_arm64->pc, regs_arm64->sp, &code_cfa, &code_missed);
+      U64 function_vaddr = (module_info != 0) ? module_info->function_vaddr : 0;
+      code_state = uwnd_arm64_code_state_from_pc(memory_map, function_vaddr, regs_arm64->pc, regs_arm64->sp, &code_cfa, &code_missed);
     }
     if(code_state == UWND_ARM64_CodeState_NeedRead)
     {

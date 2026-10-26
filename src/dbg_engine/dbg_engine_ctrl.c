@@ -1983,7 +1983,30 @@ d_unwind_from_thread(Arena *arena, D_Handle thread, U64 endt_us)
       D_ModuleInfo *module_info = d_info_from_module(access, module_entity->handle);
       UWND_Unwinder unwinder = module_info->unwinder;
       UWND_ModuleInfo unwinder_module_info = {module_entity->vaddr_range.min, module_info->unwind_info, pc_is_return_address};
-      
+
+      //- rjf: ip -> start of the function containing it, from debug info, for
+      // the code analysis of a stopped frame: the module's unwind info may not
+      // describe the function (a syscall stub), or may not give its start (a
+      // compact unwind entry is shared by a run of same-encoding functions).
+      // Debug info which is not loaded yet leaves it unknown (nil rdi).
+      if(!pc_is_return_address)
+      {
+        U64 ip_voff = start_ip - module_entity->vaddr_range.min;
+        DI_Key dbgi_key = d_dbgi_key_from_module(module_entity);
+        RDI_Parsed *rdi = di_rdi_from_key(access, dbgi_key, 0, 0);
+        RDI_Scope *scope = rdi_scope_from_voff(rdi, ip_voff);
+        RDI_Symbol *procedure = rdi_procedure_from_scope(rdi, scope);
+        if(procedure->root_scope_idx != 0)
+        {
+          RDI_Scope *root_scope = rdi_root_scope_from_procedure(rdi, procedure);
+          U64 function_voff = rdi_first_voff_from_scope(rdi, root_scope);
+          if(function_voff <= ip_voff)
+          {
+            unwinder_module_info.function_vaddr = module_entity->vaddr_range.min + function_voff;
+          }
+        }
+      }
+
       //- rjf: thread * module -> tls vaddr
       U64 tls_vaddr = 0;
       d_thread_get_module_tls_vaddr(thread_entity->handle, module_entity->handle, &tls_vaddr);
