@@ -105,6 +105,29 @@ bundled with Zig: `zig cc -target aarch64-macos -fsyntax-only ...`).
   images (`mac_dmn_process_read_all_image_infos`); the trap is (re)armed from
   that struct's notifier. Module info is parsed from the in-memory Mach-O header
   (`__unwind_info`, `__eh_frame`, UUID, entry point, `__thread_vars`).
+* Symbol tables of shared-cache images: the dyld shared cache's images have no
+  file of their own on this macOS (`/usr/lib/libSystem.B.dylib` is not on
+  disk; `/usr/lib/system/libsystem_kernel.dylib` is, but as a fat file whose
+  slices are not the cache's copy) and no DWARF. Their symbol tables are
+  reachable through the task port: `LC_SYMTAB`'s cache-relative offsets map
+  into memory through the `__LINKEDIT` segment, as the demon already does to
+  find dyld's notifier. For an image whose path is not a file with its UUID,
+  `mac_dmn_debug_info_path_from_image` writes a symbol-only Mach-O (header and
+  load commands from memory; the defined symbols, their names and
+  `LC_FUNCTION_STARTS` appended; segments without file data, like a dSYM) to
+  `<cache>/raddbg/images/<UUID>/<name>`, once per UUID, and reports it as the
+  module's debug info path. The engine converts it like any Mach-O
+  (`radbin --rdi`): without `__DWARF`, `rdi_from_macho.c` turns `LC_SYMTAB`'s
+  defined code symbols into procedures (`_write` -> `write`, link name kept),
+  each ending at the next symbol, the next function start or its section's
+  end. Cost: a C program's 44 startup images take about 2 MB, written during
+  the first stop of the first run; later runs reuse them. The cache files under
+  `/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/` hold the same
+  data (and the local symbols), but using them means parsing the cache header,
+  image and mapping tables across the sub-cache files of exactly the cache the
+  debuggee maps, a layout that changes between releases; memory reuses the
+  parsing the demon does for every image anyway. Extracting dylibs with
+  `dyld_shared_cache_extract_dylibs` was ruled out as a runtime dependency.
 * Exception codes reported to the engine: BSD signal numbers, or
   `0x10000 + EXC_*` for Mach exception types (see `mac/mac.mdesk`); soft
   `SIGSEGV` / `SIGBUS` and `EXC_BAD_ACCESS` report the fault address.
@@ -343,10 +366,13 @@ parts of the execution; calls to `next()` after the first jump straight to
   the two candidate structs lists more images. After a stop in `main`,
   `ctrl_thread.raddbg_log` and `state` modules list libSystem.B.dylib,
   libsystem_kernel.dylib and the rest, and a dlopen/dlclose produce LoadModule /
-  UnloadModule events (`tests/dyld_module_events.sh`). Still missing: a function
-  breakpoint in a no-DWARF shared-cache module (e.g. `write`) cannot resolve,
-  because `rdi_from_macho.c` converts only `__DWARF`, not the Mach-O symbol
-  table, into RDI procedures — a separate converter change.
+  UnloadModule events (`tests/dyld_module_events.sh`). Those modules have no
+  DWARF; their RDIs now come from the Mach-O symbol table (see "Symbol tables
+  of shared-cache images" under Demon): `eval write` resolves, a function
+  breakpoint on `write` hits and the frame is named
+  (`tests/dyld_module_events.sh`). Note that stdio writes through
+  `write$NOCANCEL`, so a `write` breakpoint only hits programs calling
+  `write` themselves.
 * Driving the debugger from a script: `launch_and_step_into` sent over `--ipc`
   has no target in its registers and launches nothing; send `step_into` with
   no process instead. `exit` over IPC now quits an instance even with a live
@@ -432,10 +458,22 @@ impact:
   several threads in one run are reported together by the demon, the engine
   stops for the first and the resume answers the others with the traps
   already removed, so their hits are lost (`threads_breakpoints`).
-* Modules without DWARF (the shared cache's libSystem etc.) get no RDI
-  procedures: `rdi_from_macho.c` converts `__DWARF` only, not the Mach-O
-  symbol table, so a function breakpoint on `write` cannot resolve and their
-  frames show as `???` (`tests/dyld_module_events.sh`, flows `D3`).
+* Shared-cache images are named from their exported symbols only: the
+  per-image `LC_SYMTAB` in the cache keeps the `N_EXT` symbols (libsystem_c
+  has 2268, `__swrite` and `_printf` among them); the locals (`__sflush`,
+  `__sfvwrite`, ...) live in the cache's `.symbols` file, which is not mapped
+  into the debuggee, so frames inside them stay `???`. Reading that file
+  (`dyld_cache_local_symbols_info`, keyed by the cache UUID) is the
+  follow-up. `eval` of a symbol-table procedure prints an empty value (it has
+  no type).
+* Stopped at the entry of a frameless syscall stub (`write` has no compact
+  unwind entry) the call stack skips the caller (`write start`, no `main`):
+  the unwinder falls back to the frame-pointer chain, where lldb applies its
+  at-function-entry rule (pc = lr). The symbol-table RDI now tells the engine
+  where those functions start (`tests/dyld_module_events.sh`, NOTE). `D3`'s
+  `write` breakpoint cannot hit on this macOS: `basic.c`'s `printf` reaches
+  `write$NOCANCEL` (`__write_nocancel`), not `write`; the scenario needs a
+  direct `write()` call, or `__write_nocancel` as the name.
 * **Step-into and code without line info.** Every Zig `threadlocal` access
   calls dyld's TLV getter through an indirect `blr`, and a step into on such
   a line lands there (the trap net cannot know an indirect call's destination
@@ -770,10 +808,11 @@ fixed since by the demon and unwinder work and are not repeated here):
   new thread selects it), the call stacks of other threads (`U3`,
   `threads_freeze`, `D5` finds the spinner) and the fiber stack
   (`range -> entryPoint -> next`).
-* A function breakpoint on a libSystem symbol (`write`, `D3`) does not hit,
-  not even after a warm-up evaluation (`eval write` resolves nothing: the
-  system libraries' RDIs come from their symbol tables and `write` is not
-  found by name).
+* `eval write` now resolves (the system libraries' RDIs come from their
+  symbol tables, see Demon), but `D3`'s `write` breakpoint still does not
+  hit: `basic.c`'s `printf` reaches `write$NOCANCEL` (`__write_nocancel`),
+  not `write`, on this macOS. A program calling `write()` itself stops there
+  (`tests/dyld_module_events.sh`).
 * exec (`exec`, `D6`): `execv`/`execl` fail inside the debuggee (exit 5, the
   `perror` path; see the scenario's NOTE for errno).
 * Watchpoints (`watchpoint`, `D8`): consecutive stops report the same ip and
@@ -842,5 +881,8 @@ fixed since by the demon and unwinder work and are not repeated here):
   rects use the primary screen's scale; only cosmetic on mixed-DPI setups.
 * Executables with only a debug map (`N_OSO` stabs) and no dSYM are not
   linked by the converter itself; it runs `dsymutil` when available.
+* Shared-cache images: only the exported symbols (the in-memory `LC_SYMTAB`)
+  name frames and resolve breakpoints; the cache's local symbols (its
+  `.symbols` file) are not read.
 * Hardware execute breakpoints are implemented as software `brk` traps;
   watchpoints use `DBGWCR`/`DBGWVR` (up to 16, 8-byte aligned ranges).
