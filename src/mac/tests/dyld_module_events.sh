@@ -51,7 +51,9 @@ set -u
 ROOT="$(cd "$(dirname ${(%):-%x})/../../.." && pwd)"
 RD=${RADDBG:-"$ROOT/build/raddbg"}
 P=${IPC_PORT:-7609}
-S=${HARNESS_DIR:-$(mktemp -d /tmp/raddbg_dyld.XXXXXX)}
+# a scratch directory of our own is removed at exit (with the instance's HOME, so the symbol-only
+# images it wrote go too); a HARNESS_DIR given by the caller is theirs
+if [[ -n ${HARNESS_DIR:-} ]]; then S=$HARNESS_DIR; else S=$(mktemp -d /tmp/raddbg_dyld.XXXXXX); trap 'rm -rf "$S"' EXIT; fi
 mkdir -p $S/src $S/home
 ipc() { $RD --ipc_port:$P --ipc "$@" 2>&1; }
 field() { echo "$1" | grep -m1 " $2:" | awk '{print $2}'; }

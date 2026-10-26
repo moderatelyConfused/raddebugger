@@ -15,7 +15,9 @@ set -u
 ROOT="$(cd "$(dirname ${(%):-%x})/../../.." && pwd)"
 RD=${RADDBG:-"$ROOT/build/raddbg"}
 P=${IPC_PORT:-7611}
-S=${HARNESS_DIR:-$(mktemp -d /tmp/raddbg_sweep.XXXXXX)}
+# a scratch directory of our own is removed at exit (with the instance's HOME); a HARNESS_DIR given
+# by the caller is theirs
+if [[ -n ${HARNESS_DIR:-} ]]; then S=$HARNESS_DIR; else S=$(mktemp -d /tmp/raddbg_sweep.XXXXXX); trap 'rm -rf "$S"' EXIT; fi
 IMAGES=$S/home/Library/Caches/raddbg/images
 mkdir -p $S/src $IMAGES
 ipc() { $RD --ipc_port:$P --ipc "$@" 2>&1; }
