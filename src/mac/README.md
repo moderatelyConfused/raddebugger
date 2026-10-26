@@ -199,7 +199,21 @@ directory when nothing has been stored yet.
 `task_for_pid` requires the `com.apple.security.cs.debugger` entitlement
 (`mac/raddbg.entitlements`); `build.sh` applies it with an ad-hoc signature.
 
-## Status and open issues (2026-10-25, evening)
+## Status and open issues (2026-10-25, night)
+
+Two rounds on an Apple Silicon Mac: first the "erratic stepping" of the Zig
+0.16 `generator` (a fiber-based coroutine demo), whose causes and fixes are
+below; then, since the first real target hit this many issues, a sweep over
+everything that routes through platform code, done as six parallel efforts
+with their own sections and scripted checks: the converter conformance corpus
+(70 Mach-O binaries, "Converter conformance corpus"), the torture driver
+ported to macOS ("Tests"), the scripted feature-flow suite (42 scenarios,
+"Scripted feature-flow suite"), IPC / dyld notification / `--pid` routing
+(this section), the arm64 unwinder ("Unwinding"), and the demon's process
+control (detach, fork, exec, signals, frozen threads, thread exits; "Demon"
+and below). Everything runs from the command line against private debugger
+instances on ports of their own; the user's default port 7423 is never used.
+
 
 Confirmed on an Apple Silicon Mac with a Zig 0.16 target (`generator`, a
 fiber-based coroutine demo): building, launching, Retina scaling,
@@ -344,6 +358,29 @@ parts of the execution; calls to `next()` after the first jump straight to
   (`h.sh`: launch, breakpoint, run, step, printing every stop with its inline
   frames) runs a breakpoint-and-steps scenario in about a second.
 
+* Frame selection after a stop is done by the stop handler itself (base
+  registers set from the event's address, one FindThread) rather than through
+  SelectThread + SelectUnwind, which needed the call stack within 10 ms and
+  otherwise kept the innermost frame at random; a finished step is shown in
+  the frame it stepped while the thread is still inside it, identified by the
+  chain of inline-site scopes at the step's start and end (common prefix),
+  not by a depth number, so leaving an inlined frame into a sibling inlined
+  call shows the call site (`rd_stop_inline_depth_from_event`). The line
+  lookup by file and line also matches the file, same-line ranges strictly
+  containing the stepped range (an enclosing call site of the same line
+  number: a generic instantiated within itself) are ignored, and the stepped
+  line's own range is always in the trap net (at an inlined call whose first
+  instructions carry the call line, the shallowest-table lookup returned only
+  the enclosing range, and a step over at the inlined frame ran to the next
+  breakpoint). The call stack's inline frame labels skip lexical blocks
+  between sites, like the engine's own walks.
+* Named POSIX semaphores and shared memory objects a debugger process creates
+  (two semaphores and one object per instance, named by pid, for the debug
+  info conversion) are unlinked at exit; they persisted until reboot and ran
+  into `kern.posix.sem.max` after a few thousand launches, after which debug
+  info never loaded. Secondary threads get an 8 MB stack (macOS default 512
+  KiB).
+
 Demon review fixes (2026-10-25, night; `src/mac/tests/demon/run_all.sh`, one
 script per item, each building a small C debuggee and driving a private
 instance through `tests/ipc_harness.sh`): detach never completed (the process
@@ -368,36 +405,37 @@ continuing stops on the fault again instead of a dead process),
 information: see Exec above), `watchpoint.sh` (hit count 1 in a saved copy
 of the project).
 
-Open:
+### Open
+
+Consolidated from the sections below (each records its evidence); roughly by
+impact:
 
 * **Exception stops are never enabled on macOS by the UI.** `raddbg.mdesk`'s
   project schema has `win32_*` and `linux_*` "Break on ..." settings but no
   `mac_*` ones, so `rd_setting_b32_from_name("mac_sigsegv")` is 0 and the
-  engine filters (passes) every Mach exception and signal at first chance.
-  Before the demon fixes above an unhandled crash still stopped, by accident,
-  at the re-reported escalation; now it terminates the debuggee, as the
-  settings say. A setting written by hand into the project or user file works
-  (`mac_exc_bad_access: 1`, `mac_sigsegv: 1`, ... names from
-  `MAC_ExceptionCodeTable` prefixed with `mac_`; `tests/demon/frozen_thread.sh`
-  relies on it); the fix is a `mac_*` block in `raddbg.mdesk` mirroring the
-  Linux one, with the table's `break_default` values.
-* Exec of a platform binary (`/bin/echo`, ...) kills the traced process with
-  `SIGTRAP` (the OS drops the exception ports; lldb behaves the same).
-* IPC: commands with entity query slots (`select_thread`, `freeze_thread`,
-  `detach` of a process other than the selected one) cannot name their entity
-  (`--thread:`/`--process:` options are ignored: `rd_regs_fill_slot_from_string`
-  has no case for them). `save_project` without `--file_path:<path>:<line>`
-  takes the focused tab's file path, i.e. the source file, as its destination,
-  and a second call while the overwrite confirmation popup is up goes through
-  it (`tests/demon/watchpoint.sh` saves to a new path). A FilePath register is
-  only filled from a `path:line` string.
-* `&global` evaluates to 0 for clang `-g` binaries (`&main` works), so a data
-  breakpoint on a global cannot be expressed directly; the global's address is
-  missing from the converted RDI.
-* A demon-side gap left: forked children are only continued over traps of the
-  run in progress and the dyld trap; a child which hits a trap written by an
-  earlier run (breakpoint since removed) takes `SIGTRAP`.
-
+  engine passes every Mach exception and signal at first chance: `abort()`
+  and `raise(SIGINT)` neither stop nor get delivered (the process continues
+  with `ignore_previous_exception`), a NULL store or `__builtin_trap` stops
+  only on the escalated second chance, and an unhandled crash now terminates
+  the debuggee, as the settings say (before the demon fixes it stopped by
+  accident at the re-reported escalation). Settings written by hand into the
+  project or user file work (`mac_exc_bad_access: 1`, `mac_sigsegv: 1`, ...:
+  `mac_` + the `MAC_ExceptionCodeTable` name; `tests/demon/frozen_thread.sh`
+  relies on it). Fix: a `mac_*` block in `raddbg.mdesk` mirroring the Linux
+  one, with the table's `break_default` values.
+* Function-name breakpoints added while a process is live are resolved once,
+  on the control thread, with `di_match_from_string(..., endt_us = 0)`: when
+  the asynchronous name search has not seen the name yet, the breakpoint
+  never gets a trap (`flows: breakpoints_O0/func_bp_cold_symbol`; evaluating
+  the name first works around it). Fix: a deadline in
+  `d_ctrl_thread__append_resolved_*_user_bp_traps`. Breakpoint hits on
+  several threads in one run are reported together by the demon, the engine
+  stops for the first and the resume answers the others with the traps
+  already removed, so their hits are lost (`threads_breakpoints`).
+* Modules without DWARF (the shared cache's libSystem etc.) get no RDI
+  procedures: `rdi_from_macho.c` converts `__DWARF` only, not the Mach-O
+  symbol table, so a function breakpoint on `write` cannot resolve and their
+  frames show as `???` (`tests/dyld_module_events.sh`, flows `D3`).
 * **Step-into and code without line info.** Every Zig `threadlocal` access
   calls dyld's TLV getter through an indirect `blr`, and a step into on such
   a line lands there (the trap net cannot know an indirect call's destination
@@ -408,27 +446,62 @@ Open:
   step, end stepping only if the new pc has line info, else trap at the
   return address (`lr`, or `[sp]` on x64) and keep stepping" (the module ->
   `d_dbgi_key_from_module` -> `di_rdi_from_key` -> `rdi_line_info_idx_from_voff`
-  lookup is available on that thread). A UI-level "step out, then resume the
-  step into" was tried and removed when the unwinder still skipped the
-  caller of a frameless function (fixed since, see "Unwinding": the step out
-  from `_tlv_get_addr` returns to the caller now).
+  lookup is available on that thread). Related: a step into on a line calling
+  through a `__stubs` entry (`strlen`, a weak template instantiation) lands on
+  the stub, and a step over the stub's indirect jump runs to the process'
+  end; a step over a tail call (`b target` at -O2) ends in the callee's first
+  line (`stepping_O0`, `stepping_O2`). Step out of a signal handler, and a
+  step over `longjmp`, run to the process' end.
+* `step_out` from an inlined function steps out of the concrete function; it
+  could use the selected inline site's ranges (`step_out_scope` already works
+  from scope ranges). A step over at inline depth 1 from a line into which
+  LLVM scheduled a helper's instruction stops at that instruction (flows
+  `F1`/`F2`); a breakpoint on an inlined line stops first in whichever
+  instance comes first in the code (`F4b`).
 * Frame names of outer frames come from the raw return address (the UI and
   `d_call_stack_from_unwind` look symbols and scopes up at pc, not pc-1), so
   a frame whose call does not return (`fn a() void { @panic("x"); }`) is
   named after the function which follows it in the binary; the unwind itself
-  is right (its callers are found).
-* Call stacks are artifacts computed asynchronously: the first `--ipc eval`
-  of another thread's frame (`query:threads[1].call_stack[0].address`) can
-  come back empty ("Could not find a member named `address`") while the
-  stack is being built; the same query a moment later answers.
-* `step_out` from an inlined function steps out of the concrete function; it
-  could use the selected inline site's ranges (`step_out_scope` already works
-  from scope ranges).
-* Optimized code attributes scheduled instructions to the function's
-  declaration line (`start.zig:641` fragments between other lines); stepping
-  visits them, as other debuggers do.
+  is right (`state`'s `call_stack` already looks callers up at pc-1).
+* Evaluation: in a caller's frame `rec->name` reads `""` while `(*rec).name`
+  is right (the `->` path reads the pointer from the wrong frame); locals held
+  in registers at -O2 read 0 or "could not be found"; `&global` evaluates to 0
+  for clang `-g` binaries (the address is missing from the RDI, so a data
+  breakpoint on a global needs a cast); after a watchpoint stop the registers
+  read stale (the ip repeats, values lag the store); `eval` of a global right
+  after a stop can answer "could not be found" for a few hundred ms (the name
+  search is asynchronous); the first `eval` of another thread's call stack
+  can come back empty while it is being built; a stop in a thread created
+  after another exited evaluates in the main thread's context (`D7`).
+* IPC: `save_project` without `--file_path:<path>:<line>` takes the focused
+  tab's source file as its destination, and a second call while the overwrite
+  confirmation is up goes through it; a FilePath register is only filled from
+  a `path:line` string; option values cannot contain spaces; outputs pushed by
+  a chained command are often lost (double-buffered command queue), so check
+  effects via `state` or the logs.
+* Demon: exec of a platform binary (`/bin/echo`) kills the traced process with
+  `SIGTRAP` (the OS drops the exception ports; lldb behaves the same); a
+  forked child which hits a trap written by an earlier run (a breakpoint since
+  removed) takes `SIGTRAP`; the run's single `ignore_previous_exception` flag
+  applies to every thread it resumes (a passed signal of a thread resumed by a
+  later run is dropped).
+* Stepping over a coroutine context switch in a coroutine driven by *another*
+  coroutine of the same type (`range2d`'s `x_rng` and `y_rng`) can end in the
+  parent after the first yield, since the sibling executes the same code
+  while the parent runs. Optimized code attributes scheduled instructions to
+  the function's declaration line (`start.zig:641` fragments between other
+  lines); stepping visits them, as other debuggers do. After a step out onto
+  the middle of a line, the line's remaining rows count as a new line (`U5`).
+* Converter: Swift functions directly under `DW_TAG_module` get no function
+  type (their inline sites neither); C++ member functions are named without
+  their class (`area`, not `Rect::area`); code the line program attributes to
+  an inlinee's line outside the site's ranges keeps that line in the enclosing
+  table.
+* `dylib_host_O0` exits 0 without its final `printf` under the debugger
+  (natively "host done 8", exit 8) after the second `dlclose`. `eval signo` at
+  the first line of a signal handler is flaky (0 or 30).
 * A headless driver (the demon from a console program, the way `torture`
-  does) would still be useful; the `--ipc` loop above is the next best thing.
+  does) would still be useful; the `--ipc` loop is the next best thing.
 
 ## Converter conformance corpus (2026-10-25, night)
 
@@ -659,8 +732,9 @@ Policy, not bugs (the suite expects these):
   image's thread-locals (dyld allocates the block lazily, so
   `dmn_thread_get_module_tls_vaddr` finds none before).
 
-Open, recorded with evidence by the suite (owners: the demon, unwinder and
-stepping agents):
+Open, recorded with evidence by the suite (detach, fork, exec into a binary
+of our own, watchpoint attribution and other threads' call stacks have been
+fixed since by the demon and unwinder work and are not repeated here):
 
 * Expression (function-name) breakpoints added while a process is live are
   resolved once, on the control thread, through `e_eval_from_string` ->
@@ -686,8 +760,6 @@ stepping agents):
   `threads_breakpoints` ctrl log), the engine stops for the first, and the
   resume replies to all pending exceptions with the traps already removed, so
   the other hits are lost (1 of 4 worker hits in the first launch).
-* Call stacks of threads other than the stopping one are empty (`U3` sleeping
-  thread, the spinner in `threads_freeze`, `D5`).
 * Fixed by the merged dyld-notification work (recorded before the merge):
   only the executable and dyld were listed, dylib breakpoints never resolved
   and the TLS getter stopped in code without a module; after the merge
@@ -702,22 +774,12 @@ stepping agents):
   not even after a warm-up evaluation (`eval write` resolves nothing: the
   system libraries' RDIs come from their symbol tables and `write` is not
   found by name).
-* Detach (`D1`, `attach_detach`): `dmn_ctrl_detach` releases the process
-  without reporting it, while `d_ctrl_thread__detach` waits for a
-  `DMN_EventKind_ExitProcess` of that process (win32 queues detached processes
-  and synthesizes their exit/unload events in the next run); the process stays
-  listed and a launched debuggee stays stopped (`D1`).
-* fork (`fork`/D2): the child inherits the exception ports and the `brk`
-  written at `child_work`; the demon answers the unknown task's exception with
-  success, the child re-executes the trap forever and the parent's `waitpid`
-  never returns.
 * exec (`exec`, `D6`): `execv`/`execl` fail inside the debuggee (exit 5, the
   `perror` path; see the scenario's NOTE for errno).
 * Watchpoints (`watchpoint`, `D8`): consecutive stops report the same ip and
   lag the write (stop 2 shows the value before the store, stop 3 after it, in
-  the same iteration), and the demon's watchpoint event carries no `user_data`
-  (trap id), so the stop is not attributed to the user breakpoint: `bp_id` is
-  0, the hit count stays 0 and a condition on the data breakpoint is ignored.
+  the same iteration). (The missing attribution to the user breakpoint,
+  `user_data`, is fixed by the demon work; `tests/demon/watchpoint.sh`.)
 * Step out of a signal handler runs to the process' end
   (`signal_handler/handler_step_out`); a step over `longjmp` as well
   (`longjmp`; gdb/lldb stop after `setjmp`).
@@ -739,9 +801,6 @@ stepping agents):
 * A stop in a new thread created after another thread exited evaluates in the
   main thread's context (`D7`: `idx` reads 0, the call stack lacks
   `worker_body`), although the thread list is right.
-* A stop inside a Zig coroutine (`zig_generator/fiber_stack`) shows the
-  previous stop's call stack (main's frames): the unwind on the fiber stack
-  produces nothing and the stale artifact stays.
 * `eval` of locals held in registers at -O2 (`F4a` `r`, `F6` `node`) gives 0
   or "could not be found".
 * In a caller's frame (`select_unwind --unwind_count:1`), `rec->name` reads
@@ -757,8 +816,6 @@ stepping agents):
 * Flaky: `eval signo` at the first line of a signal handler reads 0 in some
   runs and 30 in others (`signal_handler/handler_signo`); the registers or
   frame base used right after the stop differ between runs.
-* `fork`: a forked child was observed at >50 % CPU after the parent's stop
-  (`D2_no_spinning_child` lists its pid): the inherited `brk` re-executes.
 * `F7`: with a disassembly tab focused, a step into at the first instruction
   of an inlined call only selects the next inline frame (pc unchanged).
 * `F1`/`F2`: a step over at inline depth 1 from `next`'s last line stops at the
