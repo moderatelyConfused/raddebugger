@@ -3,14 +3,16 @@
 # trap id in the event's user_data, which is how the engine identifies the breakpoint that was hit
 # (the UI then counts the hit: `hit_count` in the autosaved project file).
 # The breakpoint's address expression is a local pointer, evaluated when a run starts: the first run
-# (from the entry point) stops at a line where it is set, the second run arms the watchpoint.
+# (from the entry point) stops at a line where it is set, the second run arms the watchpoint. The
+# pointer is cast (`(uint64)p`) so that the expression is a value on every engine path (a bare `p`
+# can resolve to the variable's own address, i.e. its stack slot).
 # (IPC output suppresses addresses, so the pointer's value cannot be checked through `eval`.)
 source "$(dirname ${(%):-%x})/common.sh"
 build_c watch_global
 write_project watch_global $S/watch_global "" <<'EOF'
 breakpoint:
 {
-  address_location: "p"
+  address_location: "(uint64)p"
   address_range_size: 4
   break_on_write: 1
   enabled: 1
@@ -23,7 +25,9 @@ st=$(ipc state)
 check "stopped where the pointer is set" "echo '$st' | grep -q 'line_num: *$(line_of watch_global '// bp_setup')\$'"
 go
 st=$(ipc state)
-check "stopped at the write (line $(line_of watch_global '// write'))" "echo '$st' | grep -q 'line_num: *$(line_of watch_global '// write')\$'"
+# rjf: the demon steps past the access before reporting, so the thread may already be on the next line
+wl=$(line_of watch_global '// write')
+check "stopped at the write (line $wl) or right after it (reported: $(echo "$st" | grep -m1 'line_num:' | awk '{print $2}'))" "echo '$st' | grep -q -E 'line_num: *($wl|$((wl+1)))\$'"
 check "the stop is a breakpoint hit at the written address" "echo '$st' | grep -q 'hit a breakpoint (Address: 0x'"
 # rjf: save the project (to a new path: saving over an existing file asks for a confirmation the
 # script cannot give) to read the hit count. NOTE: the path option must be given, with a `:line`
