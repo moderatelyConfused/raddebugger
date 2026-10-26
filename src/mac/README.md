@@ -111,7 +111,8 @@ bundled with Zig: `zig cc -target aarch64-macos -fsyntax-only ...`).
   slices are not the cache's copy) and no DWARF. Their symbol tables are
   reachable through the task port: `LC_SYMTAB`'s cache-relative offsets map
   into memory through the `__LINKEDIT` segment, as the demon already does to
-  find dyld's notifier. For an image whose path is not a file with its UUID,
+  find dyld's notifier. For an image whose path is not a file with its UUID
+  (`MH_DYLIB_IN_CACHE` in the header skips that probe),
   `mac_dmn_debug_info_path_from_image` writes a symbol-only Mach-O (header and
   load commands from memory; the defined symbols, their names and
   `LC_FUNCTION_STARTS` appended; segments without file data, like a dSYM) to
@@ -120,14 +121,36 @@ bundled with Zig: `zig cc -target aarch64-macos -fsyntax-only ...`).
   (`radbin --rdi`): without `__DWARF`, `rdi_from_macho.c` turns `LC_SYMTAB`'s
   defined code symbols into procedures (`_write` -> `write`, link name kept),
   each ending at the next symbol, the next function start or its section's
-  end. Cost: a C program's 44 startup images take about 2 MB, written during
-  the first stop of the first run; later runs reuse them. The cache files under
+  end. The cache files under
   `/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/` hold the same
-  data (and the local symbols), but using them means parsing the cache header,
-  image and mapping tables across the sub-cache files of exactly the cache the
-  debuggee maps, a layout that changes between releases; memory reuses the
-  parsing the demon does for every image anyway. Extracting dylibs with
+  data, but using them means parsing the cache header, image and mapping
+  tables across the sub-cache files of exactly the cache the debuggee maps, a
+  layout that changes between releases; memory reuses the parsing the demon
+  does for every image anyway. Extracting dylibs with
   `dyld_shared_cache_extract_dylibs` was ruled out as a runtime dependency.
+* Local symbols of shared-cache images: the cache this macOS (26.6) ships is a
+  development-type cache (`dyld_cache_header.cacheType` 0; its header has
+  `localSymbolsOffset` 0 and a zero `symbolFileUUID`, and no `.symbols` file
+  exists on disk), and every image's `LC_SYMTAB` keeps its locals:
+  libsystem_c's 2268 symbols are 1299 `N_EXT`, 200 `N_PEXT` and 769 plain
+  locals, exactly the set lldb lists for the image (its 284 extra rows are
+  synthesized stub names), and `__sflush`, `__sfvwrite` are even exported. So
+  `__sflush`, `__vfprintf`, ... name frames and take breakpoints from the
+  symbol-only file alone; `tests/dyld_module_events.sh` breaks on `__vfprintf`,
+  which is private to the image. (The earlier note that the locals were missing
+  mistook the 2268 for exports.)
+* Cost and cache of the symbol-only files: a C program's 45 startup images
+  take 2 MB of symbol-only files plus 6 MB of RDIs the engine writes next to
+  them (8 MB, 180 KB per image; the author's mixed cache averages 430 KB per
+  image, frameworks like WebCore reach 70 MB), written during the first stop of
+  the first run; later runs reuse them. Every macOS update changes every UUID,
+  so the cache only grew (1018 directories, 1.4 GB, on the author's machine):
+  once per debugger session, when the first symbol-only file is needed, the
+  demon removes `images/<UUID>` directories unused for 30 days (a reuse touches
+  the directory) and then the oldest beyond 1 GB
+  (`mac_dmn_delete_stale_subdirectories`; one listing of `images/` and of each
+  directory, a few ms; `tests/images_cache_sweep.sh`). The `dsyms/` cache
+  radbin fills (187 bundles, 126 MB here) and `rdis/` are not swept.
 * Exception codes reported to the engine: BSD signal numbers, or
   `0x10000 + EXC_*` for Mach exception types (see `mac/mac.mdesk`); soft
   `SIGSEGV` / `SIGBUS` and `EXC_BAD_ACCESS` report the fault address.
@@ -501,14 +524,11 @@ without the stop, since the demon learns a non-child's exit status only from
 Consolidated from the sections below (each records its evidence); roughly by
 impact:
 
-* Shared-cache images are named from their exported symbols only: the
-  per-image `LC_SYMTAB` in the cache keeps the `N_EXT` symbols (libsystem_c
-  has 2268, `__swrite` and `_printf` among them); the locals (`__sflush`,
-  `__sfvwrite`, ...) live in the cache's `.symbols` file, which is not mapped
-  into the debuggee, so frames inside them stay `???`. Reading that file
-  (`dyld_cache_local_symbols_info`, keyed by the cache UUID) is the
-  follow-up. `eval` of a symbol-table procedure prints an empty value (it has
-  no type).
+* Shared-cache images: function starts with no symbol at all (19 in
+  libsystem_c; lldb shows them as `___lldb_unnamed_symbol<N>`) end the
+  preceding procedure and are themselves unnamed, so a stop inside one is
+  `???`; `eval` of a symbol-table procedure prints an empty value (it has no
+  type). The locals themselves are present (Demon, "Local symbols").
 * Fixed (see "Unwinding", function starts): stopped at the entry of a frameless
   syscall stub (`write`), at a function's first instruction, or in a `__stubs`
   entry, the call stack skipped the caller; the engine now hands the unwinder
@@ -1083,8 +1103,15 @@ fixed since by the demon and unwinder work and are not repeated here):
   rects use the primary screen's scale; only cosmetic on mixed-DPI setups.
 * Executables with only a debug map (`N_OSO` stabs) and no dSYM are not
   linked by the converter itself; it runs `dsymutil` when available.
-* Shared-cache images: only the exported symbols (the in-memory `LC_SYMTAB`)
-  name frames and resolve breakpoints; the cache's local symbols (its
-  `.symbols` file) are not read.
+* Shared-cache images: on this macOS every image's `LC_SYMTAB` keeps its local
+  symbols, so the symbol-only files name them. A production cache (macOS 12-15
+  shipped `dyld_shared_cache_<arch>.symbols` next to the cache) strips the
+  locals into that file's `dyld_cache_local_symbols_info` chunk and would need
+  a reader (locate the file by the running cache's `symbolFileUUID`, match the
+  image's entry by its offset from the cache base, append the nlists to the
+  symbol-only file); not written, since no such cache was available to test
+  against. Code with no symbol at all stays unnamed either way. The images
+  cache is swept (30 days / 1 GB); radbin's `dsyms/` and the engine's `rdis/`
+  caches are not.
 * Hardware execute breakpoints are implemented as software `brk` traps;
   watchpoints use `DBGWCR`/`DBGWVR` (up to 16, 8-byte aligned ranges).

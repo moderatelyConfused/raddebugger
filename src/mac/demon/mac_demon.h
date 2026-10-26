@@ -337,6 +337,7 @@ struct MAC_DMN_ImageInfo
   B32 valid;
   U32 cputype;
   U32 filetype;
+  U32 flags;                    // mach_header.flags (MH_DYLIB_IN_CACHE: a shared-cache image, never a file of its own)
   U64 header_vaddr;
   U64 slide;                    // header_vaddr - __TEXT vmaddr
   U64 vsize;                    // extent of all segments
@@ -395,6 +396,9 @@ struct MAC_DMN_State
   U64 process_count;
   U64 process_pending_creation;
   
+  // rjf: symbol-only image files: their cache is swept once per session (see mac_dmn_debug_info_path_from_image)
+  B32 images_cache_swept;
+
   // rjf: traps of the run in progress (to restore inherited trap instructions in forked children)
   DMN_TrapChunkList *run_traps;
   U8 *run_trap_swap_bytes;
