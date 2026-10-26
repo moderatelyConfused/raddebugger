@@ -508,6 +508,97 @@ RD_VocabTable:
         linux_sigpwr: bool,
       @display_name("Break on Linux SIGSYS") @default(1) @description("Bad system call (Code: 31)")
         linux_sigsys: bool,
+      
+      //- rjf: mac exception settings (one per MAC_ExceptionCodeTable entry; the engine reads
+      // these as `mac_` + the lower-case name, see raddbg_core.c's exception_code_filters)
+      @display_name("Break on Mac SIGHUP") @default(1) @description("Hangup detected on controlling terminal or death of controlling process (Code: 1)")
+        mac_sighup: bool,
+      @display_name("Break on Mac SIGINT") @default(1) @description("Interrupt from keyboard (Code: 2)")
+        mac_sigint: bool,
+      @display_name("Break on Mac SIGQUIT") @default(1) @description("Quit from keyboard (Code: 3)")
+        mac_sigquit: bool,
+      @display_name("Break on Mac SIGILL") @default(1) @description("Illegal instruction (Code: 4)")
+        mac_sigill: bool,
+      @display_name("Break on Mac SIGTRAP") @default(1) @description("Trace/breakpoint trap (Code: 5)")
+        mac_sigtrap: bool,
+      @display_name("Break on Mac SIGABRT") @default(1) @description("Abort signal (Code: 6)")
+        mac_sigabrt: bool,
+      @display_name("Break on Mac SIGEMT") @default(1) @description("Emulator trap (Code: 7)")
+        mac_sigemt: bool,
+      @display_name("Break on Mac SIGFPE") @default(1) @description("Erroneous arithmetic operation (Code: 8)")
+        mac_sigfpe: bool,
+      @display_name("Break on Mac SIGKILL") @default(1) @description("Kill signal (Code: 9)")
+        mac_sigkill: bool,
+      @display_name("Break on Mac SIGBUS") @default(1) @description("Bus error (bad address) (Code: 10)")
+        mac_sigbus: bool,
+      @display_name("Break on Mac SIGSEGV") @default(1) @description("Invalid memory reference (Code: 11)")
+        mac_sigsegv: bool,
+      @display_name("Break on Mac SIGSYS") @default(1) @description("Bad system call (Code: 12)")
+        mac_sigsys: bool,
+      @display_name("Break on Mac SIGPIPE") @default(1) @description("Broken pipe; write to pipe with no readers (Code: 13)")
+        mac_sigpipe: bool,
+      @display_name("Break on Mac SIGALRM") @default(1) @description("Timer signal (Code: 14)")
+        mac_sigalrm: bool,
+      @display_name("Break on Mac SIGTERM") @default(1) @description("Termination signal (Code: 15)")
+        mac_sigterm: bool,
+      @display_name("Break on Mac SIGURG") @default(0) @description("Urgent condition on socket (Code: 16)")
+        mac_sigurg: bool,
+      @display_name("Break on Mac SIGSTOP") @default(1) @description("Stop process (Code: 17)")
+        mac_sigstop: bool,
+      @display_name("Break on Mac SIGTSTP") @default(1) @description("Stop typed at terminal (Code: 18)")
+        mac_sigtstp: bool,
+      @display_name("Break on Mac SIGCONT") @default(0) @description("Continue if stopped (Code: 19)")
+        mac_sigcont: bool,
+      @display_name("Break on Mac SIGCHLD") @default(0) @description("Child stopped, terminated, or continued (Code: 20)")
+        mac_sigchld: bool,
+      @display_name("Break on Mac SIGTTIN") @default(0) @description("Terminal input for background process (Code: 21)")
+        mac_sigttin: bool,
+      @display_name("Break on Mac SIGTTOU") @default(0) @description("Terminal output for background process (Code: 22)")
+        mac_sigttou: bool,
+      @display_name("Break on Mac SIGIO") @default(0) @description("I/O now possible (Code: 23)")
+        mac_sigio: bool,
+      @display_name("Break on Mac SIGXCPU") @default(1) @description("CPU time limit exceeded (Code: 24)")
+        mac_sigxcpu: bool,
+      @display_name("Break on Mac SIGXFSZ") @default(1) @description("File size limit exceeded (Code: 25)")
+        mac_sigxfsz: bool,
+      @display_name("Break on Mac SIGVTALRM") @default(0) @description("Virtual alarm clock (Code: 26)")
+        mac_sigvtalrm: bool,
+      @display_name("Break on Mac SIGPROF") @default(0) @description("Profiling timer expired (Code: 27)")
+        mac_sigprof: bool,
+      @display_name("Break on Mac SIGWINCH") @default(0) @description("Window resize signal (Code: 28)")
+        mac_sigwinch: bool,
+      @display_name("Break on Mac SIGINFO") @default(0) @description("Information request (Code: 29)")
+        mac_siginfo: bool,
+      @display_name("Break on Mac SIGUSR1") @default(1) @description("User-defined signal 1 (Code: 30)")
+        mac_sigusr1: bool,
+      @display_name("Break on Mac SIGUSR2") @default(1) @description("User-defined signal 2 (Code: 31)")
+        mac_sigusr2: bool,
+      @display_name("Break on Mac EXC_BAD_ACCESS") @default(1) @description("Bad memory access (Code: 0x10001)")
+        mac_exc_bad_access: bool,
+      @display_name("Break on Mac EXC_BAD_INSTRUCTION") @default(1) @description("Illegal or undefined instruction (Code: 0x10002)")
+        mac_exc_bad_instruction: bool,
+      @display_name("Break on Mac EXC_ARITHMETIC") @default(1) @description("Arithmetic exception (Code: 0x10003)")
+        mac_exc_arithmetic: bool,
+      @display_name("Break on Mac EXC_EMULATION") @default(1) @description("Emulation instruction (Code: 0x10004)")
+        mac_exc_emulation: bool,
+      @display_name("Break on Mac EXC_SOFTWARE") @default(1) @description("Software exception (Code: 0x10005)")
+        mac_exc_software: bool,
+      @display_name("Break on Mac EXC_BREAKPOINT") @default(1) @description("Breakpoint or trace trap (Code: 0x10006)")
+        mac_exc_breakpoint: bool,
+      @display_name("Break on Mac EXC_SYSCALL") @default(0) @description("Unix system call (Code: 0x10007)")
+        mac_exc_syscall: bool,
+      @display_name("Break on Mac EXC_MACH_SYSCALL") @default(0) @description("Mach system call (Code: 0x10008)")
+        mac_exc_mach_syscall: bool,
+      @display_name("Break on Mac EXC_RPC_ALERT") @default(0) @description("RPC alert (Code: 0x10009)")
+        mac_exc_rpc_alert: bool,
+      @display_name("Break on Mac EXC_CRASH") @default(1) @description("Abnormal process exit (Code: 0x1000a)")
+        mac_exc_crash: bool,
+      @display_name("Break on Mac EXC_RESOURCE") @default(0) @description("Resource limit hit (Code: 0x1000b)")
+        mac_exc_resource: bool,
+      @display_name("Break on Mac EXC_GUARD") @default(1) @description("Guarded resource violation (Code: 0x1000c)")
+        mac_exc_guard: bool,
+      @display_name("Break on Mac EXC_CORPSE_NOTIFY") @default(0) @description("Corpse notification (Code: 0x1000d)")
+        mac_exc_corpse_notify: bool,
     }
     ```
   }

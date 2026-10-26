@@ -429,7 +429,9 @@ scenario_stepping_cpp() {
 
 scenarios+=(signal_handler)
 scenario_signal_handler() {
-  begin signal_handler $B/signals_O0 handler || return
+  # SIGUSR1 breaks by default (as linux_sigusr1 does) and a continue after that stop would drop the
+  # signal; this flow is about the handler, so its project turns the SIGUSR1 stop off
+  begin signal_handler $B/signals_O0 handler $'mac_sigusr1: 0' || return
   bp_tag $D/signals.c handler_body >/dev/null
   local st=$(run_stop); check_stop handler_bp "$st" $D/signals.c handler_body
   check handler_sym "on_sigusr1" "$(stop_symbol "$st")"
@@ -461,26 +463,54 @@ scenario_longjmp() {
 
 scenarios+=(exceptions)
 scenario_exceptions() {
-  local mode code tag
-  for spec in "segv:0xb:segv_line" "abort:0x6:abort_line" "trap:0x5:trap_line" "sigint:0x2:sigint_line"; do
-    mode=${spec%%:*}; code=${${spec#*:}%%:*}; tag=${spec##*:}
+  # every MAC_ExceptionCodeTable entry has a `mac_*` "Break on ..." project setting (raddbg.mdesk) with
+  # the table's default, so these stop at their first chance: a hardware fault as its Mach exception
+  # (EXC_BAD_ACCESS 0x10001, EXC_BREAKPOINT 0x10006), a soft signal as its number (SIGABRT 6, SIGINT 2).
+  # abort() and raise() stop inside libsystem_kernel's __pthread_kill (the shared cache has no RDI
+  # procedures, so that frame has no symbol or line) with main's line further down the stack.
+  # A continue after a reported exception stop runs with ignore_previous_exception, which the demon
+  # answers with KERN_SUCCESS (a hardware exception re-executes its instruction and faults again:
+  # another stop at the same pc) or PT_THUPDATE signal 0 (a soft signal is dropped), as upstream's
+  # Linux demon does with PTRACE_CONT signal 0 and Win32's with DBG_CONTINUE; the exception reaches
+  # the debuggee when its setting is off (D4).
+  local mode code tag expl rest
+  for spec in "segv:0x10001:segv_line:Access violation writing to address 0x0" \
+              "abort:0x6:abort_line:SIGABRT" \
+              "trap:0x10006:trap_line:EXC_BREAKPOINT" \
+              "sigint:0x2:sigint_line:SIGINT"; do
+    mode=${spec%%:*}; rest=${spec#*:}; code=${rest%%:*}; rest=${rest#*:}; tag=${rest%%:*}; expl=${rest#*:}
     begin exception_$mode $B/signals_O0 $mode || continue
     local st=$(run_stop)
-    check_match exception_code "^($code|0x10001|0x10002|0x10006)$" "$(exception_code "$st")"
+    check exception_code $code "$(exception_code "$st")"
     check process_still_stopped 1 "$(process_count "$st")"
-    check_match explanation 'exception' "$(stop_explanation "$st")"
-    check_stop exception_line "$st" $D/signals.c $tag
-    check exception_stack_top "main" "$(concrete_frames "$st" | head -1)"
-    note "$mode: code $(exception_code "$st"), explanation: $(stop_explanation "$st")"
-    if [[ "$(process_count "$st")" == "0" ]]; then
-      note "$mode: no stop; the process ended with exit code $(field "$st" last_exit_code) (the signal was neither reported nor delivered)"
-    elif [[ $mode == sigint ]]; then
-      ipc run >/dev/null; st=$(wait_exit); check sigint_exit_code 2 "$(field "$st" last_exit_code)"
-    elif [[ $mode == segv ]]; then
-      # continuing re-raises the fault: a second stop (the signal) or the process' death by signal 11
-      ipc run >/dev/null; st=$(wait_exit_or_stop $(field "$st" stop_count))
-      note "segv after continue: processes=$(process_count "$st") exit_code=$(field "$st" last_exit_code) code=$(exception_code "$st") expl=$(stop_explanation "$st")"
+    check_match explanation "hit an exception.*$expl" "$(stop_explanation "$st")"
+    if [[ $mode == segv || $mode == trap ]]; then
+      check_stop exception_line "$st" $D/signals.c $tag
+      check exception_stack_top "main" "$(concrete_frames "$st" | head -1)"
+    else
+      check exception_module "libsystem_kernel.dylib" "$(stop_module "$st")"
+      check exception_main_frame 1 "$(call_stack "$st" | grep -c "^main@$(tag_loc $D/signals.c $tag)\[0\]$")"
     fi
+    note "$mode: code $(exception_code "$st"), explanation: $(stop_explanation "$st"), stack: $(call_stack "$st" | tr '\n' ' ')"
+    local ip=$(field "$st" ip) before=$(field "$st" stop_count)
+    case $mode in
+      segv|trap)
+        # the continue re-executes the faulting instruction: the same exception at the same pc again
+        ipc run >/dev/null; st=$(wait_exit_or_stop $before)
+        check continue_restops_same_code $code "$(exception_code "$st")"
+        check continue_restops_same_ip "$ip" "$(field "$st" ip)"
+        check continue_process_alive 1 "$(process_count "$st")"
+        ipc kill_all >/dev/null; wait_exit >/dev/null;;
+      sigint)
+        # the continue drops the signal: raise() returns and the process exits normally
+        ipc run >/dev/null; st=$(wait_exit)
+        check continue_drops_signal_exits 0 "$(process_count "$st")"
+        check continue_drops_signal_exit_code 0 "$(field "$st" last_exit_code)";;
+      abort)
+        ipc run >/dev/null; st=$(wait_exit_or_stop $before)
+        note "abort after continue: processes=$(process_count "$st") exit_code=$(field "$st" last_exit_code) code=$(exception_code "$st") expl=$(stop_explanation "$st")"
+        ipc kill_all >/dev/null; wait_exit >/dev/null;;
+    esac
     finish
   done
 }
@@ -927,6 +957,8 @@ scenario_D3_modules_system() {
 
 scenarios+=(D4_segv_recover)
 scenario_D4_segv_recover() {
+  # the fault settings off: the first chance is passed (KERN_FAILURE), the kernel's SIGSEGV reaches
+  # the handler, no stop
   begin D4_segv_recover $B/signals_O0 segv_recover $'mac_sigsegv: 0\nmac_sigbus: 0\nmac_exc_bad_access: 0' || return
   local before=$(field "$(ipc state)" stop_count)
   ipc run >/dev/null
@@ -935,6 +967,23 @@ scenario_D4_segv_recover() {
   check D4_no_stop_on_filtered_fault 0 "$(process_count "$st")"
   check D4_exit_code 0 "$(field "$st" last_exit_code)"
   check D4_recovered_printed 1 "$(grep -c recovered $S/raddbg_stdout.txt)"
+  finish
+  # the defaults (EXC_BAD_ACCESS breaks): the first chance stops at the faulting line; a continue
+  # re-executes the store (ignore_previous_exception -> KERN_SUCCESS), which faults again and stops
+  # again at the same pc, so the handler runs only with the settings off (above), as upstream's
+  # Linux and Win32 demons behave (see the exceptions scenario)
+  begin D4_segv_recover_default $B/signals_O0 segv_recover || return
+  st=$(run_stop)
+  check D4_default_first_chance_code 0x10001 "$(exception_code "$st")"
+  check_stop D4_default_fault_line "$st" $D/signals.c recover_fault
+  check D4_default_process_alive 1 "$(process_count "$st")"
+  local ip=$(field "$st" ip)
+  st=$(go_cmd run)
+  check D4_default_continue_restops_code 0x10001 "$(exception_code "$st")"
+  check D4_default_continue_same_ip "$ip" "$(field "$st" ip)"
+  check D4_default_continue_process_alive 1 "$(process_count "$st")"
+  note "D4 default settings after one continue: 'recovered' printed $(grep -c recovered $S/raddbg_stdout.txt) time(s) (the handler runs when mac_exc_bad_access is off)"
+  ipc kill_all >/dev/null; wait_exit >/dev/null
   finish
 }
 
@@ -1032,14 +1081,23 @@ scenario_D9_attach_kill9() {
   local st=$(go_cmd "attach --pid:$tpid")
   check D9_attached "$tpid" "$(process_ids "$st" | awk '{print $1}')"
   ipc run >/dev/null; wait_running
+  local before=$(field "$st" stop_count)
   local t0=$(date +%s%N)
   kill -9 $tpid
+  # PT_ATTACHEXC reports the SIGKILL as a soft signal and mac_sigkill breaks by default (as
+  # linux_sigkill does): the first report is a stop; the exit follows the continue
+  st=$(wait_stop ${before:-0})
+  local stop_ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+  check D9_sigkill_stop 0x9 "$(exception_code "$st")"
+  check D9_sigkill_stop_process_known 1 "$(process_count "$st")"
+  t0=$(date +%s%N)
+  ipc run >/dev/null
   for i in $(seq 1 100); do st=$(ipc state); [[ "$(process_count "$st")" == "0" ]] && break; done
   local ms=$(( ($(date +%s%N) - t0) / 1000000 ))
   check D9_exit_reported 0 "$(process_count "$st")"
   check D9_exit_code_is_signal 9 "$(field "$st" last_exit_code)"
   check_match D9_exit_within_500ms '^([0-9]|[1-9][0-9]|[1-4][0-9][0-9])$' "$ms"
-  note "D9 exit reported after ${ms} ms (one ipc state round trip is ~50 ms)"
+  note "D9 SIGKILL stop after ${stop_ms} ms (100 ms polls), exit reported ${ms} ms after the continue (one ipc state round trip is ~50 ms)"
   wait_gone $tpid
   finish
 }
@@ -1077,7 +1135,8 @@ scenarios+=(U2_noreturn_stack)
 scenario_U2_noreturn_stack() {
   begin U2_noreturn_stack $B/noreturn_O2 || return
   local st=$(run_stop)
-  check_match U2_trap_stop '^(0x5|0x10006)$' "$(exception_code "$st")"
+  # the trap's first chance, EXC_BREAKPOINT (mac_exc_breakpoint breaks by default)
+  check U2_trap_stop 0x10006 "$(exception_code "$st")"
   check U2_top_frame "die" "$(concrete_frames "$st" | head -1)"
   check_match U2_stack_has_a_func 'a_func' "$(call_stack_symbols "$st")"
   check U2_stack_without_b_func 0 "$(call_stack_symbols "$st" | tr ' ' '\n' | grep -c '^b_func$')"

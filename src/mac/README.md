@@ -405,24 +405,42 @@ continuing stops on the fault again instead of a dead process),
 information: see Exec above), `watchpoint.sh` (hit count 1 in a saved copy
 of the project).
 
+Exception stops are enabled by default now (they never were from the UI:
+`raddbg.mdesk`'s project schema had `win32_*` and `linux_*` "Break on ..."
+settings but no `mac_*` ones, so every Mach exception and signal was passed at
+first chance). The schema has one `mac_*` setting per `MAC_ExceptionCodeTable`
+entry (`mac_` + the lower-case name, the table's `break_default`), which the
+UI reads into the engine's exception filters exactly like the Windows and
+Linux ones (`raddbg_core.c`, `exception_code_filters`; nothing in the engine
+or demon changed). A NULL store now stops at its first chance as
+EXC_BAD_ACCESS (0x10001), `__builtin_trap` as EXC_BREAKPOINT (0x10006),
+`abort()` as SIGABRT (0x6) and `raise(SIGINT)` as SIGINT (0x2), the last two
+inside `__pthread_kill` with `main`'s line further down the stack. A continue
+after such a stop follows upstream: the engine runs with
+`ignore_previous_exception`, which the demon answers with KERN_SUCCESS for a
+hardware exception (the instruction re-executes and faults again, a second,
+repeated stop at the same pc) and with `PT_THUPDATE` signal 0 for a soft
+signal (not delivered: `raise(SIGINT)` returns and the process exits 0), as
+the Linux demon's `PTRACE_CONT` with signal 0 and Win32's `DBG_CONTINUE` do;
+the exception reaches the debuggee (a `SIGSEGV` handler runs, a crash
+terminates) when its setting is off. So `tests/demon/signal_handler.sh` turns
+the three fault settings off on purpose, `frozen_thread.sh` turns `mac_sigusr1`
+off for its pass-through thread (SIGUSR1 breaks by default, as on Linux), and
+the flows `exceptions`, `U2` and `D4` pin the codes and both continue paths.
+Two more consequences of the Linux-like defaults: `raise(SIGUSR1)` stops
+before its handler runs (the `signal_handler` flow turns `mac_sigusr1` off),
+and a `kill -9` of the debuggee is reported first as a SIGKILL stop (0x9;
+`PT_ATTACHEXC` reports it as a soft signal and `mac_sigkill` breaks, as
+`linux_sigkill` does), the exit following the continue (`D9`; a launched
+process then reports exit code 9, an attached one 0 on this machine with or
+without the stop, since the demon learns a non-child's exit status only from
+`NOTE_EXITSTATUS`: `D9_exit_code_is_signal` stays open).
+
 ### Open
 
 Consolidated from the sections below (each records its evidence); roughly by
 impact:
 
-* **Exception stops are never enabled on macOS by the UI.** `raddbg.mdesk`'s
-  project schema has `win32_*` and `linux_*` "Break on ..." settings but no
-  `mac_*` ones, so `rd_setting_b32_from_name("mac_sigsegv")` is 0 and the
-  engine passes every Mach exception and signal at first chance: `abort()`
-  and `raise(SIGINT)` neither stop nor get delivered (the process continues
-  with `ignore_previous_exception`), a NULL store or `__builtin_trap` stops
-  only on the escalated second chance, and an unhandled crash now terminates
-  the debuggee, as the settings say (before the demon fixes it stopped by
-  accident at the re-reported escalation). Settings written by hand into the
-  project or user file work (`mac_exc_bad_access: 1`, `mac_sigsegv: 1`, ...:
-  `mac_` + the `MAC_ExceptionCodeTable` name; `tests/demon/frozen_thread.sh`
-  relies on it). Fix: a `mac_*` block in `raddbg.mdesk` mirroring the Linux
-  one, with the table's `break_default` values.
 * Function-name breakpoints added while a process is live are resolved once,
   on the control thread, with `di_match_from_string(..., endt_us = 0)`: when
   the asynchronous name search has not seen the name yet, the breakpoint
@@ -723,9 +741,36 @@ implementation):
   specification and follows `ref_addr` references into other units (the
   converter-corpus work above). The names are still unqualified (`area`, not
   `Rect::area`): the container is not derived from the declaration's parent.
+* Soft signals neither stopped nor got delivered (`abort()` and `raise(SIGINT)`
+  were filtered with `stop_cause: 0` and continued with
+  `ignore_previous_exception`, so `raise(SIGINT)` returned and the process
+  exited 0) and hardware exceptions stopped only on their repeated second
+  chance: the `mac_*` "Break on ..." settings had no schema in `raddbg.mdesk`
+  and read as off (see "Status and open issues"). With the schema, `exceptions`
+  checks the first-chance stops (NULL store 0x10001 at its line, `__builtin_trap`
+  0x10006, `abort()` 0x6 and `raise(SIGINT)` 0x2 in `__pthread_kill` with
+  `main`'s line on the stack), `U2` the trap, and `D4` both paths of a
+  `SIGSEGV` handler: with the fault settings off no stop, the handler runs and
+  the process exits 0; with the defaults the first-chance stop, and a continue
+  that stops on the re-executed fault again (the policy below). The
+  `signal_handler` flow turns `mac_sigusr1` off so that `raise(SIGUSR1)` reaches
+  its handler (SIGUSR1 breaks by default, as `linux_sigusr1` does), and `D9`
+  continues once past the SIGKILL stop a `kill -9` now produces (`mac_sigkill`
+  breaks by default) before expecting the exit; its exit code check (9) fails
+  for the attached process with or without that stop (exit code 0: see "Status
+  and open issues"), as do `fork/D2_exit_code_from_child` (0 instead of 7) and
+  `D1_debuggee_ran_to_completion` on the pre-change binary too.
 
 Policy, not bugs (the suite expects these):
 
+* A continue after an exception stop does not deliver the exception to the
+  debuggee: the engine resumes with `ignore_previous_exception`, which the
+  demon answers with KERN_SUCCESS (a hardware exception re-executes its
+  instruction and faults again: another stop at the same pc) or `PT_THUPDATE`
+  signal 0 (a soft signal is dropped: `raise(SIGINT)` returns, exit code 0), as
+  upstream's Linux demon (`PTRACE_CONT` with signal 0) and Win32 demon
+  (`DBG_CONTINUE`) do. A handler runs, or an unhandled crash terminates the
+  process, when the exception's "Break on ..." setting is off.
 * A step into a function stops at its opening brace (the prologue's line), as
   upstream does; the first statement is one step over away.
 * A `__thread` variable reads 0 until the thread has touched one of the
@@ -746,15 +791,6 @@ fixed since by the demon and unwinder work and are not repeated here):
   resolution (`dbg_engine_ctrl.c`,
   `d_ctrl_thread__append_resolved_module_user_bp_traps` and
   `..._process_user_bp_traps`).
-* Soft signals neither stop nor get delivered: `abort()` and `raise(SIGINT)`
-  produce an `Exception` demon event, the engine filters it (`stop_cause: 0`;
-  the `mac_*` exception filter settings read as off) and continues with
-  `ignore_previous_exception`, so `raise(SIGINT)` returns and the process
-  exits 0 (`exceptions`, `U2` with `abort`). Hardware exceptions stop only on
-  their escalated second chance: `__builtin_trap` is reported as SIGTRAP (0x5)
-  after the first-chance EXC_BREAKPOINT was continued, a NULL store as SIGSEGV
-  (0xb) after EXC_BAD_ACCESS; hence `D4` (SIGSEGV handler, filters off) still
-  stops, and the handler runs only after a manual continue.
 * Breakpoint hits on several threads at once: the demon reports every thread's
   pending exception in one `dmn_ctrl_run` (four `Breakpoint` events in the
   `threads_breakpoints` ctrl log), the engine stops for the first, and the

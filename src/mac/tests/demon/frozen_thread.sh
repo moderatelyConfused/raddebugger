@@ -3,8 +3,9 @@
 # the ignore flag of a run which is about some other thread's event.
 # `select_thread` cannot be driven over IPC (entity slots are not filled from option strings), so the
 # situation is arranged through the event order instead: three threads raise at once, the faulting
-# one first (its exception is the stop, with mac_exc_bad_access: 1), then a thread hitting a
-# breakpoint, then a thread raising a signal the engine passes through (SIGUSR1 has no mac_ setting).
+# one first (its exception is the stop: EXC_BAD_ACCESS breaks by default), then a thread hitting a
+# breakpoint, then a thread raising a signal the engine passes through (SIGUSR1 breaks by default
+# too, so the project turns `mac_sigusr1` off; the `mac_*` names come from MAC_ExceptionCodeTable).
 # A step then makes the engine single-step the breakpoint thread past its trap in a run with
 # `ignore_previous_exception: 0`, the fault thread frozen with its reported exception pending: before
 # the fix that reply escalated the fault to SIGSEGV and the process died when continued; now the
@@ -13,7 +14,7 @@
 source "$(dirname ${(%):-%x})/common.sh"
 build_c frozen_thread
 write_project frozen_thread $S/frozen_thread "" <<'EOF'
-mac_exc_bad_access: 1
+mac_sigusr1: 0
 EOF
 # rjf: runs so far whose single step had another thread frozen: `single_step_thread: [0x...]` with a nonzero handle, ignore flag 0
 ignore0_step_runs() { awk '/single_step_thread:/ {s=$2} /ignore_previous_exception:/ {if(s != "[0x0]" && $2 == "0") n++} END {print n+0}' $CTRL_LOG 2>/dev/null; }
