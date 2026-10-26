@@ -1461,36 +1461,91 @@ mac_dmn_strip_pac(U64 ptr)
   return ptr & ((1ull << 47) - 1);
 }
 
+// rjf: read dyld_all_image_infos. the address captured at launch belongs to the
+// initial dyld and is replaced when dyld hands over to its shared-cache copy; the old
+// struct keeps reporting the pre-handover image count (often 1), so re-query
+// TASK_DYLD_INFO for the current address every time rather than trusting the cache.
+internal U64
+mac_dmn_process_read_all_image_infos(MAC_DMN_Process *process, struct dyld_all_image_infos *out)
+{
+  // NOTE: there can be two dyld_all_image_infos structs in flight on an arm64 Mac:
+  // the one at the address captured at launch, and the one TASK_DYLD_INFO reports after
+  // dyld hands over to its shared-cache copy. On this macOS only one of them is actually
+  // populated with the full image array (the other keeps reporting infoArrayCount == 1),
+  // and which one it is is not fixed, so read both candidate addresses and keep whichever
+  // currently lists more images. The chosen address is cached for sync_images, which reads
+  // process->all_image_infos_vaddr itself.
+  U64 min_size = OffsetOf(struct dyld_all_image_infos, notification) + sizeof(out->notification);
+  U64 cand_addrs[2] = {0};
+  U64 cand_count = 0;
+  if(process->all_image_infos_vaddr != 0)
+  {
+    cand_addrs[cand_count++] = process->all_image_infos_vaddr;
+  }
+  {
+    task_dyld_info_data_t dyld_info = {0};
+    mach_msg_type_number_t info_count = TASK_DYLD_INFO_COUNT;
+    if(task_info(process->task, TASK_DYLD_INFO, (task_info_t)&dyld_info, &info_count) == KERN_SUCCESS &&
+       dyld_info.all_image_info_addr != 0 && dyld_info.all_image_info_addr != cand_addrs[0])
+    {
+      cand_addrs[cand_count++] = dyld_info.all_image_info_addr;
+    }
+  }
+  U64 best_read = 0;
+  U64 best_addr = process->all_image_infos_vaddr;
+  B32 best_valid = 0;
+  MemoryZeroStruct(out);
+  for EachIndex(idx, cand_count)
+  {
+    struct dyld_all_image_infos infos = {0};
+    U64 read_size = mac_dmn_read(process->task, r1u64(cand_addrs[idx], cand_addrs[idx] + sizeof(infos)), &infos);
+    B32 valid = (read_size >= min_size);
+    // rjf: prefer a readable struct, and among readable ones the one listing more images.
+    if(valid && (!best_valid || infos.infoArrayCount > out->infoArrayCount))
+    {
+      MemoryCopy(out, &infos, sizeof(infos));
+      best_read = read_size;
+      best_addr = cand_addrs[idx];
+      best_valid = 1;
+    }
+  }
+  process->all_image_infos_vaddr = best_addr;
+  return best_read;
+}
+
 internal B32
 mac_dmn_process_find_dyld_notification(MAC_DMN_Process *process, U64 dyld_header_vaddr, B32 dyld_is_rebased)
 {
   process->dyld_base_vaddr = dyld_header_vaddr;
   process->dyld_notification_vaddr = 0;
-  MAC_DMN_ImageInfo dyld_image = mac_dmn_image_info_from_header_vaddr(process->task, dyld_header_vaddr);
-  if(dyld_image.valid)
+  // rjf: prefer the function pointer dyld publishes in dyld_all_image_infos.notification.
+  // on this macOS the notifier is the shared-cache dyld's `_lldb_image_notifier`, whose
+  // local symbol is not in the on-disk dyld's symbol table, so a symbol lookup fails; the
+  // published pointer (PAC-stripped on arm64e) is the reliable source once dyld has rebased.
+  if(dyld_is_rebased)
   {
-    U64 vaddr = mac_dmn_symbol_vaddr_from_image(process->task, &dyld_image, str8_lit("__dyld_debugger_notification"));
-    if(vaddr == 0)
+    struct dyld_all_image_infos infos = {0};
+    U64 read_size = mac_dmn_process_read_all_image_infos(process, &infos);
+    if(read_size >= OffsetOf(struct dyld_all_image_infos, notification) + sizeof(infos.notification) && infos.notification != 0)
     {
-      vaddr = mac_dmn_symbol_vaddr_from_image(process->task, &dyld_image, str8_lit("_dyld_debugger_notification"));
+      process->dyld_notification_vaddr = mac_dmn_strip_pac((U64)(uintptr_t)infos.notification);
     }
-    // rjf: fall back to the function pointer published in dyld_all_image_infos. it is
-    // only meaningful once dyld has rebased itself (it is a chained fixup before),
-    // and it carries pointer-authentication bits on arm64e dylds.
-    if(vaddr == 0 && dyld_is_rebased && process->all_image_infos_vaddr != 0)
+  }
+  // rjf: fall back to a symbol lookup in the dyld image (older dylds export the notifier).
+  if(process->dyld_notification_vaddr == 0)
+  {
+    MAC_DMN_ImageInfo dyld_image = mac_dmn_image_info_from_header_vaddr(process->task, dyld_header_vaddr);
+    if(dyld_image.valid)
     {
-      struct dyld_all_image_infos infos = {0};
-      U64 read_size = mac_dmn_read(process->task, r1u64(process->all_image_infos_vaddr, process->all_image_infos_vaddr + sizeof(infos)), &infos);
-      if(read_size >= OffsetOf(struct dyld_all_image_infos, notification) + sizeof(infos.notification) && infos.notification != 0)
-      {
-        vaddr = mac_dmn_strip_pac((U64)(uintptr_t)infos.notification);
-      }
+      U64 vaddr = mac_dmn_symbol_vaddr_from_image(process->task, &dyld_image, str8_lit("__dyld_debugger_notification"));
+      if(vaddr == 0) { vaddr = mac_dmn_symbol_vaddr_from_image(process->task, &dyld_image, str8_lit("_dyld_debugger_notification")); }
+      if(vaddr == 0) { vaddr = mac_dmn_symbol_vaddr_from_image(process->task, &dyld_image, str8_lit("_lldb_image_notifier")); }
+      process->dyld_notification_vaddr = vaddr;
     }
-    process->dyld_notification_vaddr = vaddr;
   }
   if(process->dyld_notification_vaddr == 0)
   {
-    log_infof("mac demon: could not find _dyld_debugger_notification in dyld (pid %d); dynamic library load events will be synthesized at stops.\n", (int)process->pid);
+    log_infof("mac demon: could not find the dyld debugger notification function in dyld (pid %d); dynamic library load events will be synthesized at stops.\n", (int)process->pid);
   }
   return (process->dyld_notification_vaddr != 0);
 }
@@ -1505,8 +1560,10 @@ mac_dmn_process_check_images(Arena *arena, DMN_EventList *events, MAC_DMN_Proces
   {
     return;
   }
+  // rjf: read dyld_all_image_infos, refreshing the address from TASK_DYLD_INFO if the
+  // one we have is stale (dyld handed over to its shared-cache copy) or not yet populated.
   struct dyld_all_image_infos infos = {0};
-  U64 read_size = mac_dmn_read(process->task, r1u64(process->all_image_infos_vaddr, process->all_image_infos_vaddr + sizeof(infos)), &infos);
+  U64 read_size = mac_dmn_process_read_all_image_infos(process, &infos);
   if(read_size < OffsetOf(struct dyld_all_image_infos, notification) + sizeof(infos.notification))
   {
     return;
@@ -1516,11 +1573,22 @@ mac_dmn_process_check_images(Arena *arena, DMN_EventList *events, MAC_DMN_Proces
     // rjf: dyld has not initialized yet (first instruction)
     return;
   }
-  // rjf: trap not placed yet (e.g. symbol lookup failed before dyld rebased itself)
-  if(process->dyld_notification_vaddr == 0 && infos.notification != 0)
+  // rjf: (re)arm the notification trap from the pointer dyld currently publishes. this
+  // picks it up when a symbol lookup failed at launch, and re-targets it after dyld moved
+  // to its shared-cache copy (the old notifier address is gone).
+  if(infos.notification != 0)
   {
-    process->dyld_notification_vaddr = mac_dmn_strip_pac((U64)(uintptr_t)infos.notification);
-    mac_dmn_process_set_dyld_notification_trap(process, 1);
+    U64 notif_vaddr = mac_dmn_strip_pac((U64)(uintptr_t)infos.notification);
+    if(process->dyld_notification_vaddr != notif_vaddr)
+    {
+      mac_dmn_process_set_dyld_notification_trap(process, 0);
+      process->dyld_notification_vaddr = notif_vaddr;
+      mac_dmn_process_set_dyld_notification_trap(process, 1);
+    }
+    else if(!process->dyld_notification_trap_is_set)
+    {
+      mac_dmn_process_set_dyld_notification_trap(process, 1);
+    }
   }
   if(infos.infoArrayCount != process->last_image_info_count || !process->dyld_notification_trap_is_set)
   {
@@ -2385,6 +2453,17 @@ mac_dmn_process_handle_dyld_notification(Arena *arena, DMN_EventList *events, MA
     if(mac_dmn_read_struct(process->task, array_vaddr, &moved) == sizeof(moved) && moved.imageLoadAddress != 0)
     {
       U64 new_dyld_vaddr = (U64)(uintptr_t)moved.imageLoadAddress;
+      // rjf: prefer dyld's own published base after the handover (re-querying
+      // TASK_DYLD_INFO for the current all_image_infos) over the x2 argument.
+      {
+        struct dyld_all_image_infos infos = {0};
+        U64 read_size = mac_dmn_process_read_all_image_infos(process, &infos);
+        if(read_size >= OffsetOf(struct dyld_all_image_infos, dyldImageLoadAddress) + sizeof(infos.dyldImageLoadAddress) &&
+           infos.dyldImageLoadAddress != 0)
+        {
+          new_dyld_vaddr = (U64)(uintptr_t)infos.dyldImageLoadAddress;
+        }
+      }
       String8 path = mac_dmn_read_string_capped(scratch.arena, process->task, (U64)(uintptr_t)moved.imageFilePath, 4096);
       if(path.size == 0) { path = str8_lit("/usr/lib/dyld"); }
       // rjf: finish executing the old trap site first, then remove it for good
