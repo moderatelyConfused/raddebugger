@@ -165,6 +165,13 @@ struct MAC_ProcessGroup
 ////////////////////////////////
 //~ rjf: State
 
+typedef struct MAC_OwnedIPCName MAC_OwnedIPCName;
+struct MAC_OwnedIPCName
+{
+  char name[MAC_IPC_NAME_CAP];
+  B32 is_shared_memory;
+};
+
 typedef struct MAC_State MAC_State;
 struct MAC_State
 {
@@ -177,6 +184,11 @@ struct MAC_State
   U64 default_env_count;
   char **default_env;
   U32 unnamed_shared_memory_counter;
+  // rjf: names of the POSIX semaphores & shared memory objects this process
+  // created; unlinked at exit (they would otherwise persist until reboot).
+  // guarded by entity_mutex.
+  U64 owned_ipc_name_count;
+  MAC_OwnedIPCName owned_ipc_names[16];
 };
 
 ////////////////////////////////
@@ -195,6 +207,8 @@ internal DenseTime mac_dense_time_from_timespec(timespec in);
 internal FileProperties mac_file_properties_from_stat(struct stat *s);
 internal void mac_safe_call_sig_handler(int sig, siginfo_t *info, void *context);
 internal String8 mac_ipc_name_from_name(Arena *arena, String8 name);
+internal void mac_owned_ipc_name_push(String8 ipc_name, B32 is_shared_memory);
+internal void mac_unlink_owned_ipc_names(void);
 internal U64 mac_relative_us_from_endt_us(U64 endt_us);
 internal timespec mac_relative_timespec_from_endt_us(U64 endt_us);
 internal B32 mac_kinfo_proc_from_pid(pid_t pid, struct kinfo_proc *out);

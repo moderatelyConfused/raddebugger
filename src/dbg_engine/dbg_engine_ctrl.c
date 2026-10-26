@@ -5921,11 +5921,9 @@ d_ctrl_thread__run(DMN_CtrlCtx *ctrl_ctx, D_Msg *msg)
       
       //- rjf: trap net logic: stack pointer check on target thread
       B32 stack_pointer_check_passes = 0;
-      U64 hit_sp = 0;
       if(!hard_stop && use_stepping_logic && hit_trap_net_bp && dmn_handle_match(event->thread, d_dmn_from_handle(target_thread)))
       {
         U64 sp = d_sp_from_thread(target_thread);
-        hit_sp = sp;
         stack_pointer_check_passes = ((hit_trap_flags & D_TrapFlag_IgnoreStackPointerCheck) || (sp == sp_check_value));
       }
       

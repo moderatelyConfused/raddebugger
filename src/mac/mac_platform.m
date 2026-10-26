@@ -1788,6 +1788,11 @@ mac_plat_set_clipboard_text(const char *utf8, size_t size)
     if(utf8 != 0)
     {
       string = [[[NSString alloc] initWithBytes:utf8 length:size encoding:NSUTF8StringEncoding] autorelease];
+      if(string == nil)
+      {
+        // rjf: not valid UTF-8 -> copy the bytes as Latin-1 rather than clearing
+        string = [[[NSString alloc] initWithBytes:utf8 length:size encoding:NSISOLatin1StringEncoding] autorelease];
+      }
     }
     if(string == nil)
     {
