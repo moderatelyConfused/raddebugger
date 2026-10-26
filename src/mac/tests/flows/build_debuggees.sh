@@ -1,9 +1,10 @@
 #!/bin/zsh
 # Builds the flow-test debuggees (src/mac/tests/flows/debuggees) into FLOWS_BUILD_DIR
 # (default: <repo>/build/flows), each as a -g -O0 and a -g -O2 variant, with dSYM bundles.
-# Also builds the Zig generator (FLOWS_ZIG_GENERATOR, default ~/Desktop/Etc/October-2026/generator)
-# into FLOWS_BUILD_DIR/generator when zig (FLOWS_ZIG, default ~/.zvm/bin/zig) is available; the
-# generator's own directory is left untouched (its own cache dir is under FLOWS_BUILD_DIR).
+# Also builds the Zig generator (GENERATOR_DIR, default ~/Desktop/Etc/October-2026/generator) into
+# FLOWS_BUILD_DIR/generator when zig (ZIG, default ~/.zvm/bin/zig) is available (lib.sh's
+# generator_locate / generator_build); the generator's own directory is left untouched (its cache
+# dir is under FLOWS_BUILD_DIR).
 set -e
 here=$(cd "$(dirname ${(%):-%x})" && pwd)
 repo=$(cd "$here/../../../.." && pwd)
@@ -94,12 +95,14 @@ $cc -g -O2 -fomit-frame-pointer -Wall -c -o "$out/obj/basic_O2_nofp.o" "$src/bas
 $cc -g -O2 -fomit-frame-pointer -Wall -o "$out/basic_O2_nofp" "$out/obj/basic_O2_nofp.o"
 dsymutil "$out/basic_O2_nofp"
 
-# Zig generator (debug build), see README "Status and open issues"
-zig=${FLOWS_ZIG:-$HOME/.zvm/bin/zig}
-gen=${FLOWS_ZIG_GENERATOR:-$HOME/Desktop/Etc/October-2026/generator}
-if [[ -x $zig && -f $gen/build.zig ]]; then
+# Zig generator (debug build), see README "Status and open issues"; located and built by lib.sh
+# (ZIG, GENERATOR_DIR), skipped when either is missing. (lib.sh wants a HARNESS_DIR; a build has no
+# instance, so the output directory stands in for it rather than a temp dir of its own.)
+export HARNESS_DIR=${HARNESS_DIR:-$out}
+source "$here/../lib.sh"
+if generator_locate; then
   echo "[generator (zig)]"
-  (cd "$gen" && "$zig" build -Doptimize=Debug --prefix "$out/generator" --cache-dir "$out/generator/zig-cache") || echo "zig build failed (generator scenarios will be skipped)"
+  generator_build "$out/generator" || echo "zig build failed (generator scenarios will be skipped)"
 else
   echo "zig or the generator project not found; generator scenarios will be skipped"
 fi

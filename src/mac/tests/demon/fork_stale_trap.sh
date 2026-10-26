@@ -7,7 +7,7 @@
 # known and the child took SIGTRAP (the parent then saw a signalled child, status 5).
 source "$(dirname ${(%):-%x})/common.sh"
 build_c fork_child
-write_project fork_child $S/fork_child "stale" </dev/null
+write_project fork_child $S/fork_child "stale"
 launch $S/fork_child.raddbg
 bp $DEMON_TESTS_DIR/src/fork_child.c:$(line_of fork_child "// bp_foo")
 bp $DEMON_TESTS_DIR/src/fork_child.c:$(line_of fork_child "// bp_after_fork")

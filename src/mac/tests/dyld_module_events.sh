@@ -46,18 +46,20 @@
 # The instance runs with HOME under HARNESS_DIR, so the symbol-only image files it writes
 # (and the images-cache sweep) stay out of the user's cache.
 #
-# Settings: RADDBG, IPC_PORT (7609), HARNESS_DIR.
+# Settings: RADDBG, IPC_PORT (7609), HARNESS_DIR (see lib.sh: the instance, `ipc`, `field`, the
+# `state` readers and the waits).
 set -u
-ROOT="$(cd "$(dirname ${(%):-%x})/../../.." && pwd)"
-RD=${RADDBG:-"$ROOT/build/raddbg"}
-P=${IPC_PORT:-7609}
+export IPC_PORT=${IPC_PORT:-7609}
+source "$(cd "$(dirname ${(%):-%x})" && pwd)/lib.sh"
 # a scratch directory of our own is removed at exit (with the instance's HOME, so the symbol-only
 # images it wrote go too); a HARNESS_DIR given by the caller is theirs
-if [[ -n ${HARNESS_DIR:-} ]]; then S=$HARNESS_DIR; else S=$(mktemp -d /tmp/raddbg_dyld.XXXXXX); trap 'rm -rf "$S"' EXIT; fi
+remove_owned_harness_dir_at_exit
+# the instance's HOME (and this script's: nothing here needs the real one) is under the scratch
+# directory, so the symbol-only image files it writes stay out of the user's cache
+export HOME=$S/home
 mkdir -p $S/src $S/home
-ipc() { $RD --ipc_port:$P --ipc "$@" 2>&1; }
-field() { echo "$1" | grep -m1 " $2:" | awk '{print $2}'; }
-state_modules() { ipc state | sed -n '/^ modules:/,/^ }/p' | grep "name:" | sed 's/.*name: *//'; }
+WAIT_STOP_POLLS=200   # runs to a stop wait up to 20 s (the conversions of 45 images are in flight)
+state_modules() { module_names "$(ipc state)"; }
 # resolved: the reply names a value (an empty or failed reply is not a resolution)
 eval_resolved() { local out=$(ipc eval "$1"); [[ -n "$out" ]] && echo "$out" | grep -q " value:" && ! echo "$out" | grep -q "could not be found"; }
 wait_resolved() { for i in $(seq 1 100); do eval_resolved "$1" && return 0; sleep 0.1; done; return 1; }
@@ -101,32 +103,20 @@ DL=$S/src
 
 fails=0
 INSTANCE_PID=
+# a fresh instance (dbg_start: the earlier one on the port is killed, the user file is fresh, readiness
+# is the listener, the pid is RD_PID) with a fresh project file and log: `exit` saves the project, and
+# the next instance would otherwise start with the previous one's targets and breakpoints
 start_instance() {
-  [[ -n "$INSTANCE_PID" ]] && kill -9 $INSTANCE_PID 2>/dev/null
-  # a fresh user & project file: `ipc exit` saves the project, and the next instance would
-  # otherwise start with the previous one's targets and breakpoints
-  rm -f $S/u.raddbg_user $S/p.raddbg; rm -rf $S/logs
-  HOME=$S/home $RD --ipc_port:$P --user:$S/u.raddbg_user --project:$S/p.raddbg --logs:$S/logs > $S/out.txt 2>&1 &
-  INSTANCE_PID=$!
-  for i in $(seq 1 600); do lsof -nP -iTCP:$P -sTCP:LISTEN 2>/dev/null | grep -q raddbg && return 0; sleep 0.05; done
-  echo "FAIL: instance did not listen on $P"; fails=$((fails+1)); return 1
+  rm -f $S/p.raddbg; rm -rf $S/logs
+  dbg_start $S/p.raddbg || { echo "FAIL: instance did not listen on $IPC_PORT"; fails=$((fails+1)); return 1; }
+  INSTANCE_PID=$RD_PID
 }
-# exit the instance (flushes its logs), then make sure it is gone
-stop_instance() {
-  ipc exit >/dev/null 2>&1
-  for i in $(seq 1 100); do kill -0 $INSTANCE_PID 2>/dev/null || break; sleep 0.05; done
-  kill -9 $INSTANCE_PID 2>/dev/null
-  INSTANCE_PID=
-}
+# exit the instance (flushes its logs), then make sure it is gone (dbg_stop)
+stop_instance() { dbg_stop; INSTANCE_PID=; }
 run_to_stop() {  # $1 = stop_count floor; echoes the new stop_count
-  local before=$1
-  ipc run >/dev/null 2>&1
-  for i in $(seq 1 200); do
-    local st=$(ipc state); local sc=$(field "$st" stop_count)
-    if [[ "$(field "$st" running)" == "0" && -n "$sc" && "$sc" -gt "$before" ]]; then echo "$sc"; return 0; fi
-    sleep 0.1
-  done
-  echo "$before"; return 1
+  local st=$(go_cmd run); local sc=$(field "$st" stop_count)
+  if [[ -n "$sc" && "$sc" -gt "$1" ]]; then echo "$sc"; return 0; fi
+  echo "$1"; return 1
 }
 L=$S/logs/ctrl_thread.raddbg_log
 

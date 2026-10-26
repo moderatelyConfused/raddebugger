@@ -3,7 +3,7 @@
 # on an inherited brk; with the original instruction restored it runs the function normally.
 source "$(dirname ${(%):-%x})/common.sh"
 build_c fork_child
-write_project fork_child $S/fork_child "" </dev/null
+write_project fork_child $S/fork_child ""
 launch $S/fork_child.raddbg
 bp $DEMON_TESTS_DIR/src/fork_child.c:$(line_of fork_child "// bp_foo")
 bp $DEMON_TESTS_DIR/src/fork_child.c:$(line_of fork_child "// bp_after_wait")

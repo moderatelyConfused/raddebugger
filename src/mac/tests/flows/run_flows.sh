@@ -1,6 +1,6 @@
 #!/bin/zsh
 # Feature-flow suite for the macOS debugger, driven over `raddbg --ipc` (see src/mac/README.md,
-# "Driving the debugger from a script", and src/mac/tests/ipc_harness.sh).
+# "Driving the debugger from a script", src/mac/tests/lib.sh and src/mac/tests/ipc_harness.sh).
 #
 #   zsh src/mac/tests/flows/run_flows.sh [scenario ...]      run all scenarios, or the named ones
 #   zsh src/mac/tests/flows/run_flows.sh -l                  list scenarios
@@ -10,10 +10,9 @@
 # IPC_PORT (default 7500 + pid % 100, so two concurrent runs do not kill each other's instances;
 # never the user's 7423), HARNESS_DIR (user file, logs and project files of the private instance;
 # default a temp dir), FLOWS_KEEP_LOGS=1 keeps a copy of each scenario's logs under
-# $HARNESS_DIR/logs_<scenario>. The Zig generator is named as the demon scripts name it:
-# GENERATOR_SRC (its project directory, default ~/Desktop/Etc/October-2026/generator) and ZIG
-# (the compiler, default ~/.zvm/bin/zig); FLOWS_ZIG_GENERATOR / FLOWS_ZIG are accepted as
-# overrides for older invocations. The generator's lines are looked up in its source by pattern.
+# $HARNESS_DIR/logs_<scenario>. The Zig generator is named as every test script names it (lib.sh's
+# generator_locate): GENERATOR_DIR (its project directory, default ~/Desktop/Etc/October-2026/generator)
+# and ZIG (the compiler, default ~/.zvm/bin/zig); its lines are looked up in its source by pattern.
 #
 # Every check prints "PASS <scenario>/<check>: <observed>" or "FAIL <scenario>/<check>: expected
 # <...>, observed <...>"; NOTE lines record observations without a verdict; the summary at the end
@@ -25,89 +24,28 @@ zmodload zsh/datetime
 now_ms() { printf '%.0f' $(( EPOCHREALTIME * 1000 )); }
 here=$(cd "$(dirname ${(%):-%x})" && pwd)
 repo=$(cd "$here/../../../.." && pwd)
-export IPC_PORT=${IPC_PORT:-$(( 7500 + $$ % 100 ))}
-export HARNESS_DIR=${HARNESS_DIR:-$(mktemp -d /tmp/raddbg_flows.XXXXXX)}
-mkdir -p "$HARNESS_DIR"
 export RADDBG=${RADDBG:-$repo/build/raddbg}
+# the instance (dbg_start / dbg_stop / launch), the `state` readers, the waits, the check reporting and
+# the project file writer come from lib.sh (through the stepping harness, which adds `launch`)
+source "$here/../ipc_harness.sh"
 B=${FLOWS_BUILD_DIR:-$repo/build/flows}
 D=$here/debuggees
+# the Zig generator: built by build_debuggees.sh into $B/generator when ZIG and GENERATOR_DIR are found
+generator_locate
 GEN=$B/generator/bin/generator
-export GENERATOR_SRC=${GENERATOR_SRC:-${FLOWS_ZIG_GENERATOR:-$HOME/Desktop/Etc/October-2026/generator}}
-export ZIG=${ZIG:-${FLOWS_ZIG:-$HOME/.zvm/bin/zig}}
-GSRC=$GENERATOR_SRC/src/main.zig
+GSRC=${GENERATOR_MAIN:-}
 # (re)build the debuggees when missing, or when a debuggee source is newer than the build: the
 # expected lines come from the sources, the observed ones from the binaries
 if [[ ! -x $B/basic_O0 || -n "$(find "$D" -newer "$B/basic_O0" -type f 2>/dev/null)" ]]; then
-  FLOWS_BUILD_DIR=$B FLOWS_ZIG=$ZIG FLOWS_ZIG_GENERATOR=$GENERATOR_SRC zsh "$here/build_debuggees.sh" >/dev/null
+  FLOWS_BUILD_DIR=$B zsh "$here/build_debuggees.sh" >/dev/null
 fi
-source "$here/../ipc_harness.sh"
+# list-valued `state` readers (thread_ids, module_names, ...) print their entries space-joined here, as
+# the checks record them; the project files' working directory is the debuggees' build directory
+STATE_LIST_JOIN=' '
+PROJECT_WORKING_DIR=$B
 
-typeset -i pass_count=0 fail_count=0
-typeset -a failures
-scenario=""
-
-# -- reporting -----------------------------------------------------------------------------------
-# check <name> <expected> <observed>: PASS when equal
-check() {
-  if [[ "$2" == "$3" ]]; then pass_count+=1; echo "PASS $scenario/$1: $3";
-  else fail_count+=1; failures+=("$scenario/$1"); echo "FAIL $scenario/$1: expected <$2>, observed <$3>"; fi
-}
-# check_match <name> <extended regex> <observed>
-check_match() {
-  if [[ "$3" =~ $2 ]]; then pass_count+=1; echo "PASS $scenario/$1: $3";
-  else fail_count+=1; failures+=("$scenario/$1"); echo "FAIL $scenario/$1: expected match <$2>, observed <$3>"; fi
-}
-# check_ne <name> <unexpected> <observed>
-check_ne() {
-  if [[ "$2" != "$3" ]]; then pass_count+=1; echo "PASS $scenario/$1: $3";
-  else fail_count+=1; failures+=("$scenario/$1"); echo "FAIL $scenario/$1: expected anything but <$2>, observed <$3>"; fi
-}
-note() { echo "NOTE $scenario: $*"; }
-
-# -- source line lookup by tag -------------------------------------------------------------------
-# line_of <source file> <tag>  -> the line number carrying "// @tag" (word boundary)
-line_of() { grep -n -E "// @$2([^a-zA-Z0-9_]|\$)" "$1" | head -1 | cut -d: -f1; }
-tag_loc() { echo "$(basename $1):$(line_of $1 $2)"; }
-# line_of_pattern <source file> <fixed string> -> the first line containing the string (sources
-# without tags, e.g. the Zig generator's main.zig)
-line_of_pattern() { grep -n -F -m1 -- "$2" "$1" | cut -d: -f1; }
-
-# -- state parsing (raddbg --ipc state) ----------------------------------------------------------
-# the innermost line of the stop ("<file>:<line>"), and the line at a given inline depth (0 = the
-# concrete function's line, i.e. the outermost call site)
-stop_file_line() {
-  echo "$1" | sed -n '/^ lines:/,/^ threads:/p' | grep 'file_name\|line_num' | paste - - | tail -1 | awk -F'"' '{split($3,a,":"); gsub(/ /,"",a[2]); printf "%s:%s", $2, a[2]}'
-}
-stop_file_line_at() {
-  echo "$1" | sed -n '/^ lines:/,/^ threads:/p' | grep 'file_name\|line_num' | paste - - | sed -n "$(( $2 + 1 ))p" | awk -F'"' '{split($3,a,":"); gsub(/ /,"",a[2]); printf "%s:%s", $2, a[2]}'
-}
-# the line of the selected inline frame (what the UI shows)
-stop_selected_line() { stop_file_line_at "$1" "$(field "$1" inline_depth)"; }
-stop_symbol() { echo "$1" | grep -m1 "ip_voff_symbol:" | cut -d'"' -f2; }
-stop_explanation() { echo "$1" | grep -m1 "explanation:" | cut -d'"' -f2; }
-stop_module() { echo "$1" | grep -m1 "ip_module:" | cut -d'"' -f2; }
-stop_bp_id() { echo "$1" | grep -m1 "bp_id:" | cut -d'"' -f2; }
-exception_code() { field "$1" exception_code; }
-thread_count() { echo "$1" | sed -n '/^ threads:/,/^ modules:/p' | grep -c "   id:"; }
-thread_ids() { echo "$1" | sed -n '/^ threads:/,/^ modules:/p' | grep "   id:" | awk '{print $2}' | tr '\n' ' '; }
-frozen_flags() { echo "$1" | sed -n '/^ threads:/,/^ modules:/p' | grep "frozen:" | awk '{print $2}' | tr '\n' ' '; }
-module_names() { echo "$1" | sed -n '/^ modules:/,/^ selected_thread:/p' | grep "name:" | cut -d'"' -f2 | tr '\n' ' '; }
-process_count() { echo "$1" | sed -n '/^ processes:/,/^ call_stack:/p' | grep -c "   id:"; }
-process_ids() { echo "$1" | sed -n '/^ processes:/,/^ call_stack:/p' | grep "   id:" | awk '{print $2}' | tr '\n' ' '; }
-# the call stack as "sym@file:line[depth]" lines (inline frames carry their depth), symbols only,
-# the concrete frames' symbols (one per unwind count), and the frames' modules
-call_stack() {
-  echo "$1" | sed -n '/^ call_stack:/,/^ breakpoints:/p' | grep 'inline_depth\|   symbol\|file_name\|line_num' | paste - - - - |
-    awk -F'"' '{split($1,d," "); split($5,l,":"); gsub(/ /,"",l[2]); printf "%s@%s:%s[%s]\n", $2, $4, l[2], d[2]}'
-}
-call_stack_symbols() { call_stack "$1" | cut -d@ -f1 | tr '\n' ' '; }
-concrete_frames() { call_stack "$1" | grep '\[0\]$' | cut -d@ -f1; }
-frame_modules() { echo "$1" | sed -n '/^ call_stack:/,/^ breakpoints:/p' | grep "   module:" | cut -d'"' -f2; }
-frame_ip_symbols() { echo "$1" | sed -n '/^ call_stack:/,/^ breakpoints:/p' | grep "ip_symbol:" | cut -d'"' -f2 | tr '\n' ' '; }
-bp_hit_count() { echo "$1" | sed -n '/^ breakpoints:/,$p' | grep -A5 "id:  *\"\\$2\"" | grep -m1 hit_count | awk '{print $2}'; }
-bp_enabled() { echo "$1" | sed -n '/^ breakpoints:/,$p' | grep -A5 "id:  *\"\\$2\"" | grep -m1 enabled | awk '{print $2}'; }
-bp_count() { echo "$1" | sed -n '/^ breakpoints:/,$p' | grep -c "   id:"; }
-bp_ids() { echo "$1" | sed -n '/^ breakpoints:/,$p' | grep "   id:" | cut -d'"' -f2 | tr '\n' ' '; }
+# -- source line lookup by tag (lib.sh: line_of_tag / line_of_pattern) ---------------------------
+tag_loc() { echo "$(basename $1):$(line_of_tag $1 $2)"; }
 
 # eval helpers: value / type / msgs of an expression in the selected frame. `--ipc eval` evaluates
 # once and waits (1 s at most) for fresh memory, the selected thread's call stack and the debug
@@ -126,58 +64,38 @@ ev_type() { ev_out "$@" | grep -m1 " type:" | sed 's/^ type: *//' | sed 's/^"\(.
 ev_msgs() { ev_out "$@" | grep -m1 " msgs:" | sed 's/^ msgs: *//' | sed 's/^"\(.*\)"$/\1/'; }
 
 # -- flow helpers ----------------------------------------------------------------------------------
-# project <name> <executable> [arguments] [extra top-level cfg lines] -> writes and echoes the project file path
-project() {
-  local path=$HARNESS_DIR/$1.raddbg
-  printf '// raddbg 0.9.30 project file\n\ntarget:\n{\n  executable: "%s"\n  arguments: "%s"\n  working_directory: "%s"\n  enabled: 1\n}\n' "$2" "${3:-}" "$B" > "$path"
-  [[ -n "${4:-}" ]] && printf '%s\n' "$4" >> "$path"
-  echo "$path"
-}
-# start_debugger <project>: a fresh private instance with the project loaded, no target launched.
-# Readiness is the instance's own listener (lsof, LISTEN on the port: no probe connection, no
-# fixed sleep); its pid is recorded (RD_PID) and kill_test_instances kills by it.
+# start_debugger <project>: a fresh private instance with the project loaded, no target launched, with
+# fresh logs (dbg_start: listener readiness, pid in RD_PID; wait_up: it answers `state`)
 start_debugger() {
-  kill_test_instances; rm -f $S/test.raddbg_user; rm -rf $S/logs
-  (nohup $RD $P --project:$1 --user:$S/test.raddbg_user --logs:$S/logs > $S/raddbg_stdout.txt 2>&1 &)
-  wait_listener && wait_up
+  kill_test_instances; rm -rf $S/logs
+  dbg_start "$1" && wait_up
 }
 # begin <scenario name> <executable> [arguments] [extra cfg]: fresh instance, launched and stopped at the entry point
 begin() {
   scenario=$1; echo "--- $scenario"
   rm -rf $S/logs
-  local proj=$(project "$1" "$2" "${3:-}" "${4:-}")
-  launch "$proj" >/dev/null || { check launch "launched" "launch failed"; return 1; }
+  write_project "$1" "$2" "${3:-}" "${4:-}"
+  launch "$S/$1.raddbg" >/dev/null || { check launch "launched" "launch failed"; return 1; }
   return 0
 }
-# run a command which makes the thread run and wait for the next stop; echoes the state
-go_cmd() { local st0=$(ipc state); local before=$(field "$st0" stop_count); before=${before:-0}; local depth_before=$(field "$st0" inline_depth); ipc "$@" >/dev/null; wait_stop $before ${depth_before:-x}; }
-run_stop() { go_cmd run; }
 # restart and wait for the new process to stop (the old process' exit also counts as a stop)
 restart_stop() {
   local before=$(field "$(ipc state)" stop_count); before=${before:-0}; ipc restart >/dev/null
   for i in $(seq 1 100); do st=$(ipc state); local sc=$(field "$st" stop_count); if [[ "$(field "$st" running)" == "0" && -n "$sc" && "$sc" -gt "$before" && "$(process_count "$st")" != "0" ]]; then echo "$st"; return 0; fi; sleep 0.1; done
   echo "$st"; return 1
 }
-# wait_exit: wait until no process is left (the target ran to its end); echoes the state
-wait_exit() { for i in $(seq 1 150); do st=$(ipc state); if [[ "$(field "$st" running)" == "0" && "$(process_count "$st")" == "0" ]]; then echo "$st"; return 0; fi; sleep 0.1; done; echo "$st"; return 1; }
-# wait_exit_or_stop <stop_count before>: the process ended, or a new stop happened; echoes the state
-wait_exit_or_stop() { for i in $(seq 1 150); do st=$(ipc state); local sc=$(field "$st" stop_count); if [[ "$(field "$st" running)" == "0" && ( "$(process_count "$st")" == "0" || ( -n "$sc" && "$sc" -gt "$1" ) ) ]]; then echo "$st"; return 0; fi; sleep 0.1; done; echo "$st"; return 1; }
-wait_running() { for i in $(seq 1 40); do [[ "$(field "$(ipc state)" running)" == "1" ]] && return 0; sleep 0.05; done; return 1; }
-# wait_gone <pid>: wait (up to 5 s) until a process is gone. NOTE: never `wait` for a background
-# process the debugger attached to: ptrace reparents it to the debugger, so the shell's `wait` blocks forever.
-wait_gone() { for i in $(seq 1 100); do kill -0 $1 2>/dev/null || return 0; sleep 0.05; done; return 1; }
-# finish: stop the instance (and keep its logs when asked)
+# finish: stop the instance (dbg_stop: exit, which flushes its logs, then kill by pid) and keep its logs when asked
 finish() {
+  dbg_stop
   if [[ -n ${FLOWS_KEEP_LOGS:-} ]]; then rm -rf "$S/logs_$scenario"; cp -R "$S/logs" "$S/logs_$scenario" 2>/dev/null; cp "$S/raddbg_stdout.txt" "$S/logs_$scenario/stdout.txt" 2>/dev/null; fi
-  kill_test_instances
 }
 # a source breakpoint by tag; echoes the breakpoint's cfg id ($xx)
-bp_tag() { ipc "add_breakpoint --file_path:$1:$(line_of $1 $2)" | grep -o '\$[0-9a-f]*' | head -1; }
+bp_tag() { ipc "add_breakpoint --file_path:$1:$(line_of_tag $1 $2)" | grep -o '\$[0-9a-f]*' | head -1; }
 # does a stop's innermost line match a tag? check_stop <check name> <state> <source> <tag>
 check_stop() { check "$1" "$(tag_loc $3 $4)" "$(stop_file_line "$2")"; }
 # a step into a function stops at its opening brace (the line of the prologue, as upstream does):
 # check_brace <check name> <state> <source> <tag of the first body line> expects `line - 1`
-brace_loc() { echo "$(basename $1):$(( $(line_of $1 $2) - 1 ))"; }
+brace_loc() { echo "$(basename $1):$(( $(line_of_tag $1 $2) - 1 ))"; }
 check_brace() { check "$1" "$(brace_loc $3 $4)" "$(stop_file_line "$2")"; }
 # count ctrl events of a kind in the ui thread log
 event_count() { grep -c "kind: \"$1\"" $S/logs/ui_thread.raddbg_log 2>/dev/null; }
@@ -215,7 +133,7 @@ scenario_attach_detach() {
   scenario=attach_detach; echo "--- $scenario"
   $B/basic_O0 spin > /dev/null 2>&1 &
   local target_pid=$!
-  start_debugger "$(project attach_detach $B/basic_O0 spin)" >/dev/null
+  write_project attach_detach $B/basic_O0 spin; start_debugger $S/attach_detach.raddbg >/dev/null
   local st=$(go_cmd "attach --pid:$target_pid")
   check attached_process "$target_pid" "$(process_ids "$st" | awk '{print $1}')"
   check attached_thread_count 1 "$(thread_count "$st")"
@@ -266,9 +184,9 @@ scenario_breakpoints_O0() {
   check_brace func_bp_line "$st" $D/basic.c libsystem_call
   ipc clear_breakpoints >/dev/null
   local n0=$(bp_count "$(ipc state)")
-  ipc "toggle_breakpoint --file_path:$D/basic.c:$(line_of $D/basic.c inner_body)" >/dev/null
+  ipc "toggle_breakpoint --file_path:$D/basic.c:$(line_of_tag $D/basic.c inner_body)" >/dev/null
   check toggle_add $(( n0 + 1 )) "$(bp_count "$(ipc state)")"
-  ipc "toggle_breakpoint --file_path:$D/basic.c:$(line_of $D/basic.c inner_body)" >/dev/null
+  ipc "toggle_breakpoint --file_path:$D/basic.c:$(line_of_tag $D/basic.c inner_body)" >/dev/null
   check toggle_remove "$n0" "$(bp_count "$(ipc state)")"
   local tmp_bp=$(bp_tag $D/basic.c inner_body)
   ipc "remove_cfg --cfg:$tmp_bp" >/dev/null
@@ -288,7 +206,7 @@ scenario_breakpoint_inline_O2() {
   check inline_bp_symbol "one_line_loop" "$(stop_symbol "$st")"
   check inline_bp_depth 2 "$(field "$st" inline_depth)"
   check_match inline_bp_stack '^square square_sum one_line_loop main ' "$(call_stack_symbols "$st")"
-  check inline_frame_lines "square@basic.c:$(line_of $D/basic.c inline_body)[2] square_sum@basic.c:$(line_of $D/basic.c inline_outer_call)[1] one_line_loop@basic.c:$(line_of $D/basic.c one_line_loop)[0]" "$(call_stack "$st" | head -3 | tr '\n' ' ' | sed 's/ $//')"
+  check inline_frame_lines "square@basic.c:$(line_of_tag $D/basic.c inline_body)[2] square_sum@basic.c:$(line_of_tag $D/basic.c inline_outer_call)[1] one_line_loop@basic.c:$(line_of_tag $D/basic.c one_line_loop)[0]" "$(call_stack "$st" | head -3 | tr '\n' ' ' | sed 's/ $//')"
   note "inlined parameter v at the first hit: '$(ev v)' (msgs: $(ev_msgs v)); at the second hit: '$(st=$(run_stop); ev v)'"
   check inline_bp_hit_count 2 "$(bp_hit_count "$(ipc state)" "$(bp_ids "$(ipc state)" | awk '{print $1}')")"
   finish
@@ -343,7 +261,7 @@ scenario_stepping_O0() {
   st=$(go_cmd step_over); check_stop into_tail_target "$st" $D/basic.c tail_target_body
   st=$(go_cmd step_out); check_stop out_of_tail_target "$st" $D/basic.c tail_call
   st=$(go_cmd step_out); check_stop out_of_tail_caller "$st" $D/basic.c main_tail
-  ipc "run_to_line --file_path:$D/basic.c:$(line_of $D/basic.c one_line_loop)" >/dev/null
+  ipc "run_to_line --file_path:$D/basic.c:$(line_of_tag $D/basic.c one_line_loop)" >/dev/null
   st=$(wait_stop $(field "$st" stop_count) 0); check_stop run_to_line "$st" $D/basic.c one_line_loop
   check run_to_line_sym "one_line_loop" "$(stop_symbol "$st")"
   st=$(go_cmd step_over); check_stop over_one_line_loop "$st" $D/basic.c one_line_after
@@ -386,7 +304,7 @@ scenario_stepping_O2() {
   begin stepping_O2 $B/basic_O2 || return
   bp_tag $D/basic.c main_tail >/dev/null
   local st=$(run_stop); check_stop at_main_tail "$st" $D/basic.c main_tail
-  st=$(go_cmd step_into); check_match into_tail_caller "basic.c:($(line_of $D/basic.c tail_caller_body)|$(( $(line_of $D/basic.c tail_caller_body) - 1 )))" "$(stop_file_line "$st")"
+  st=$(go_cmd step_into); check_match into_tail_caller "basic.c:($(line_of_tag $D/basic.c tail_caller_body)|$(( $(line_of_tag $D/basic.c tail_caller_body) - 1 )))" "$(stop_file_line "$st")"
   check into_tail_caller_sym "tail_caller" "$(stop_symbol "$st")"
   [[ "$(stop_file_line "$st")" == "$(brace_loc $D/basic.c tail_caller_body)" ]] && st=$(go_cmd step_over)
   check_stop into_tail_caller_body "$st" $D/basic.c tail_caller_body
@@ -398,7 +316,7 @@ scenario_stepping_O2() {
   st=$(run_stop); check_stop run_to_one_line "$st" $D/basic.c one_line_loop
   check one_line_depth 0 "$(field "$st" inline_depth)"
   st=$(go_cmd step_into)
-  check_match into_inlined_line "basic.c:($(line_of $D/basic.c inline_outer_call)|$(( $(line_of $D/basic.c inline_body) - 1 ))|$(line_of $D/basic.c inline_body))" "$(stop_selected_line "$st")"
+  check_match into_inlined_line "basic.c:($(line_of_tag $D/basic.c inline_outer_call)|$(( $(line_of_tag $D/basic.c inline_body) - 1 ))|$(line_of_tag $D/basic.c inline_body))" "$(stop_selected_line "$st")"
   check_match into_inlined_depth '^[12]$' "$(field "$st" inline_depth)"
   check into_inlined_sym "one_line_loop" "$(stop_symbol "$st")"
   check into_inlined_call_site "$(tag_loc $D/basic.c one_line_loop)" "$(stop_file_line_at "$st" 0)"
@@ -409,7 +327,7 @@ scenario_stepping_O2() {
   st=$(go_cmd step_over)
   check over_in_inlined_stays_in_function "one_line_loop" "$(stop_symbol "$st")"
   note "step over in the inlined code: depth $(field "$st" inline_depth), line $(stop_selected_line "$st")"
-  st=$(go_cmd step_out); check_match out_of_inlined "basic.c:($(line_of $D/basic.c one_line_loop)|$(line_of $D/basic.c one_line_after)|$(line_of $D/basic.c main_one_line))" "$(stop_selected_line "$st")"
+  st=$(go_cmd step_out); check_match out_of_inlined "basic.c:($(line_of_tag $D/basic.c one_line_loop)|$(line_of_tag $D/basic.c one_line_after)|$(line_of_tag $D/basic.c main_one_line))" "$(stop_selected_line "$st")"
   finish
 }
 
@@ -453,7 +371,7 @@ scenario_signal_handler() {
   note "stack in the handler: $(call_stack "$st" | tr '\n' ' ') modules: $(frame_modules "$st" | tr '\n' ' ')"
   st=$(go_cmd step_over); check_stop handler_step_over "$st" $D/signals.c handler_second
   check handler_hits 1 "$(ev g_handler_hits)"
-  st=$(go_cmd step_out); check_match handler_step_out "signals.c:($(line_of $D/signals.c raise_call)|$(line_of $D/signals.c raise_after))" "$(stop_file_line "$st")"
+  st=$(go_cmd step_out); check_match handler_step_out "signals.c:($(line_of_tag $D/signals.c raise_call)|$(line_of_tag $D/signals.c raise_after))" "$(stop_file_line "$st")"
   ipc run >/dev/null; st=$(wait_exit); check exit_code 0 "$(field "$st" last_exit_code)"
   finish
 }
@@ -465,7 +383,7 @@ scenario_longjmp() {
   local st=$(run_stop); check_stop jumper_bp "$st" $D/signals.c jumper_body
   st=$(go_cmd step_over); check_stop at_longjmp "$st" $D/signals.c longjmp_call
   st=$(go_cmd step_over)
-  check_match over_longjmp "signals.c:($(line_of $D/signals.c setjmp_line)|$(line_of $D/signals.c after_longjmp))" "$(stop_file_line "$st")"
+  check_match over_longjmp "signals.c:($(line_of_tag $D/signals.c setjmp_line)|$(line_of_tag $D/signals.c after_longjmp))" "$(stop_file_line "$st")"
   check over_longjmp_sym "do_setjmp" "$(stop_symbol "$st")"
   check over_longjmp_stack "do_setjmp main" "$(concrete_frames "$st" | head -2 | tr '\n' ' ' | sed 's/ $//')"
   ipc run >/dev/null; st=$(wait_exit); check exit_code 0 "$(field "$st" last_exit_code)"
@@ -768,7 +686,7 @@ scenario_watchpoint() {
   ipc "break_when_value_changes g_watched" >/dev/null
   st=$(ipc state); check watch_bp_count 2 "$(bp_count "$st")"
   st=$(run_stop)
-  check_match watch_hit1_line "basic.c:($(line_of $D/basic.c watch_write)|$(line_of $D/basic.c loop_body))" "$(stop_file_line "$st")"
+  check_match watch_hit1_line "basic.c:($(line_of_tag $D/basic.c watch_write)|$(line_of_tag $D/basic.c loop_body))" "$(stop_file_line "$st")"
   check watch_hit1_sym "loop_sum" "$(stop_symbol "$st")"
   check watch_hit1_value 0 "$(ev g_watched)"
   note "watch stop 1: ip=$(field "$st" ip) i=$(ev i) sum=$(ev sum) g_watched=$(ev g_watched)"
@@ -821,7 +739,7 @@ scenario_ipc_commands() {
   # chained commands: every command's output is in the one reply
   local out=$(ipc "eval 1+1; eval 2+2")
   check chained_eval_outputs 2 "$(echo "$out" | grep -c ' value:')"
-  out=$(ipc "add_breakpoint --file_path:$D/basic.c:$(line_of $D/basic.c main_loop); eval 3+3")
+  out=$(ipc "add_breakpoint --file_path:$D/basic.c:$(line_of_tag $D/basic.c main_loop); eval 3+3")
   check chained_bp_id_and_eval "1 1" "$(echo "$out" | grep -c '^\$[0-9a-f]') $(echo "$out" | grep -c ' value: "6"')"
   out=$(ipc "state; eval 4+4")
   check chained_state_and_eval "1 1" "$(echo "$out" | grep -c ' version:') $(echo "$out" | grep -c ' value: "8"')"
@@ -862,7 +780,7 @@ scenario_ipc_commands() {
 scenarios+=(ipc_transport)
 scenario_ipc_transport() {
   scenario=ipc_transport; echo "--- $scenario"
-  start_debugger "$(project ipc_transport $B/basic_O0)" >/dev/null
+  write_project ipc_transport $B/basic_O0; start_debugger $S/ipc_transport.raddbg >/dev/null
   # a command far longer than the listener's 4 KB recv chunk (1000 chained add_breakpoint, ~350 KB)
   # arrives whole: the server gathers the chunks by the header's size. the breakpoints name a
   # file with a 300-character name, so that `state` (which prints each location) grows past the
@@ -910,7 +828,7 @@ scenario_F1_inline_seq_O2() {
   st=$(go_cmd step_over)
   check F1_step_over_line "$(tag_loc $src main_next2)" "$(stop_selected_line "$st")"
   check F1_step_over_depth 0 "$(field "$st" inline_depth)"
-  check F1_step_over_frame "main@inline_flows.c:$(line_of $src main_next2)[0]" "$(call_stack "$st" | grep '\[0\]$' | head -1)"
+  check F1_step_over_frame "main@inline_flows.c:$(line_of_tag $src main_next2)[0]" "$(call_stack "$st" | grep '\[0\]$' | head -1)"
   note "F1 after step over: lines $(echo "$st" | sed -n '/^ lines:/,/^ threads:/p' | grep 'file_name\|line_num' | paste - - | awk -F'"' '{split($3,a,":"); gsub(/ /,"",a[2]); printf "%s:%s ", $2, a[2]}') stack: $(call_stack "$st" | tr '\n' ' ')"
   # F7: with a disassembly tab focused, a step into here executes one instruction (not just a frame change)
   local pc0=$(ev pc)
@@ -953,8 +871,8 @@ scenario_F3_inline_fresh_rdi() {
   local rdi=$B/inline_flows_O2.dSYM/Contents/Resources/DWARF/inline_flows_O2.rdi   # the converter writes next to the DWARF file it reads
   rm -f $rdi; rm -rf $S/logs
   check F3_rdi_deleted 0 "$(find $B -name 'inline_flows_O2*.rdi' | wc -l | tr -d ' ')"
-  start_debugger "$(project F3_inline_fresh_rdi $B/inline_flows_O2)" >/dev/null
-  ipc "add_breakpoint --file_path:$src:$(line_of $src main_next1)" >/dev/null
+  write_project F3_inline_fresh_rdi $B/inline_flows_O2; start_debugger $S/F3_inline_fresh_rdi.raddbg >/dev/null
+  ipc "add_breakpoint --file_path:$src:$(line_of_tag $src main_next1)" >/dev/null
   local st=$(go_cmd run)
   check F3_first_stop_is_breakpoint 1 "$(stop_explanation "$st" | grep -c breakpoint)"
   check F3_first_stop_selected_line "$(tag_loc $src main_next1)" "$(stop_selected_line "$st")"
@@ -1296,7 +1214,7 @@ scenario_D9_attach_kill9() {
   scenario=D9_attach_kill9; echo "--- $scenario"
   $B/basic_O0 spin >/dev/null 2>&1 &
   local tpid=$!
-  start_debugger "$(project D9_attach_kill9 $B/basic_O0 spin)" >/dev/null
+  write_project D9_attach_kill9 $B/basic_O0 spin; start_debugger $S/D9_attach_kill9.raddbg >/dev/null
   local st=$(go_cmd "attach --pid:$tpid")
   check D9_attached "$tpid" "$(process_ids "$st" | awk '{print $1}')"
   ipc run >/dev/null; wait_running
@@ -1450,7 +1368,7 @@ scenario_U5_tls_step_into() {
     st=$(go_cmd step_out)
     # the getter returns into the middle of the TLS line (its store follows the call), so a step
     # out lands on that line; one step over then reaches the next line
-    check_match U5_step_out_returns_to_caller "basic.c:($(line_of $D/basic.c main_tls)|$(line_of $D/basic.c main_static))" "$(stop_file_line "$st")"
+    check_match U5_step_out_returns_to_caller "basic.c:($(line_of_tag $D/basic.c main_tls)|$(line_of_tag $D/basic.c main_static))" "$(stop_file_line "$st")"
     check U5_step_out_sym "main" "$(stop_symbol "$st")"
     [[ "$(stop_file_line "$st")" == "$(tag_loc $D/basic.c main_tls)" ]] && st=$(go_cmd step_over)
     check_stop U5_next_line "$st" $D/basic.c main_static
@@ -1472,7 +1390,5 @@ for sc in "${selected[@]}"; do
   if typeset -f scenario_$sc >/dev/null; then scenario_$sc; else echo "unknown scenario: $sc"; fi
 done
 kill_test_instances
-echo
-echo "=== $pass_count passed, $fail_count failed in $(( $(date +%s) - start_time )) s"
-for f in "${failures[@]}"; do echo "  FAIL $f"; done
-exit $(( fail_count > 0 ))
+check_summary $start_time
+exit $?

@@ -17,21 +17,22 @@
 #
 # Settings: RADDBG, PORT_A (7603), PORT_B (7604), HARNESS_DIR, SLEEPER (a long-lived target
 # binary; built if missing).
+#
+# This proof drives two instances on two ports by hand and never through lib.sh's single-instance
+# dbg_start / ipc / wait_up: the routing under test is the client's, and every reply must be traced to
+# the instance it was addressed to. It takes from lib.sh only the binary, the scratch directory,
+# `field` and the listener lookup by port (lsof, LISTEN on the port: no connection).
 set -u
-RD=${RADDBG:-"$(cd "$(dirname ${(%):-%x})/../../.." && pwd)/build/raddbg"}
+source "$(cd "$(dirname ${(%):-%x})" && pwd)/lib.sh"
 PA=${PORT_A:-7603}
 PB=${PORT_B:-7604}
 # a scratch directory of our own is removed at exit; a HARNESS_DIR given by the caller is theirs
-if [[ -n ${HARNESS_DIR:-} ]]; then S=$HARNESS_DIR; else S=$(mktemp -d /tmp/raddbg_ipc_pid.XXXXXX); trap 'rm -rf "$S"' EXIT; fi
-mkdir -p $S
+remove_owned_harness_dir_at_exit
 SLEEPER=${SLEEPER:-"$S/sleeper"}
 # rd_ipc_port_from_pid (raddbg_main.c): a window of the registered range, 20000..39999
 port_from_pid() { echo $(( 20000 + ($1 % 20000) )); }
-field() { echo "$1" | grep -m1 " $2:" | awk '{print $2}'; }
-wait_listen() { local port=$1; for i in $(seq 1 400); do lsof -nP -iTCP:$port -sTCP:LISTEN 2>/dev/null | grep -q raddbg && return 0; sleep 0.05; done; return 1; }
+wait_listen() { local port=$1; for i in $(seq 1 400); do [[ -n "$(listener_pid $port)" ]] && return 0; sleep 0.05; done; return 1; }
 listens_on() { lsof -nP -iTCP:$2 -sTCP:LISTEN 2>/dev/null | grep -q " $1 "; }
-# the instances are found by their listeners (lsof, LISTEN on the port) and killed by pid
-listener_pid() { lsof -nP -iTCP:$1 -sTCP:LISTEN 2>/dev/null | awk 'NR>1 && $1 ~ /raddbg/ {print $2; exit}'; }
 # from_pid <expected pid> <reply>: the reply came from the expected instance. Every reply below is
 # checked this way: the user's own debugger (default port 7423, and its own pid-derived port) could
 # answer a misrouted command, and a reply from it must fail the proof, never pass it.

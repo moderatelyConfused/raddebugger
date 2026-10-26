@@ -4,7 +4,7 @@
 # (threads are told apart by id: thread names arrive with the run after the stop which gathered them)
 source "$(dirname ${(%):-%x})/common.sh"
 build_c thread_exit
-write_project thread_exit $S/thread_exit "" </dev/null
+write_project thread_exit $S/thread_exit ""
 launch $S/thread_exit.raddbg
 st0=$(ipc state)
 main_id=$(thread_ids "$st0" | head -1)

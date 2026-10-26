@@ -13,24 +13,16 @@
 # The script launches an instance, adds and runs a long-lived target (so there is
 # a live debuggee), confirms running==1 and the debuggee process exists, sends a
 # plain `exit` (must be refused, instance still alive), then `exit
-# --force_confirm:1`, and checks the instance process is gone shortly after (and
-# reports what happened to the debuggee).
+# --force_confirm:1`, and checks the instance process is gone shortly after, and
+# the debuggee with it.
 #
 # Settings: RADDBG, SLEEPER (a long-lived target binary; built if missing),
-# IPC_PORT (7607), HARNESS_DIR.
+# IPC_PORT (7607), HARNESS_DIR (see lib.sh: the instance, `ipc`, `field`).
 set -u
-ROOT="$(cd "$(dirname ${(%):-%x})/../../.." && pwd)"
-RD=${RADDBG:-"$ROOT/build/raddbg"}
-P=${IPC_PORT:-7607}
-# a scratch directory of our own is removed at exit; a HARNESS_DIR given by the caller is theirs
-if [[ -n ${HARNESS_DIR:-} ]]; then S=$HARNESS_DIR; else S=$(mktemp -d /tmp/raddbg_ipc_exit.XXXXXX); trap 'rm -rf "$S"' EXIT; fi
+export IPC_PORT=${IPC_PORT:-7607}
+source "$(cd "$(dirname ${(%):-%x})" && pwd)/lib.sh"
+remove_owned_harness_dir_at_exit
 SLEEPER=${SLEEPER:-"$S/sleeper"}
-mkdir -p $S
-ipc() { $RD --ipc_port:$P --ipc "$@" 2>&1; }
-field() { echo "$1" | grep -m1 " $2:" | awk '{print $2}'; }
-# the instance is found by its listener (lsof, LISTEN on the port) and killed by that pid
-listener_pid() { lsof -nP -iTCP:$P -sTCP:LISTEN 2>/dev/null | awk 'NR>1 && $1 ~ /raddbg/ {print $2; exit}'; }
-kill_port() { local pid=$(listener_pid); [[ -n "$pid" ]] && kill -9 $pid 2>/dev/null; }
 
 # build a long-lived debuggee if one was not provided
 if [[ ! -x "$SLEEPER" ]]; then
@@ -43,15 +35,13 @@ EOF
   SLEEPER="$S/sleeper"
 fi
 
-kill_port
-rm -f $S/u.raddbg_user
-($RD --ipc_port:$P --user:$S/u.raddbg_user --project:$S/p.raddbg --logs:$S/logs > $S/out.txt 2>&1 &)
-for i in $(seq 1 400); do lsof -nP -iTCP:$P -sTCP:LISTEN 2>/dev/null | grep -q raddbg && break; sleep 0.05; done
+# a fresh instance (dbg_start: an earlier one on the port is killed, readiness is the listener, the pid
+# is RD_PID), then the first `state` answered before the test's own commands
+dbg_start $S/p.raddbg || { echo "FAIL: no instance listens on $IPC_PORT"; exit 1; }
 (ipc state >/dev/null 2>&1 &)
-for i in $(seq 1 100); do ipc state | grep -q version && break; sleep 0.1; done
-PID=$(listener_pid)
+wait_up >/dev/null
+PID=$RD_PID
 echo "instance pid $PID"
-[[ -n "$PID" ]] || { echo "FAIL: no instance listens on $P"; exit 1; }
 
 ipc add_target "$SLEEPER" >/dev/null 2>&1
 ipc run >/dev/null 2>&1

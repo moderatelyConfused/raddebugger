@@ -6,7 +6,7 @@
 # round is pending" when it reports such a stop instead of resuming (counted for information).
 source "$(dirname ${(%):-%x})/common.sh"
 LDFLAGS_EXTRA="-lpthread" build_c bp_loop
-write_project bp_loop $S/bp_loop "" </dev/null
+write_project bp_loop $S/bp_loop ""
 launch $S/bp_loop.raddbg
 bp $DEMON_TESTS_DIR/src/bp_loop.c:$(line_of bp_loop "// bp_work")
 rounds=${BP_STRESS_ROUNDS:-200}

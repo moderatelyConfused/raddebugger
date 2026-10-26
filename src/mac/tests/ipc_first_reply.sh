@@ -8,31 +8,29 @@
 #
 # Settings: RADDBG (binary; default build/raddbg under the repo root),
 # IPC_PORT (default 7601, must be in 7600-7699), TRIALS (default 10),
-# HARNESS_DIR (scratch for the private user file / logs).
+# HARNESS_DIR (scratch for the private user file / logs; lib.sh).
+#
+# This proof starts its instance by hand and never through lib.sh's dbg_start / wait_up: nothing may
+# be sent to the instance before the timed first command (wait_up probes with `state`). It takes from
+# lib.sh only what sends nothing: the binary, the scratch directory, the listener readiness
+# (wait_listener: lsof, LISTEN on the port, no connection) and the kill by listener pid.
 set -u
-RD=${RADDBG:-"$(cd "$(dirname ${(%):-%x})/../../.." && pwd)/build/raddbg"}
-P=${IPC_PORT:-7601}
-N=${TRIALS:-10}
+export IPC_PORT=${IPC_PORT:-7601}
+source "$(cd "$(dirname ${(%):-%x})" && pwd)/lib.sh"
 # a scratch directory of our own is removed at exit; a HARNESS_DIR given by the caller is theirs
-if [[ -n ${HARNESS_DIR:-} ]]; then S=$HARNESS_DIR; else S=$(mktemp -d /tmp/raddbg_ipc_first_reply.XXXXXX); trap 'rm -rf "$S"' EXIT; fi
+remove_owned_harness_dir_at_exit
+N=${TRIALS:-10}
 LIMIT=${LIMIT:-1.0}
-mkdir -p $S
 now() { python3 -c 'import time;print(time.time())'; }
-# the instance is found by its listener (lsof, LISTEN on the port) and killed by that pid
-listener_pid() { lsof -nP -iTCP:$P -sTCP:LISTEN 2>/dev/null | awk 'NR>1 && $1 ~ /raddbg/ {print $2; exit}'; }
-kill_port() { local pid=$(listener_pid); [[ -n "$pid" ]] && kill -9 $pid 2>/dev/null; for i in $(seq 1 100); do [[ -z "$(listener_pid)" ]] && break; sleep 0.02; done; }
-# readiness via lsof (LISTEN) instead of nc -z: nc would itself be the first
-# connection and absorb the very bug under test.
-wait_listen() { for i in $(seq 1 600); do lsof -nP -iTCP:$P -sTCP:LISTEN 2>/dev/null | grep -q raddbg && return 0; sleep 0.05; done; return 1; }
 
 fails=0
 for trial in $(seq 1 $N); do
-  kill_port
+  kill_test_instances
   rm -f $S/u.raddbg_user; rm -rf $S/logs
-  ($RD --ipc_port:$P --user:$S/u.raddbg_user --project:$S/p.raddbg --logs:$S/logs > $S/stdout.txt 2>&1 &)
-  if ! wait_listen; then echo "trial $trial: instance never listened on $P"; fails=$((fails+1)); continue; fi
-  PID=$(listener_pid)
-  t0=$(now); out=$($RD --ipc_port:$P --ipc state 2>&1); t1=$(now)
+  ($RD $P --user:$S/u.raddbg_user --project:$S/p.raddbg --logs:$S/logs > $S/stdout.txt 2>&1 &)
+  if ! wait_listener >/dev/null; then echo "trial $trial: instance never listened on $IPC_PORT"; fails=$((fails+1)); continue; fi
+  PID=$RD_PID
+  t0=$(now); out=$($RD $P --ipc state 2>&1); t1=$(now)
   dt=$(python3 -c "print(round($t1-$t0,3))")
   ok=$(python3 -c "print('OK' if $t1-$t0 < $LIMIT else 'SLOW')")
   lines=$(echo "$out" | grep -c .)
@@ -40,7 +38,7 @@ for trial in $(seq 1 $N); do
   [[ "$ok" == "OK" && "$lines" -gt 1 ]] || fails=$((fails+1))
   kill -9 $PID 2>/dev/null; sleep 0.1
 done
-kill_port
+kill_test_instances
 echo "----"
 if [[ $fails -eq 0 ]]; then echo "PASS: all $N first commands answered in < ${LIMIT}s"; exit 0
 else echo "FAIL: $fails / $N trials failed"; exit 1; fi
