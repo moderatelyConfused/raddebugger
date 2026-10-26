@@ -132,6 +132,8 @@ struct D_Entity
   Arch arch;
   B32 is_frozen;
   B32 is_soloed;
+  B32 has_unreported_bp_hit; // ctrl thread only: sits on a user trap it hit; the hit is reported by a later run (dbg_engine_ctrl.c, d_ctrl_thread__run)
+  U64 unreported_bp_hit_vaddr;
   U32 rgba;
   D_Handle handle;
   U64 id;

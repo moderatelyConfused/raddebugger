@@ -93,20 +93,33 @@ bp_enabled() { echo "$1" | sed -n '/^ breakpoints:/,$p' | grep -A5 "id:  *\"\\$2
 bp_count() { echo "$1" | sed -n '/^ breakpoints:/,$p' | grep -c "   id:"; }
 bp_ids() { echo "$1" | sed -n '/^ breakpoints:/,$p' | grep "   id:" | cut -d'"' -f2 | tr '\n' ' '; }
 
-# eval helpers: value / type / msgs of an expression in the selected frame. NOTE: right after a
+# eval helpers: value / type / msgs of an expression in the selected frame. NOTE: `--ipc eval`
+# reports what the frontend has in that frame (see the TODO at RD_CmdKind_Eval): right after a
 # stop the symbol lookup can report "could not be found" for a short while (the debug info's
-# lookup tables are produced asynchronously); ev retries a few times before giving up.
+# lookup tables are produced asynchronously), and a value in memory the frontend has not read yet
+# prints as 0 until the asynchronous read lands (the eval waits a frame's spare time at most; the
+# frontend's own views read the stopping thread's frame at most stops, but not after a stop which
+# reports a hit held back from an earlier run, see README). ev_out retries the former and accepts
+# an answer only once two consecutive evaluations agree.
 ev_raw() { ipc eval "$@"; }
-ev() {
-  local out; for i in $(seq 1 15); do out=$(ipc eval "$@"); echo "$out" | grep -q "could not be found" || break; sleep 0.1; done
-  # the value is printed escaped (\" for quotes); unescape it
-  echo "$out" | grep -m1 " value:" | sed 's/^ value: *//' | sed 's/^"\(.*\)"$/\1/' | sed 's/\\"/"/g'
+ev_out() {
+  local out prev=""
+  for i in $(seq 1 15); do
+    out=$(ipc eval "$@")
+    if echo "$out" | grep -q "could not be found"; then prev=""; sleep 0.1; continue; fi
+    [[ -n "$prev" && "$out" == "$prev" ]] && break
+    prev=$out
+  done
+  echo "$out"
 }
-# warm_symbol <name>: evaluate a symbol name until the debug info search has resolved it (see the
-# README: expression breakpoints added while the process is live are resolved once, without waiting
-# for that search, so a function breakpoint on a not-yet-searched name never hits)
+ev() {
+  # the value is printed escaped (\" for quotes); unescape it
+  ev_out "$@" | grep -m1 " value:" | sed 's/^ value: *//' | sed 's/^"\(.*\)"$/\1/' | sed 's/\\"/"/g'
+}
+# warm_symbol <name>: evaluate a symbol name until the asynchronous debug info search has answered
+# for it; only for recording what a name evaluates to (the control thread waits for that search
+# itself when it resolves expression breakpoints, so no scenario needs it as a warm-up anymore)
 warm_symbol() { for i in $(seq 1 20); do ipc eval "$1" | grep -q "could not be found" || return 0; sleep 0.1; done; return 1; }
-ev_out() { local out; for i in $(seq 1 15); do out=$(ipc eval "$@"); echo "$out" | grep -q "could not be found" || break; sleep 0.1; done; echo "$out"; }
 ev_type() { ev_out "$@" | grep -m1 " type:" | sed 's/^ type: *//' | sed 's/^"\(.*\)"$/\1/'; }
 ev_msgs() { ev_out "$@" | grep -m1 " msgs:" | sed 's/^ msgs: *//' | sed 's/^"\(.*\)"$/\1/'; }
 
@@ -243,15 +256,10 @@ scenario_breakpoints_O0() {
   check addr_bp_i 4 "$(ev i)"
   check addr_bp_stack "loop_sum main" "$(concrete_frames "$st" | head -2 | tr '\n' ' ' | sed 's/ $//')"
   ipc clear_breakpoints >/dev/null
-  # a function breakpoint added while the process is live: without the warm-up it never resolves (bug, see README)
+  # a function breakpoint added while the process is live, on a name nothing has evaluated yet (the
+  # control thread must wait for the asynchronous debug info search to resolve it; see README)
   ipc "add_function_breakpoint libsystem_call" >/dev/null
   st=$(run_stop); check func_bp_cold_symbol "libsystem_call" "$(stop_symbol "$st")"
-  if [[ "$(process_count "$st")" == "0" ]]; then
-    note "the function breakpoint added without a prior lookup did not resolve; the process ran to its end (exit $(field "$st" last_exit_code)); relaunching with a warmed-up name"
-    warm_symbol libsystem_call
-    st=$(run_stop)
-  fi
-  check func_bp_symbol "libsystem_call" "$(stop_symbol "$st")"
   check_brace func_bp_line "$st" $D/basic.c libsystem_call
   ipc clear_breakpoints >/dev/null
   local n0=$(bp_count "$(ipc state)")
@@ -606,7 +614,7 @@ scenario_threads_breakpoints() {
     idxs="$idxs$(ev idx) "
   done
   check distinct_threads 4 "$(echo $tids | tr ' ' '\n' | sort -u | grep -c .)"
-  check worker_indices "0 1 2 3" "$(echo $idxs | tr ' ' '\n' | sort -n | tr '\n' ' ' | sed 's/ $//')"
+  check worker_indices "0 1 2 3" "$(echo $idxs | tr ' ' '\n' | grep . | sort -n | tr '\n' ' ' | sed 's/ $//')"
   check_match worker_stack '^worker_body worker ' "$(call_stack_symbols "$st")"
   check thread_count_at_stop 5 "$(thread_count "$st")"
   ipc run >/dev/null; st=$(wait_exit); check exit_code 0 "$(field "$st" last_exit_code)"
@@ -870,7 +878,6 @@ scenarios+=(F5b_bigframe_step_O2)
 scenario_F5b_bigframe_step_O2() {
   begin F5b_bigframe_step_O2 $B/bigframe_O2 || return
   local src=$D/bigframe.c
-  warm_symbol big_frame
   ipc "add_function_breakpoint big_frame" >/dev/null
   local st=$(run_stop); check F5b_at_entry "big_frame" "$(stop_symbol "$st")"
   check_stop F5b_entry_line "$st" $src big_first_line

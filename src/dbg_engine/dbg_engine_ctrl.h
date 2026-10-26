@@ -683,6 +683,7 @@ internal void d_ctrl_thread__close_dump_process(D_MsgID msg_id, D_Handle process
 internal D_RunCtrls *d_ctrl_thread__run_ctrls(Arena *arena);
 internal void d_ctrl_thread__run_ctrls_set_server(Arena *arena, D_RunCtrls *ctrls, D_ServerID server_id, DMN_RunCtrls *server_ctrls);
 internal DMN_RunCtrls *d_ctrl_thread__server_run_ctrls_from_id(D_RunCtrls *ctrls, D_ServerID server_id);
+internal D_ServerState *d_ctrl_thread__server_state_from_id(D_ServerID server_id);
 
 //- rjf: attached process running/event gathering
 internal DMN_Event *d_ctrl_thread__next_dmn_event(Arena *arena, DMN_CtrlCtx *ctrl_ctx, D_Msg *msg, DMN_RunCtrls *run_ctrls, D_Spoof *spoof);

@@ -467,15 +467,6 @@ without the stop, since the demon learns a non-child's exit status only from
 Consolidated from the sections below (each records its evidence); roughly by
 impact:
 
-* Function-name breakpoints added while a process is live are resolved once,
-  on the control thread, with `di_match_from_string(..., endt_us = 0)`: when
-  the asynchronous name search has not seen the name yet, the breakpoint
-  never gets a trap (`flows: breakpoints_O0/func_bp_cold_symbol`; evaluating
-  the name first works around it). Fix: a deadline in
-  `d_ctrl_thread__append_resolved_*_user_bp_traps`. Breakpoint hits on
-  several threads in one run are reported together by the demon, the engine
-  stops for the first and the resume answers the others with the traps
-  already removed, so their hits are lost (`threads_breakpoints`).
 * Shared-cache images are named from their exported symbols only: the
   per-image `LC_SYMTAB` in the cache keeps the `N_EXT` symbols (libsystem_c
   has 2268, `__swrite` and `_printf` among them); the locals (`__sflush`,
@@ -736,8 +727,15 @@ codes), plus `NOTE` lines for observations without a verdict.
   registers. Option values cannot contain spaces (`--string:i==3`).
 * Scripting caveats: right after a stop `eval` of a global can answer "`x`
   could not be found" for a few hundred milliseconds (`di_match_from_string`
-  searches the debug infos asynchronously and `eval` does not wait); the
-  runner's `ev` retries. `eval` over `--ipc` runs with `disable_addresses`:
+  searches the debug infos asynchronously and `eval` does not wait), and a
+  value in memory the frontend has not read yet prints as 0 until the
+  asynchronous page read lands (`eval` waits a frame's spare time at most,
+  see the TODO at `RD_CmdKind_Eval`; the frontend's own views read the
+  stopping thread's frame at an ordinary stop before a script gets to it, but
+  not at a stop which reports a breakpoint hit held back from an earlier run,
+  `threads_breakpoints` since the fix below); the runner's `ev` retries the
+  former and accepts an answer only once two consecutive evaluations agree.
+  `eval` over `--ipc` runs with `disable_addresses`:
   pointers print their pointee, address casts give 0, a function's address
   cannot be read (`&inner` prints the signature); use the stop's `ip` from
   `state`. Never `wait` on a shell background process the debugger attached
@@ -745,13 +743,16 @@ codes), plus `NOTE` lines for observations without a verdict.
 
 ### Results and findings (2026-10-25, this branch)
 
-Last full run (after merging `macos-arm64-port`): 310 checks passed, 74
-failed, 45 scenario runs in 338 s. Every failure below is a recorded bug or
-observation; scenarios fully passing include launch/kill/restart/exit, the
-breakpoint flows (line, inline line, dylib before load, address, condition,
-hit counts, toggle/remove), halt, eval, the frame-pointer-less call stack,
-freeze/thaw, modules (load/unload/reload), the Zig generator stepping and
-fiber stack, D7, D9, F3, F4a, F5a, F5b, U1, U2, U3.
+Last full run (with the breakpoint fixes below): 316 checks passed, 68
+failed, 45 scenario runs in 196 s (the same tree before them: 306 passed, 77
+failed; nothing that passed then fails now). Every failure below is a
+recorded bug or observation; scenarios fully passing include
+launch/kill/restart/exit, the breakpoint flows (line, inline line, dylib
+before load, address, condition, hit counts, toggle/remove, function name
+without a warm-up), the four simultaneous worker hits, watchpoint, halt,
+eval, the frame-pointer-less call stack, freeze/thaw, modules
+(load/unload/reload), the Zig generator stepping and fiber stack, D7, D9, F3,
+F4a, F5a, F5b, U1, U2, U3.
 
 Fixed here (the suite found them; the first and third were fixed independently
 on `macos-arm64-port` at the same time, and the merge kept that branch's
@@ -798,6 +799,34 @@ implementation):
   for the attached process with or without that stop (exit code 0: see "Status
   and open issues"), as do `fork/D2_exit_code_from_child` (0 instead of 7) and
   `D1_debuggee_ran_to_completion` on the pre-change binary too.
+* Function-name (expression) breakpoints added while a process was live never
+  got a trap when nothing had evaluated the name before
+  (`breakpoints_O0/func_bp_cold_symbol`, `F5b big_frame`, the Zig `range`):
+  the control thread resolves them through `e_eval_from_string`, whose
+  identifier lookup polled the asynchronous debug-info name search the
+  frontend's way, `di_match_from_string(..., endt_us = 0)`, and took "not seen
+  yet" as the answer. The eval base context now carries a deadline for those
+  lookups (`E_BaseCtx.dbgi_match_endt_us`, used by `eval_ir.c` and
+  `eval_parse.c`); the control thread's eval scope sets it (5 s per scope,
+  `d_ctrl_thread__eval_scope_begin`), so breakpoint expressions and conditions
+  wait for the search as they already waited for the RDIs, and the frontend
+  leaves it 0 as before. The runner's `warm_symbol` work-arounds are gone.
+* Breakpoint hits on several threads at once were lost but one: the demon
+  reports every thread's pending exception from one `dmn_ctrl_run` (four
+  `Breakpoint` events for the `threads_breakpoints` workers), the engine stops
+  for the first, and the other events stayed in its queue, where the next run's
+  single-step runs consumed them as noise while taking "stuck" threads off
+  their trap -- which the other hitters were, since arm64 reports a `brk` with
+  pc at the instruction (1 of 4 worker hits); an event reaching the run loop
+  instead would have carried a trap id into a released message. The end of a
+  run now drops the other threads' queued `Breakpoint` events and marks their
+  thread entities (`D_Entity.has_unreported_bp_hit`, `dbg_engine_ctrl.c`):
+  such a thread is not stepped off its trap, and the following runs report one
+  held-back hit each, through the regular breakpoint handling (conditions,
+  thread filters), before resuming anything; a hit whose breakpoint is gone, or
+  whose thread was moved, is dropped. The win32 demon gets the same hits one per
+  run from the kernel's queue; nothing changes for it. All four workers now stop
+  at the line, with all five threads alive at every stop.
 
 Policy, not bugs (the suite expects these):
 
@@ -819,21 +848,6 @@ Open, recorded with evidence by the suite (detach, fork, exec into a binary
 of our own, watchpoint attribution and other threads' call stacks have been
 fixed since by the demon and unwinder work and are not repeated here):
 
-* Expression (function-name) breakpoints added while a process is live are
-  resolved once, on the control thread, through `e_eval_from_string` ->
-  `di_match_from_string(..., endt_us = 0)`: when the asynchronous debug-info
-  search has not seen the name yet the breakpoint gets no trap and never hits
-  (`breakpoints_O0/func_bp_cold_symbol`; the Zig `range`, `F5b big_frame`
-  without the warm-up). Evaluating the name once before adding the breakpoint
-  works around it; the fix is a deadline for the ctrl thread's breakpoint
-  resolution (`dbg_engine_ctrl.c`,
-  `d_ctrl_thread__append_resolved_module_user_bp_traps` and
-  `..._process_user_bp_traps`).
-* Breakpoint hits on several threads at once: the demon reports every thread's
-  pending exception in one `dmn_ctrl_run` (four `Breakpoint` events in the
-  `threads_breakpoints` ctrl log), the engine stops for the first, and the
-  resume replies to all pending exceptions with the traps already removed, so
-  the other hits are lost (1 of 4 worker hits in the first launch).
 * Fixed by the merged dyld-notification work (recorded before the merge):
   only the executable and dyld were listed, dylib breakpoints never resolved
   and the TLS getter stopped in code without a module; after the merge
@@ -851,10 +865,13 @@ fixed since by the demon and unwinder work and are not repeated here):
   (`tests/dyld_module_events.sh`).
 * exec (`exec`, `D6`): `execv`/`execl` fail inside the debuggee (exit 5, the
   `perror` path; see the scenario's NOTE for errno).
-* Watchpoints (`watchpoint`, `D8`): consecutive stops report the same ip and
-  lag the write (stop 2 shows the value before the store, stop 3 after it, in
-  the same iteration). (The missing attribution to the user breakpoint,
-  `user_data`, is fixed by the demon work; `tests/demon/watchpoint.sh`.)
+* Watchpoints (`D8`): the condition is not honored (the stop comes at the
+  first write, `D8_condition_honored_*`). The values the `watchpoint` scenario
+  saw lagging the write by one stop were the scripting caveat above (an
+  `eval` answered from a page whose refresh had not landed), not the stops:
+  with `ev` waiting for two agreeing answers the scenario passes. (The missing
+  attribution to the user breakpoint, `user_data`, is fixed by the demon work;
+  `tests/demon/watchpoint.sh`.)
 * Step out of a signal handler runs to the process' end
   (`signal_handler/handler_step_out`); a step over `longjmp` as well
   (`longjmp`; gdb/lldb stop after `setjmp`).
