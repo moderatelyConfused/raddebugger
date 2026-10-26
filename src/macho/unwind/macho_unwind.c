@@ -153,13 +153,18 @@ macho_uwnd_step(Arch arch, MemoryMap *memory_map, UWND_ModuleInfo *module_info, 
   }
   ARM64_RegBlock *r = (ARM64_RegBlock *)regs;
   U64 pc = r->pc;
-  U64 voff = pc - module_info->base_vaddr;
   
-  //- rjf: look up the compact encoding for this pc
+  //- rjf: look up the compact encoding for this pc. An outer frame's pc is the
+  // return address of a call: the call itself (pc-1) belongs to the function
+  // (the return address may not, after a call which does not return), and the
+  // code at pc has not run, so there is no prologue / epilogue state to detect.
+  B32 analyze_code = (!module_info->pc_is_return_address && !module_info->pc_code_unreadable);
+  U64 lookup_voff = pc - module_info->base_vaddr - (module_info->pc_is_return_address ? 1 : 0);
   U32 encoding = 0;
   U64 function_voff = 0;
-  B32 found = macho_uwnd_encoding_from_voff(info, voff, &encoding, &function_voff);
+  B32 found = macho_uwnd_encoding_from_voff(info, lookup_voff, &encoding, &function_voff);
   U32 mode = encoding & MACHO_UWND_ARM64_MODE_MASK;
+  U64 function_vaddr = (encoding & MACHO_UWND_IS_NOT_FUNCTION_START) ? 0 : module_info->base_vaddr + function_voff;
   
   //- rjf: DWARF mode -> use the FDE referenced from the encoding
   B32 done = 0;
@@ -175,14 +180,26 @@ macho_uwnd_step(Arch arch, MemoryMap *memory_map, UWND_ModuleInfo *module_info, 
       // at the (still intact) frame record then restores everything correctly. If
       // the row is not fp-based after all, fall back to the code's answer.
       U64 code_cfa = 0;
-      B32 in_epilogue = (uwnd_arm64_code_state_from_pc(memory_map, module_info->base_vaddr + function_voff, pc, r->sp, &code_cfa) == UWND_ARM64_CodeState_Epilogue);
+      Rng1U64 code_missed = {0};
+      UWND_ARM64_CodeState code_state = UWND_ARM64_CodeState_Body;
+      if(analyze_code)
+      {
+        code_state = uwnd_arm64_code_state_from_pc(memory_map, function_vaddr, pc, r->sp, &code_cfa, &code_missed);
+      }
+      if(code_state == UWND_ARM64_CodeState_NeedRead)
+      {
+        result.status = UWND_StepStatus_FailedMemoryRead;
+        result.missed_read_vaddr_range = code_missed;
+        return result;
+      }
+      B32 in_epilogue = (code_state == UWND_ARM64_CodeState_Epilogue);
       ARM64_RegBlock entry_regs = *r;
       if(in_epilogue)
       {
         r->fp = code_cfa - 16;
       }
       U64 cfi_cfa = 0;
-      result = eh_uwnd_step_from_fde_vaddr(arch, memory_map, &info->ptr_ctx, fde_vaddr, tls_vaddr, regs, &cfi_cfa);
+      result = eh_uwnd_step_from_fde_vaddr(arch, memory_map, &info->ptr_ctx, fde_vaddr, tls_vaddr, regs, module_info->pc_is_return_address, &cfi_cfa);
       done = (result.status != UWND_StepStatus_Error);
       if(done && in_epilogue && (result.status != UWND_StepStatus_Good || cfi_cfa != code_cfa))
       {
@@ -247,8 +264,19 @@ macho_uwnd_step(Arch arch, MemoryMap *memory_map, UWND_ModuleInfo *module_info, 
     B32 restore_saved_regs = 1;
     B32 unwind_via_frame_record = 0;
     U64 code_cfa = 0;
-    UWND_ARM64_CodeState code_state = uwnd_arm64_code_state_from_pc(memory_map, module_info->base_vaddr + function_voff, pc, r->sp, &code_cfa);
-    if(code_state == UWND_ARM64_CodeState_Prologue)
+    Rng1U64 code_missed = {0};
+    UWND_ARM64_CodeState code_state = UWND_ARM64_CodeState_Body;
+    if(analyze_code)
+    {
+      code_state = uwnd_arm64_code_state_from_pc(memory_map, function_vaddr, pc, r->sp, &code_cfa, &code_missed);
+    }
+    if(code_state == UWND_ARM64_CodeState_NeedRead)
+    {
+      result.status = UWND_StepStatus_FailedMemoryRead;
+      result.missed_read_vaddr_range = code_missed;
+      return result;
+    }
+    else if(code_state == UWND_ARM64_CodeState_Prologue)
     {
       cfa = code_cfa;
       restore_saved_regs = 0;
@@ -263,6 +291,10 @@ macho_uwnd_step(Arch arch, MemoryMap *memory_map, UWND_ModuleInfo *module_info, 
       U64 fp = r->fp;
       if(fp == 0)
       {
+        // rjf: no frame record -> the outermost frame
+        r->pc = 0;
+        if(cfa_out) { cfa_out[0] = r->sp; }
+        result.status = UWND_StepStatus_Good;
         return result;
       }
       cfa = fp + 16;
@@ -344,7 +376,7 @@ macho_uwnd_step(Arch arch, MemoryMap *memory_map, UWND_ModuleInfo *module_info, 
   //- rjf: no usable compact info -> frame pointer chain
   if(!done)
   {
-    result = uwnd_step_moduleless(arch, memory_map, regs);
+    result = uwnd_step_moduleless(arch, memory_map, module_info, regs);
     if(result.status == UWND_StepStatus_Good && cfa_out)
     {
       cfa_out[0] = r->sp;

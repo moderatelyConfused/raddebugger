@@ -84,12 +84,54 @@ bundled with Zig: `zig cc -target aarch64-macos -fsyntax-only ...`).
   stepping into a call, or a `ret`. `uwnd_arm64_code_state_from_pc`
   (`unwind/unwind.c`) replays the prologue instructions from the function
   start (or, without a known start, recognizes a frame setup ahead of pc) and
-  scans ahead for a return through the remaining stack pops; in those states
-  the return address is `lr`, the caller's `fp` is still in `fp`, and only
-  the entry stack pointer is computed from the code. In DWARF mode the CFI row
-  is evaluated with `fp` pointed back at the intact frame record, so that the
-  callee-saved registers are restored from their slots as usual. Verified on a
-  Linux host against the prologues and epilogues of a Zig-built arm64 binary.
+  scans ahead for a return; in those states the return address is `lr`, the
+  caller's `fp` is still in `fp`, and only the entry stack pointer is computed
+  from the code. In DWARF mode the CFI row is evaluated with `fp` pointed back
+  at the intact frame record, so that the callee-saved registers are restored
+  from their slots as usual.
+* The analysis reads the code through the unwind's `MemoryMap`, which the
+  engine fills on demand: when the window around pc (`[pc-128, pc+128)`,
+  clamped to pc's page, always including a known function start) is not in
+  the map yet, the analysis reports `UWND_ARM64_CodeState_NeedRead` and the
+  unwinders return `UWND_StepStatus_FailedMemoryRead` with that range; the
+  engine reads it and retries the step (one extra round trip for the stopped
+  frame). Before this the reads silently failed and every pc looked like a
+  function body, so the frame-pointer rule was applied at a `ret` or in a
+  prologue and the caller's frame went missing (step out then overshot by a
+  frame).
+* The forward scan treats every instruction which can be shown not to write
+  `sp`, `x29` or `x30` as transparent (`uwnd_arm64_code_is_frame_neutral`),
+  lets conditional branches fall through, and stops at calls, traps, frame
+  record restores, pushes and unknown instructions. Reaching `ret` that way
+  means `lr` is intact and the entry `sp` is `sp` plus the pops passed, which
+  also covers frameless leaves that never store a frame record (dyld's
+  `_tlv_get_addr`, which every Zig `threadlocal` access calls): a step into
+  such a line now shows the caller as frame 1, and step out returns to it. A
+  `b`/`br` right after the frame record pop (or any stack pop) is a tail call.
+  The prologue replay is relaxed the same way, so argument moves between the
+  stack adjustment and the stores do not end it.
+* Outer frames hold return addresses. `UWND_ModuleInfo.pc_is_return_address`
+  (set by the engine for every frame but the first) makes the module lookup,
+  the `__unwind_info` lookup, the FDE search and the CFI row selection use
+  `pc-1`, the call's own address, and skips the code analysis (the code at a
+  return address has not run). Without it a function ending in a call to a
+  noreturn function was attributed to the function that follows it in the
+  binary, and the unwind stopped there. A CIE with the `S` augmentation marks
+  a signal trampoline: `UWND_StepResult.is_signal_frame` is surfaced so the
+  engine does not treat the frame above it as a return address.
+* The end of a frame-pointer chain (`fp == 0`) is the outermost frame (pc 0,
+  a good step) rather than an error, in both the compact-frame rule and the
+  moduleless unwinder, and the engine keeps the frames it has when an outer
+  frame's step fails or needs memory it cannot read; a thread blocked in
+  `sleep` shows `__semwait_signal` up to `thread_start`. When the code at the
+  *stopped* pc cannot be read at all (a call through a bad pointer),
+  `pc_code_unreadable` is set and the moduleless unwinder treats the stop as
+  the callee's first instruction (return address in `lr`), as lldb does.
+* Decoder: `stp`/`ldp` to `[sp]` are recognized by `(code & 0x3a000000) ==
+  0x28000000` (bit 25 clear); the old mask also matched logical
+  shifted-register ops with `Rn = xzr`, so `mov xN, xM` counted as a 16-byte
+  pair store. `src/mac/tests/unwind_arm64_test.c` checks the decoder and the
+  analysis on hand-assembled sequences (build line in its header).
 
 ## Display scaling
 
@@ -275,11 +317,18 @@ Open:
   return address (`lr`, or `[sp]` on x64) and keep stepping" (the module ->
   `d_dbgi_key_from_module` -> `di_rdi_from_key` -> `rdi_line_info_idx_from_voff`
   lookup is available on that thread). A UI-level "step out, then resume the
-  step into" was tried and removed: at the first instruction of a frameless
-  function without known unwind info the unwinder falls back to the frame
-  pointer chain and skips the callee's frame, so the step out returned one
-  frame too far (`range` -> `entryPoint`). That unwinder weakness is itself
-  worth fixing (prefer `lr` when nothing was pushed yet).
+  step into" was tried and removed when the unwinder still skipped the
+  caller of a frameless function (fixed since, see "Unwinding": the step out
+  from `_tlv_get_addr` returns to the caller now).
+* Frame names of outer frames come from the raw return address (the UI and
+  `d_call_stack_from_unwind` look symbols and scopes up at pc, not pc-1), so
+  a frame whose call does not return (`fn a() void { @panic("x"); }`) is
+  named after the function which follows it in the binary; the unwind itself
+  is right (its callers are found).
+* Call stacks are artifacts computed asynchronously: the first `--ipc eval`
+  of another thread's frame (`query:threads[1].call_stack[0].address`) can
+  come back empty ("Could not find a member named `address`") while the
+  stack is being built; the same query a moment later answers.
 * `step_out` from an inlined function steps out of the concrete function; it
   could use the selected inline site's ranges (`step_out_scope` already works
   from scope ranges).
