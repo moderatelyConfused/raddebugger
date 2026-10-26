@@ -48,13 +48,36 @@ struct UWND_ModuleInfo
 typedef enum UWND_ARM64_CodeState
 {
   UWND_ARM64_CodeState_Body,     // the function's frame is established; the regular unwind rule applies
-  UWND_ARM64_CodeState_Prologue, // before the frame is set up: lr holds the return address, fp the caller's fp
-  UWND_ARM64_CodeState_Epilogue, // after the frame record was restored: lr holds the return address, fp the caller's fp
-  UWND_ARM64_CodeState_NeedRead, // the code around pc is not in the memory map; *missed_out is the range to read
+  UWND_ARM64_CodeState_Prologue, // before the frame is set up: lr holds the return address, fp the caller's fp, and no callee-saved register has been modified
+  UWND_ARM64_CodeState_Epilogue, // after the frame record was restored: lr holds the return address, fp the caller's fp; the callee-saved registers whose pops still lie ahead come from their slots (`pending`)
+  UWND_ARM64_CodeState_NeedRead, // the code around pc is not in the memory map; `missed` is the range to read
 }
 UWND_ARM64_CodeState;
+
+// rjf: a callee-saved register which an epilogue has still to restore, and its stack slot
+typedef struct UWND_ARM64_RegSlot UWND_ARM64_RegSlot;
+struct UWND_ARM64_RegSlot
+{
+  U32 reg;   // 19-28: xN; 32+8 - 32+15: vN (the low 64 bits)
+  U64 vaddr; // the 8-byte slot
+};
+
+typedef struct UWND_ARM64_Analysis UWND_ARM64_Analysis;
+struct UWND_ARM64_Analysis
+{
+  UWND_ARM64_CodeState state;
+  U64 cfa;                        // Prologue / Epilogue: the entry stack pointer
+  Rng1U64 missed;                 // NeedRead: the range to read
+  U64 pending_count;              // Epilogue: the registers still to be restored by the code ahead of pc
+  UWND_ARM64_RegSlot pending[18]; // x19-x28 and d8-d15 at most
+};
+
 internal U64 uwnd_arm64_stub_inst_count_from_code(U32 *code, U64 count);
+internal UWND_ARM64_Analysis uwnd_arm64_analysis_from_pc(MemoryMap *memory_map, U64 function_vaddr, U64 pc, U64 sp);
 internal UWND_ARM64_CodeState uwnd_arm64_code_state_from_pc(MemoryMap *memory_map, U64 function_vaddr, U64 pc, U64 sp, U64 *cfa_out, Rng1U64 *missed_out);
+internal UWND_ARM64_Analysis uwnd_arm64_analysis_from_module_info(MemoryMap *memory_map, UWND_ModuleInfo *module_info, U64 function_vaddr, ARM64_RegBlock *regs);
+internal UWND_StepResult uwnd_arm64_restore_pending(MemoryMap *memory_map, ARM64_RegBlock *regs, UWND_ARM64_Analysis *analysis);
+internal UWND_StepResult uwnd_arm64_step_frame_chain(MemoryMap *memory_map, ARM64_RegBlock *regs, UWND_ARM64_Analysis *analysis);
 #endif
 
 ////////////////////////////////
