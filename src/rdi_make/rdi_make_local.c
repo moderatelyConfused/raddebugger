@@ -3240,7 +3240,7 @@ rdim_bake(Arena *arena, RDIM_BakeParams *params)
           for EachInRange(n_idx, range)
           {
             RDIM_Symbol *s = &n->v[n_idx];
-            if(s->location_cases.count > 1)
+            if(rdim_location_case_list_needs_set(&s->location_cases))
             {
               lane_chunk_set_element_counts[slot_idx] += s->location_cases.count;
             }
@@ -3391,7 +3391,8 @@ rdim_bake(Arena *arena, RDIM_BakeParams *params)
             // rjf: fill location set info, if applicable - get set elements to fill
             RDI_LocationSetElement *dst_loc_set_elements = loc_set_elements + dst_set_element_idx; 
             U64 dst_loc_set_elements_count = 0;
-            if(src->location_cases.count > 1)
+            B32 location_is_set = rdim_location_case_list_needs_set(&src->location_cases);
+            if(location_is_set)
             {
               dst->location |= (((U64)RDI_LocationKind_Set) << RDI_Location_KindShift);
               dst->location |= ((src->location_cases.count << RDI_Location_SetCountShift) & RDI_Location_SetCountMask);
@@ -3401,7 +3402,7 @@ rdim_bake(Arena *arena, RDIM_BakeParams *params)
             }
             
             // rjf: fill virtual offset ranges of location set elements
-            if(src->location_cases.count > 1)
+            if(location_is_set)
             {
               U64 loc_set_element_idx = 0;
               for EachNode(c, RDIM_LocationCase, src->location_cases.first)

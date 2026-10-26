@@ -1915,7 +1915,7 @@ di_match_artifact_create(String8 key, B32 *cancel_signal, AC_Status *status_out,
 }
 
 internal DI_Match
-di_match_from_string(String8 string, U32 match_index, U32 unit_idx, B32 allow_other_dbgis, DI_Key preferred_dbgi_key, U64 endt_us)
+di_match_from_string_flags(String8 string, U32 match_index, U32 unit_idx, B32 allow_other_dbgis, DI_Key preferred_dbgi_key, U64 endt_us, AC_Flags flags)
 {
   DI_Match result = {0};
   Access *access = access_open();
@@ -1931,7 +1931,11 @@ di_match_from_string(String8 string, U32 match_index, U32 unit_idx, B32 allow_ot
     String8 key = str8_list_join(scratch.arena, &key_parts, 0);
     U64 dbgi_count = di_load_count();
     B32 wide = (dbgi_count > 256 && allow_other_dbgis);
-    AC_Artifact artifact = ac_artifact_from_key(access, key, di_match_artifact_create, 0, endt_us, .flags = wide ? AC_Flag_Wide : 0, .gen = di_load_gen(), .evict_threshold_us = wide ? 20000000 : 10000000);
+    // NOTE: the match is computed over the RDIs as they are at the time (`di_match_artifact_create`
+    // does not wait for one being converted); a later load makes it stale, and a stale match is
+    // handed out as it is while a fresh one is computed, unless the caller asks to wait for the
+    // fresh one (AC_Flag_WaitForFresh, within endt_us).
+    AC_Artifact artifact = ac_artifact_from_key(access, key, di_match_artifact_create, 0, endt_us, .flags = (wide ? AC_Flag_Wide : 0) | flags, .gen = di_load_gen(), .evict_threshold_us = wide ? 20000000 : 10000000);
     result.key.u64[0]   = artifact.u64[0];
     result.key.u64[1]   = artifact.u64[1];
     result.section_kind = artifact.u64[2];
@@ -1940,5 +1944,12 @@ di_match_from_string(String8 string, U32 match_index, U32 unit_idx, B32 allow_ot
   }
   scratch_end(scratch);
   access_close(access);
+  return result;
+}
+
+internal DI_Match
+di_match_from_string(String8 string, U32 match_index, U32 unit_idx, B32 allow_other_dbgis, DI_Key preferred_dbgi_key, U64 endt_us)
+{
+  DI_Match result = di_match_from_string_flags(string, match_index, unit_idx, allow_other_dbgis, preferred_dbgi_key, endt_us, 0);
   return result;
 }

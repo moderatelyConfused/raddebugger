@@ -56,6 +56,37 @@ build inline_rec_O2 "$src/inline_rec.c" -O2
 build inl_main_O2   "$src/inl_main.c"   -O2 -I"$src"
 build bigframe_O2   "$src/bigframe.c"   -O2
 build noreturn_O2   "$src/noreturn.c"   -O2
+# large debug info (bp_resolution_converting): 20k functions and struct types, ~19 MB of DWARF,
+# so that the debugger converts it for a few seconds at launch; the source is generated here
+gen_big_symbols() # <source path> <function count> <members per struct>
+{
+  local src=$1 n=$2 m=$3 i j
+  {
+    echo '#include <unistd.h>'
+    echo '#include <stdio.h>'
+    echo 'volatile int g_sink;'
+    for ((i = 1; i <= n; i++)); do
+      printf 'typedef struct Big%d { ' $i
+      for ((j = 1; j <= m; j++)); do printf 'int a%d_%d; double b%d_%d; ' $i $j $i $j; done
+      printf 'struct Big%d *next; char name[%d]; } Big%d;\n' $i $(( (i % 7) + 4 )) $i
+      printf '__attribute__((noinline)) int big_fn_%d(Big%d *p, int q) { ' $i $i
+      for ((j = 1; j <= m; j++)); do printf 'int local_%d_%d = p->a%d_%d + q + %d; ' $i $j $i $j $j; done
+      printf 'Big%d tmp = *p; tmp.a%d_1 += local_%d_1; g_sink = tmp.a%d_1' $i $i $i $i
+      for ((j = 2; j <= m; j++)); do printf ' + local_%d_%d' $i $j; done
+      printf '; return tmp.a%d_1 + (int)tmp.b%d_1; }\n' $i $i
+    done
+    echo 'int main(int argc, char **argv) {'
+    echo '  int spin = argc > 1;'
+    echo '  Big1 b1 = {0};'
+    echo '  for(int i = 0; i < (spin ? 30000 : 3); i += 1) { g_sink += big_fn_1(&b1, i); usleep(1000); } // @big_loop'
+    printf '%s\n' '  printf("big done %d\n", g_sink);'
+    echo '  return 0;'
+    echo '}'
+  } > "$src"
+}
+echo "[big_symbols.c (generated)]"
+gen_big_symbols "$out/big_symbols.c" 20000 6
+build big_symbols "$out/big_symbols.c" -O0
 # -O2 without frame pointers (call stack through compact-unwind / eh_frame only)
 echo "[basic_O2_nofp]"
 $cc -g -O2 -fomit-frame-pointer -Wall -c -o "$out/obj/basic_O2_nofp.o" "$src/basic.c"

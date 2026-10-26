@@ -1436,6 +1436,7 @@ RDI_PROC void rdim_bytecode_push_convert(RDIM_Arena *arena, RDIM_EvalBytecode *b
 RDI_PROC void rdim_bytecode_concat_in_place(RDIM_EvalBytecode *left_dst, RDIM_EvalBytecode *right_destroyed);
 RDI_PROC B32 rdim_is_bytecode_tls_dependent(RDIM_EvalBytecode bytecode);
 RDI_PROC void rdim_location_case_list_push(RDIM_Arena *arena, RDIM_LocationCaseList *cases, RDIM_Location loc, RDIM_Rng1U64 range);
+RDI_PROC RDI_S32 rdim_location_case_list_needs_set(RDIM_LocationCaseList *cases);
 
 ////////////////////////////////
 //~ rjf: [Building] Scope Info Building

@@ -3782,6 +3782,7 @@ d_ctrl_thread__eval_scope_begin(Arena *arena, D_BreakpointList *user_bps, D_Enti
   D_EntityCtx *entity_ctx = &d_ctrl_state->ctrl_thread_entity_store->ctx;
   D_EvalScope *scope = push_array(arena, D_EvalScope, 1);
   scope->access = access_open();
+  U64 scope_begin_us = now_time_us();
   
   //////////////////////////////
   //- rjf: unpack thread
@@ -3805,6 +3806,7 @@ d_ctrl_thread__eval_scope_begin(Arena *arena, D_BreakpointList *user_bps, D_Enti
   E_DbgInfo *eval_dbg_infos_primary = &e_dbg_info_nil;
   E_String2NumMap *eval_dbg_info_from_name_map = push_array(arena, E_String2NumMap, 1);
   eval_dbg_info_from_name_map[0] = e_string2num_map_make(arena, eval_dbg_infos_count*2);
+  B32 some_rdi_converting = 0;
   {
     U64 eval_module_idx = 0;
     U64 eval_dbg_info_idx = 0;
@@ -3916,6 +3918,12 @@ d_ctrl_thread__eval_scope_begin(Arena *arena, D_BreakpointList *user_bps, D_Enti
           {
             rdi = di_rdi_from_key(scope->access, dbgi_key, 1, max_U64);
           }
+
+          //- rjf: an RDI still being converted (bounds the name match deadline below)
+          if(rdi == &di_rdi_parsed_nil_waiting)
+          {
+            some_rdi_converting = 1;
+          }
           
           //- rjf: fill debug info
           String8 debug_info_path = d_entity_child_from_kind(mod, D_EntityKind_DebugInfoPath)->string;
@@ -3971,9 +3979,18 @@ d_ctrl_thread__eval_scope_begin(Arena *arena, D_BreakpointList *user_bps, D_Enti
     //- rjf: fill name match deadline. names in expression breakpoints and conditions are
     // resolved through the asynchronous debug info search, which the frontend only ever polls;
     // this thread has waited for the RDIs above, so it waits for the search too (a trap for a
-    // name the search has not seen yet would otherwise never be placed). the budget is per
-    // scope; it is only ever reached with the async workers swamped.
-    ctx->dbgi_match_endt_us = now_time_us() + 5000000;
+    // name the search has not seen yet would otherwise never be placed), and for a fresh
+    // search when the one it has predates the last debug info load (a name whose RDI finished
+    // converting since would otherwise resolve one run late). the deadline is one absolute
+    // time per scope: every lookup waits until the same instant, so a condition with several
+    // unknown names pays the budget once, not once per name. the search itself never waits for
+    // a conversion (`di_match_artifact_create` takes the RDIs as they are, and conversions run
+    // in `radbin` processes, not on the async workers), so the budget is only ever reached with
+    // the async workers swamped; while some module's RDI is still converting it is short, since
+    // names in that RDI cannot be found yet anyway, and every run of a program whose debug info
+    // is being converted would otherwise risk the long wait.
+    ctx->dbgi_match_endt_us = scope_begin_us + (some_rdi_converting ? 1000000 : 5000000);
+    ctx->dbgi_match_wait_for_fresh = 1;
     
     //- rjf: fill debug infos
     ctx->dbg_infos        = eval_dbg_infos;

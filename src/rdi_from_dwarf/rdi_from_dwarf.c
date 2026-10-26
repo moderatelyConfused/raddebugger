@@ -4056,11 +4056,28 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
                         is_tls_dependent = 1;
                       }break;
                       
-                      //- rjf: call site value
+                      //- rjf: call site value: the value a register had at the function's
+                      // entry. the debugger cannot recover it (it would take the caller's
+                      // call site parameter info), so the location case is dropped (see
+                      // dst_bytecode_is_good): the variable reads as having no location in
+                      // this range, instead of reading as 0 from an empty bytecode stream.
+                      // clang emits it for arguments after their register was reused
+                      // (`DW_OP_entry_value(DW_OP_reg0), DW_OP_stack_value`).
                       case DW_ExprOp_EntryValue:
                       case DW_GNU_ExprOp_EntryValue:
                       {
-                        // TODO(rjf): expr op entry value ops
+                        dst_bytecode_is_good = 0;
+                        log_infof("[.debug_info@0x%I64x] DWARF expression entry value operation encountered. This is not supported for location info.\n", start_off);
+                      }break;
+
+                      //- rjf: the top of the stack is the object's value, not its address
+                      // (`DW_OP_consts 10, DW_OP_stack_value`, `DW_OP_breg29 -8, DW_OP_stack_value`)
+                      case DW_ExprOp_StackValue:
+                      {
+                        if(val_stack_top != 0)
+                        {
+                          val_stack_top->v.is_addr = 0;
+                        }
                       }break;
                       
                       //- rjf: fixed adds
@@ -4325,8 +4342,14 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
                       voff_range.min = Max(voff_range.min, framebase_voff_range.min);
                       voff_range.max = Min(voff_range.max, framebase_voff_range.max);
                     }
-                    rdim_location_case_list_push(arena, dst_locations, loc, voff_range);
-                    dst_is_tls_dependent[0] = is_tls_dependent;
+                    // rjf: an expression with an operation the bytecode cannot express gets
+                    // no location case: evaluation then reports the missing location, where
+                    // a truncated bytecode stream would read a wrong value (0 for an empty one)
+                    if(dst_bytecode_is_good)
+                    {
+                      rdim_location_case_list_push(arena, dst_locations, loc, voff_range);
+                      dst_is_tls_dependent[0] = is_tls_dependent;
+                    }
                   }
                   
                   //- rjf: not frame-base dependent? -> break - don't do this per-framebase case

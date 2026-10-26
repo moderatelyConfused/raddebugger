@@ -180,7 +180,10 @@ arch_reg_code_from_dw(Arch arch, DW_RegCode code)
   {
     ARCH_Info *arch_info = arch_info_from_arch(arch);
     U8 *dw_from_reg_code_table = arch_dw_from_reg_code_table_from_arch(arch);
-    for EachIndex(c, arch_info->reg_code_count)
+    // NOTE: index 0 is the nil register, whose table entry is 0 as well, while DWARF
+    // register 0 is a real register (x0 on arm64, rax on x64): the scan starts at 1,
+    // else `DW_OP_reg0` locations read the nil register (size 0, value 0)
+    for(U64 c = 1; c < arch_info->reg_code_count; c += 1)
     {
       if(dw_from_reg_code_table[c] == code)
       {

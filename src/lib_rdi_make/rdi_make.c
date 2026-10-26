@@ -1085,6 +1085,25 @@ rdim_location_case_list_push(RDIM_Arena *arena, RDIM_LocationCaseList *cases, RD
   n->voff_range = range;
 }
 
+RDI_PROC RDI_S32
+rdim_location_case_list_needs_set(RDIM_LocationCaseList *cases)
+{
+  // a lone case holding everywhere bakes as the symbol's location itself; several cases, or
+  // a lone case with a bounded range (a DWARF location list with one entry, or one left after
+  // dropping unsupported entries), need a set, else the range would be lost and the location
+  // would be read outside of it (a register which has since been reused, typically)
+  RDI_S32 result = 0;
+  if(cases->count > 1)
+  {
+    result = 1;
+  }
+  else if(cases->count == 1 && !(cases->first->voff_range.min == 0 && cases->first->voff_range.max == (RDI_U64)0xffffffffffffffffull))
+  {
+    result = 1;
+  }
+  return result;
+}
+
 ////////////////////////////////
 //~ rjf: [Building] Scope Info Building
 
