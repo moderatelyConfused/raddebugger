@@ -891,12 +891,32 @@ entry_point(CmdLine *cmd_line)
         SOCK_Protocol outputs_protocol = SOCK_Protocol_TCP;
         SOCK_Endpoint outputs_endpoint = {0};
         String8 packet = {0};
-        if(sock_recv(scratch.arena, ipc_sock_session, &outputs_protocol, &outputs_endpoint, &packet, now_time_us()+10000000) &&
+        U64 recv_endt_us = now_time_us()+10000000;
+        if(sock_recv(scratch.arena, ipc_sock_session, &outputs_protocol, &outputs_endpoint, &packet, recv_endt_us) &&
            str8_match(packet, str8_struct(&ipc_packet_magic_start), StringMatchFlag_RightSideSloppy) &&
            packet.size >= sizeof(ipc_packet_magic_start) + sizeof(U64))
         {
           U64 msg_size = *(U64 *)(packet.str + sizeof(ipc_packet_magic_start));
           String8 msg = str8_skip(packet, sizeof(ipc_packet_magic_start) + sizeof(U64));
+          // NOTE: the socket layer hands received data out one recv() chunk at a time
+          // (4 KB on macOS), so a reply longer than that (e.g. `state` with many
+          // modules) arrives as several packets; gather until the header's size is met.
+          if(msg.size < msg_size)
+          {
+            String8List msg_parts = {0};
+            str8_list_push(scratch.arena, &msg_parts, msg);
+            for(U64 gathered = msg.size; gathered < msg_size;)
+            {
+              String8 more = {0};
+              if(!sock_recv(scratch.arena, ipc_sock_session, &outputs_protocol, &outputs_endpoint, &more, recv_endt_us) || more.size == 0)
+              {
+                break;
+              }
+              str8_list_push(scratch.arena, &msg_parts, more);
+              gathered += more.size;
+            }
+            msg = str8_list_join(scratch.arena, &msg_parts, 0);
+          }
           msg.size = Min(msg.size, msg_size);
           U8 split_char = 0;
           outputs = str8_split(scratch.arena, msg, &split_char, 1, 0);
