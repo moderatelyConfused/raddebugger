@@ -967,12 +967,6 @@ mac_plat_set_frame_hook(MAC_PLAT_FrameHook *hook, void *user)
   mac_plat_frame_hook_user = user;
 }
 
-bool
-mac_plat_is_main_thread(void)
-{
-  return [NSThread isMainThread] ? true : false;
-}
-
 ////////////////////////////////
 //~ rjf: Window API
 
@@ -1936,16 +1930,6 @@ mac_plat_gl_context_set_window(MAC_PLAT_GLContext *ctx, MAC_PLAT_Window *w)
       mac_plat_gl_current = ctx->ctx;
     }
     [ctx->ctx makeCurrentContext];
-  }
-}
-
-void
-mac_plat_gl_context_update(MAC_PLAT_GLContext *ctx)
-{
-  if(ctx == 0) { return; }
-  @autoreleasepool
-  {
-    [ctx->ctx update];
   }
 }
 

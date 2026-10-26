@@ -65,7 +65,6 @@ typedef void MAC_PLAT_FrameHook(void *user);
 bool mac_plat_app_init(const char *app_name); // creates NSApplication, menu bar, delegate; activates the app
 void mac_plat_app_get_info(MAC_PLAT_AppInfo *out);
 void mac_plat_set_frame_hook(MAC_PLAT_FrameHook *hook, void *user);
-bool mac_plat_is_main_thread(void);
 
 ////////////////////////////////
 //~ rjf: Windows
@@ -226,7 +225,6 @@ char *mac_plat_get_clipboard_text(MAC_PLAT_AllocFunc *alloc, void *user, size_t 
 MAC_PLAT_GLContext *mac_plat_gl_context_create(void); // 4.1 core profile, double buffered, 24/8/24/8, swap interval 1
 void                mac_plat_gl_context_make_current(MAC_PLAT_GLContext *ctx);
 void                mac_plat_gl_context_set_window(MAC_PLAT_GLContext *ctx, MAC_PLAT_Window *window); // main thread only; binds the window's view (NULL detaches), updates, makes current
-void                mac_plat_gl_context_update(MAC_PLAT_GLContext *ctx);
 void                mac_plat_gl_context_swap(MAC_PLAT_GLContext *ctx);
 void                mac_plat_gl_context_set_swap_interval(MAC_PLAT_GLContext *ctx, int32_t interval);
 

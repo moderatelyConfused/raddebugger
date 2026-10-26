@@ -845,14 +845,20 @@ di_async_tick(void)
             
             // rjf: converted by an older build of the debugger than this one? converter fixes
             // which do not change the encoding would otherwise never reach existing RDIs.
+            // (macOS only, where the DWARF converter is still moving; a debugger binary
+            // with a modification time in the future does not count, else every RDI
+            // would be stale forever.)
+#if OS_MAC
             if(!t->rdi_is_stale && !og_is_rdi)
             {
               FileProperties debugger_props = properties_from_file_path(get_process_info()->binary_file_path);
-              if(debugger_props.modified != 0 && props.modified < debugger_props.modified)
+              DenseTime now = dense_time_from_date_time(now_time_universal());
+              if(debugger_props.modified != 0 && debugger_props.modified <= now && props.modified < debugger_props.modified)
               {
                 t->rdi_is_stale = 1;
               }
             }
+#endif
           }
           file_close(file);
         }

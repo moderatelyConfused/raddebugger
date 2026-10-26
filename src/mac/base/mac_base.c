@@ -791,17 +791,23 @@ semaphore_alloc(U32 initial_count, U32 max_count, String8 name)
       sem_unlink((char *)ipc_name.str);
       s = sem_open((char *)ipc_name.str, O_CREAT|O_EXCL, 0600, initial_count);
     }
+    B32 is_owner = (s != SEM_FAILED);
     if(s == SEM_FAILED)
     {
+      // rjf: could not create one (e.g. the system's named semaphore limit): join
+      // an existing object of that name, which stays somebody else's to unlink
       s = sem_open((char *)ipc_name.str, 0);
     }
     if(s != SEM_FAILED)
     {
       entity->semaphore.is_named = 1;
-      entity->semaphore.is_owner = 1;
+      entity->semaphore.is_owner = is_owner;
       entity->semaphore.posix_handle = s;
       MemoryCopy(entity->semaphore.name, ipc_name.str, Min(ipc_name.size, sizeof(entity->semaphore.name)-1));
-      mac_owned_ipc_name_push(ipc_name, 0);
+      if(is_owner)
+      {
+        mac_owned_ipc_name_push(ipc_name, 0);
+      }
       good = 1;
     }
   }
