@@ -6,10 +6,14 @@
 #   zsh src/mac/tests/flows/run_flows.sh -l                  list scenarios
 #
 # Settings (environment): RADDBG (default build/raddbg), FLOWS_BUILD_DIR (debuggees, default
-# build/flows, built by build_debuggees.sh when missing), IPC_PORT (default 7500; never the user's
-# 7423), HARNESS_DIR (user file, logs and project files of the private instance; default a temp dir),
-# FLOWS_KEEP_LOGS=1 keeps a copy of each scenario's logs under $HARNESS_DIR/logs_<scenario>,
-# FLOWS_ZIG_GENERATOR (the Zig generator project, default ~/Desktop/Etc/October-2026/generator).
+# build/flows, built by build_debuggees.sh when missing or older than a debuggee source),
+# IPC_PORT (default 7500 + pid % 100, so two concurrent runs do not kill each other's instances;
+# never the user's 7423), HARNESS_DIR (user file, logs and project files of the private instance;
+# default a temp dir), FLOWS_KEEP_LOGS=1 keeps a copy of each scenario's logs under
+# $HARNESS_DIR/logs_<scenario>. The Zig generator is named as the demon scripts name it:
+# GENERATOR_SRC (its project directory, default ~/Desktop/Etc/October-2026/generator) and ZIG
+# (the compiler, default ~/.zvm/bin/zig); FLOWS_ZIG_GENERATOR / FLOWS_ZIG are accepted as
+# overrides for older invocations. The generator's lines are looked up in its source by pattern.
 #
 # Every check prints "PASS <scenario>/<check>: <observed>" or "FAIL <scenario>/<check>: expected
 # <...>, observed <...>"; NOTE lines record observations without a verdict; the summary at the end
@@ -21,14 +25,21 @@ zmodload zsh/datetime
 now_ms() { printf '%.0f' $(( EPOCHREALTIME * 1000 )); }
 here=$(cd "$(dirname ${(%):-%x})" && pwd)
 repo=$(cd "$here/../../../.." && pwd)
-export IPC_PORT=${IPC_PORT:-7500}
+export IPC_PORT=${IPC_PORT:-$(( 7500 + $$ % 100 ))}
 export HARNESS_DIR=${HARNESS_DIR:-$(mktemp -d /tmp/raddbg_flows.XXXXXX)}
+mkdir -p "$HARNESS_DIR"
 export RADDBG=${RADDBG:-$repo/build/raddbg}
 B=${FLOWS_BUILD_DIR:-$repo/build/flows}
 D=$here/debuggees
 GEN=$B/generator/bin/generator
-GSRC=${FLOWS_ZIG_GENERATOR:-$HOME/Desktop/Etc/October-2026/generator}/src/main.zig
-[[ -x $B/basic_O0 ]] || FLOWS_BUILD_DIR=$B zsh "$here/build_debuggees.sh" >/dev/null
+export GENERATOR_SRC=${GENERATOR_SRC:-${FLOWS_ZIG_GENERATOR:-$HOME/Desktop/Etc/October-2026/generator}}
+export ZIG=${ZIG:-${FLOWS_ZIG:-$HOME/.zvm/bin/zig}}
+GSRC=$GENERATOR_SRC/src/main.zig
+# (re)build the debuggees when missing, or when a debuggee source is newer than the build: the
+# expected lines come from the sources, the observed ones from the binaries
+if [[ ! -x $B/basic_O0 || -n "$(find "$D" -newer "$B/basic_O0" -type f 2>/dev/null)" ]]; then
+  FLOWS_BUILD_DIR=$B FLOWS_ZIG=$ZIG FLOWS_ZIG_GENERATOR=$GENERATOR_SRC zsh "$here/build_debuggees.sh" >/dev/null
+fi
 source "$here/../ipc_harness.sh"
 
 typeset -i pass_count=0 fail_count=0
@@ -57,6 +68,9 @@ note() { echo "NOTE $scenario: $*"; }
 # line_of <source file> <tag>  -> the line number carrying "// @tag" (word boundary)
 line_of() { grep -n -E "// @$2([^a-zA-Z0-9_]|\$)" "$1" | head -1 | cut -d: -f1; }
 tag_loc() { echo "$(basename $1):$(line_of $1 $2)"; }
+# line_of_pattern <source file> <fixed string> -> the first line containing the string (sources
+# without tags, e.g. the Zig generator's main.zig)
+line_of_pattern() { grep -n -F -m1 -- "$2" "$1" | cut -d: -f1; }
 
 # -- state parsing (raddbg --ipc state) ----------------------------------------------------------
 # the innermost line of the stop ("<file>:<line>"), and the line at a given inline depth (0 = the
@@ -95,25 +109,11 @@ bp_enabled() { echo "$1" | sed -n '/^ breakpoints:/,$p' | grep -A5 "id:  *\"\\$2
 bp_count() { echo "$1" | sed -n '/^ breakpoints:/,$p' | grep -c "   id:"; }
 bp_ids() { echo "$1" | sed -n '/^ breakpoints:/,$p' | grep "   id:" | cut -d'"' -f2 | tr '\n' ' '; }
 
-# eval helpers: value / type / msgs of an expression in the selected frame. NOTE: `--ipc eval`
-# reports what the frontend has in that frame (see the TODO at RD_CmdKind_Eval): right after a
-# stop the symbol lookup can report "could not be found" for a short while (the debug info's
-# lookup tables are produced asynchronously), and a value in memory the frontend has not read yet
-# prints as 0 until the asynchronous read lands (the eval waits a frame's spare time at most; the
-# frontend's own views read the stopping thread's frame at most stops, but not after a stop which
-# reports a hit held back from an earlier run, see README). ev_out retries the former and accepts
-# an answer only once two consecutive evaluations agree.
-ev_raw() { ipc eval "$@"; }
-ev_out() {
-  local out prev=""
-  for i in $(seq 1 15); do
-    out=$(ipc eval "$@")
-    if echo "$out" | grep -q "could not be found"; then prev=""; sleep 0.1; continue; fi
-    [[ -n "$prev" && "$out" == "$prev" ]] && break
-    prev=$out
-  done
-  echo "$out"
-}
+# eval helpers: value / type / msgs of an expression in the selected frame. `--ipc eval` evaluates
+# once and waits (1 s at most) for fresh memory, the selected thread's call stack and the debug
+# info name search (RD_CmdKind_Eval), so one evaluation is the answer: no retries, no agreement
+# between two evaluations (which the suite needed before that wait, see README).
+ev_out() { ipc eval "$@"; }
 ev() {
   # the value is printed escaped (\" for quotes); unescape it
   ev_out "$@" | grep -m1 " value:" | sed 's/^ value: *//' | sed 's/^"\(.*\)"$/\1/' | sed 's/\\"/"/g'
@@ -133,12 +133,13 @@ project() {
   [[ -n "${4:-}" ]] && printf '%s\n' "$4" >> "$path"
   echo "$path"
 }
-# start_debugger <project>: a fresh private instance with the project loaded, no target launched
+# start_debugger <project>: a fresh private instance with the project loaded, no target launched.
+# Readiness is the instance's own listener (lsof, LISTEN on the port: no probe connection, no
+# fixed sleep); its pid is recorded (RD_PID) and kill_test_instances kills by it.
 start_debugger() {
   kill_test_instances; rm -f $S/test.raddbg_user; rm -rf $S/logs
   (nohup $RD $P --project:$1 --user:$S/test.raddbg_user --logs:$S/logs > $S/raddbg_stdout.txt 2>&1 &)
-  for i in $(seq 1 100); do nc -z -G 1 127.0.0.1 ${P#--ipc_port:} >/dev/null 2>&1 && break; sleep 0.05; done
-  (ipc state >/dev/null 2>&1 &); sleep 0.2; wait_up
+  wait_listener && wait_up
 }
 # begin <scenario name> <executable> [arguments] [extra cfg]: fresh instance, launched and stopped at the entry point
 begin() {
@@ -218,7 +219,7 @@ scenario_attach_detach() {
   local st=$(go_cmd "attach --pid:$target_pid")
   check attached_process "$target_pid" "$(process_ids "$st" | awk '{print $1}')"
   check attached_thread_count 1 "$(thread_count "$st")"
-  check_match attached_stack_has_main 'main' "$(call_stack_symbols "$st")"
+  check_match attached_stack_has_main '(^| )main( |$)' "$(call_stack_symbols "$st")"
   check attached_global_counter_type "int" "$(ev_type g_counter)"
   check_match attached_global_counter '^[0-9]+$' "$(ev g_counter)"
   bp_tag $D/basic.c spin_body >/dev/null
@@ -418,14 +419,14 @@ scenario_stepping_cpp() {
   bp_tag $D/cpp.cpp cpp_virtual_call >/dev/null
   local st=$(run_stop); check_stop at_virtual_call "$st" $D/cpp.cpp cpp_virtual_call
   st=$(go_cmd step_into); check_brace into_virtual_brace "$st" $D/cpp.cpp rect_area
-  check_match virtual_sym 'area' "$(stop_symbol "$st")"
+  check_match virtual_sym '(^|::)area$' "$(stop_symbol "$st")"
   st=$(go_cmd step_over); check_stop into_virtual "$st" $D/cpp.cpp rect_area
   check this_w 3 "$(ev 'this->w')"
   st=$(go_cmd step_out); check_stop out_virtual "$st" $D/cpp.cpp cpp_virtual_call
   st=$(go_cmd step_over); check_stop at_template_call "$st" $D/cpp.cpp cpp_template_call
   check a 12 "$(ev a)"
   st=$(go_cmd step_into); check_brace into_template_brace "$st" $D/cpp.cpp twice_body
-  check_match template_sym 'twice' "$(stop_symbol "$st")"
+  check_match template_sym '(^|::)twice(<.*>)?$' "$(stop_symbol "$st")"
   st=$(go_cmd step_over); check_stop into_template "$st" $D/cpp.cpp twice_body
   st=$(go_cmd step_out); check_stop out_template "$st" $D/cpp.cpp cpp_template_call
   st=$(go_cmd step_over); check_stop at_lambda_def "$st" $D/cpp.cpp cpp_lambda_def
@@ -535,7 +536,7 @@ scenario_halt() {
   local st=$(wait_stop $before $depth)
   check halted 0 "$(field "$st" running)"
   check halt_process_alive 1 "$(process_count "$st")"
-  check_match halt_stack 'main' "$(call_stack_symbols "$st")"
+  check_match halt_stack '(^| )main( |$)' "$(call_stack_symbols "$st")"
   check_match halt_counter '^[0-9]+$' "$(ev g_counter)"
   bp_tag $D/basic.c spin_body >/dev/null
   st=$(run_stop); check_stop after_halt_bp "$st" $D/basic.c spin_body
@@ -717,7 +718,7 @@ scenario_modules() {
   # rjf: the after_dlclose breakpoint is still set: it hits in the second round too, before the exit
   st=$(run_stop); check_stop at_after_dlclose_2 "$st" $D/dylib_host.c after_dlclose
   ipc run >/dev/null; st=$(wait_exit); check exit_code 8 "$(field "$st" last_exit_code)"
-  note "module events: NewModule=$(event_count NewModule) EndModule=$(event_count EndModule); dyld notification: $(grep -c 'could not find _dyld_debugger_notification' $S/logs/ctrl_thread.raddbg_log 2>/dev/null) 'not found' log lines"
+  note "module events: NewModule=$(event_count NewModule) EndModule=$(event_count EndModule); dyld notification: $(grep -c 'could not find the dyld debugger notification function' $S/logs/ctrl_thread.raddbg_log 2>/dev/null) 'not found' log lines"
   finish
 }
 
@@ -785,25 +786,110 @@ scenarios+=(zig_generator)
 scenario_zig_generator() {
   if [[ ! -x $GEN || ! -f $GSRC ]]; then scenario=zig_generator; note "generator not built; skipped"; return; fi
   begin zig_generator $GEN || return
-  ipc "add_breakpoint --file_path:$GSRC:57" >/dev/null
+  # the generator's lines, by their text: the `while (try rng.next())` loop in main, the print
+  # inside it, and the `yield(i)` loop of `range` (which runs on the fiber)
+  local loop_line=$(line_of_pattern $GSRC 'while (try rng.next())') print_line=$(line_of_pattern $GSRC 'try stdout.print(') yield_line=$(line_of_pattern $GSRC 'for (min..max) |i| yield(i);')
+  ipc "add_breakpoint --file_path:$GSRC:$loop_line" >/dev/null
   local st=$(run_stop)
-  check bp57 "main.zig:57" "$(stop_selected_line "$st")"
-  check bp57_frame_is_main "main" "$(stop_symbol "$st" | sed 's/.*\.//')"
+  check bp_loop "main.zig:$loop_line" "$(stop_selected_line "$st")"
+  check bp_loop_frame_is_main "main" "$(stop_symbol "$st" | sed 's/.*\.//')"
   st=$(go_cmd step_into)
-  check_match into_next 'next' "$(stop_symbol "$st")"
+  check_match into_next '(^|\.)next$' "$(stop_symbol "$st")"
   local l1=$(stop_file_line "$st")
   st=$(go_cmd step_over); local l2=$(stop_file_line "$st")
   check_ne over_contextswitch_moves "$l1" "$l2"
-  check_match over_contextswitch_in_next 'next' "$(stop_symbol "$st")"
+  check_match over_contextswitch_in_next '(^|\.)next$' "$(stop_symbol "$st")"
   st=$(go_cmd step_out)
   check out_to_main "main" "$(stop_symbol "$st" | sed 's/.*\.//')"
-  check_match out_line 'main.zig:(57|58)' "$(stop_file_line "$st")"
+  check_match out_line "main.zig:($loop_line|$print_line)" "$(stop_file_line "$st")"
   ipc clear_breakpoints >/dev/null
-  ipc "add_breakpoint --file_path:$GSRC:4" >/dev/null
+  ipc "add_breakpoint --file_path:$GSRC:$yield_line" >/dev/null
   st=$(run_stop)
-  check_match fiber_bp 'range' "$(stop_symbol "$st")"
-  check_match fiber_stack 'range' "$(call_stack_symbols "$st")"
+  check_match fiber_bp '(^|\.)range$' "$(stop_symbol "$st")"
+  check_match fiber_stack '(^| )([^ ]*\.)?range( |$)' "$(call_stack_symbols "$st")"
   note "fiber call stack: $(call_stack "$st" | tr '\n' ' ') modules: $(frame_modules "$st" | tr '\n' ' ')"
+  finish
+}
+
+# ===============================================================================================
+# scenarios: `--ipc` driving (commands, confirmations, replies, transport)
+# ===============================================================================================
+
+scenarios+=(ipc_commands)
+scenario_ipc_commands() {
+  begin ipc_commands $B/basic_O0 || return
+  # chained commands: every command's output is in the one reply
+  local out=$(ipc "eval 1+1; eval 2+2")
+  check chained_eval_outputs 2 "$(echo "$out" | grep -c ' value:')"
+  out=$(ipc "add_breakpoint --file_path:$D/basic.c:$(line_of $D/basic.c main_loop); eval 3+3")
+  check chained_bp_id_and_eval "1 1" "$(echo "$out" | grep -c '^\$[0-9a-f]') $(echo "$out" | grep -c ' value: "6"')"
+  out=$(ipc "state; eval 4+4")
+  check chained_state_and_eval "1 1" "$(echo "$out" | grep -c ' version:') $(echo "$out" | grep -c ' value: "8"')"
+  # state reports the instance's pid (what the harness recorded from the listener)
+  check state_pid "$RD_PID" "$(field "$(ipc state)" pid)"
+  # save_project without a path saves the project's own file, never the focused source tab
+  local proj=$HARNESS_DIR/ipc_commands.raddbg src_sum=$(md5 -q $D/basic.c) proj_mtime0=$(stat -f %m $proj)
+  sleep 1
+  ipc save_project >/dev/null
+  check save_project_default_keeps_source "$src_sum" "$(md5 -q $D/basic.c)"
+  check_ne save_project_default_writes_project "$proj_mtime0" "$(stat -f %m $proj)"
+  # a plain path names the destination (no `:line`)
+  local dst=$HARNESS_DIR/ipc_commands_saved.raddbg; rm -f $dst
+  ipc "save_project $dst" >/dev/null
+  check save_project_plain_path 1 "$([[ -s $dst ]] && echo 1 || echo 0)"
+  # saving over an existing file needs --force_confirm:1; a repeated command is no confirmation
+  local size0=$(stat -f %z $dst)
+  printf '// stale\n' >> $dst
+  check_match save_project_overwrite_refused '^error: save_project: .*exists' "$(ipc "save_project $dst" | head -1)"
+  check_match save_project_overwrite_refused_again '^error: save_project: .*exists' "$(ipc "save_project $dst" | head -1)"
+  check save_project_refusals_keep_file "$(( size0 + 9 ))" "$(stat -f %z $dst)"
+  ipc "save_project $dst --force_confirm:1" >/dev/null
+  check save_project_force_confirm_overwrites "$size0" "$(stat -f %z $dst)"
+  local udst=$HARNESS_DIR/ipc_commands_saved.raddbg_user; rm -f $udst
+  ipc "save_user $udst" >/dev/null
+  check save_user_plain_path 1 "$([[ -s $udst ]] && echo 1 || echo 0)"
+  # exit with a live process is refused unless force-confirmed (no popup an external driver
+  # could not answer; a second `exit` does not pass through one)
+  check_match exit_live_refused '^error: exit: still attached' "$(ipc exit | head -1)"
+  check_match exit_live_refused_again '^error: exit: still attached' "$(ipc exit | head -1)"
+  kill -0 $RD_PID 2>/dev/null; check exit_live_refused_instance_alive 0 $?
+  ipc "exit --force_confirm:1" >/dev/null
+  for i in $(seq 1 50); do kill -0 $RD_PID 2>/dev/null || break; sleep 0.1; done
+  kill -0 $RD_PID 2>/dev/null; check exit_force_confirm_quits 1 $?
+  finish
+}
+
+scenarios+=(ipc_transport)
+scenario_ipc_transport() {
+  scenario=ipc_transport; echo "--- $scenario"
+  start_debugger "$(project ipc_transport $B/basic_O0)" >/dev/null
+  # a command far longer than the listener's 4 KB recv chunk (1000 chained add_breakpoint, ~350 KB)
+  # arrives whole: the server gathers the chunks by the header's size. the breakpoints name a
+  # file with a 300-character name, so that `state` (which prints each location) grows past the
+  # socket ring (256 KB) with fewer breakpoints (the frontend takes ~3 ms per add_breakpoint)
+  local longname=$(printf 'f%.0s' $(seq 1 300)).c cmd="" i
+  for i in $(seq 1 1000); do cmd+="add_breakpoint --file_path:$HARNESS_DIR/$longname:$i; "; done
+  local t0=$EPOCHREALTIME
+  local out=$(ipc "$cmd")
+  note "a ${#cmd} byte command with 1000 breakpoints took $(printf '%.0f' $(( (EPOCHREALTIME - t0) * 1000 ))) ms"
+  check transport_long_command_all_bp_ids 1000 "$(echo "$out" | grep -o '\$[0-9a-f]*' | wc -l | tr -d ' ')"
+  # a reply larger than the socket ring (256 KB): `state` lists the 1000 breakpoints, whole, fast
+  t0=$EPOCHREALTIME
+  out=$(ipc state)
+  local ms=$(printf '%.0f' $(( (EPOCHREALTIME - t0) * 1000 )))
+  note "state with 1000 breakpoints: ${#out} bytes in ${ms} ms"
+  check transport_large_reply_over_256kb 1 "$(( ${#out} > 262144 ))"
+  check transport_large_reply_complete "}" "$(echo "$out" | tail -1)"
+  check transport_large_reply_bp_count 1000 "$(bp_count "$out")"
+  check_match transport_large_reply_under_2s '^([0-9]{1,3}|1[0-9]{3})$' "$ms"
+  # a 6 KB `eval` command is not cut: a 6000-character string literal evaluates to a 6000-byte
+  # array (a deeply nested expression is no option: `1+1+...` with ~1000 terms overflows the
+  # evaluator's stack, see README)
+  local lit=$(printf 'a%.0s' $(seq 1 6000))
+  check_match transport_6kb_eval_type '\[6000\]' "$(ev_type "\"$lit\"")"
+  check transport_6kb_eval_msgs "" "$(ev_msgs "\"$lit\"")"
+  ipc clear_breakpoints >/dev/null
+  check transport_breakpoints_cleared 0 "$(bp_count "$(ipc state)")"
   finish
 }
 
@@ -1040,7 +1126,7 @@ scenario_D1_detach_launched() {
   local exe=$GEN; [[ -x $GEN && -f $GSRC ]] || exe=$B/basic_O0
   begin D1_detach_launched $exe || return
   local st=$(ipc state); local pid=$(process_ids "$st" | awk '{print $1}')
-  if [[ $exe == $GEN ]]; then ipc "add_breakpoint --file_path:$GSRC:57" >/dev/null; else bp_tag $D/basic.c main_outer >/dev/null; fi
+  if [[ $exe == $GEN ]]; then ipc "add_breakpoint --file_path:$GSRC:$(line_of_pattern $GSRC 'while (try rng.next())')" >/dev/null; else bp_tag $D/basic.c main_outer >/dev/null; fi
   st=$(run_stop); check D1_bp_hit 1 "$(stop_explanation "$st" | grep -c breakpoint)"
   ipc clear_breakpoints >/dev/null
   ipc "detach --process:$pid" >/dev/null
@@ -1083,8 +1169,8 @@ scenario_D3_modules_system() {
   ipc "add_function_breakpoint write" >/dev/null
   st=$(run_stop)
   check D3_write_bp_module "libsystem_kernel.dylib" "$(stop_module "$st")"
-  check_match D3_write_bp_stack 'main' "$(call_stack_symbols "$st")"
-  note "D3 NewModule events: $(event_count NewModule); dyld notification 'not found' lines: $(grep -c 'could not find _dyld_debugger_notification' $S/logs/ctrl_thread.raddbg_log 2>/dev/null)"
+  check_match D3_write_bp_stack '(^| )main( |$)' "$(call_stack_symbols "$st")"
+  note "D3 NewModule events: $(event_count NewModule); dyld notification 'not found' lines: $(grep -c 'could not find the dyld debugger notification function' $S/logs/ctrl_thread.raddbg_log 2>/dev/null)"
   finish
 }
 
@@ -1215,18 +1301,18 @@ scenario_D9_attach_kill9() {
   check D9_attached "$tpid" "$(process_ids "$st" | awk '{print $1}')"
   ipc run >/dev/null; wait_running
   local before=$(field "$st" stop_count)
-  local t0=$(date +%s%N)
+  local t0=$EPOCHREALTIME
   kill -9 $tpid
   # PT_ATTACHEXC reports the SIGKILL as a soft signal and mac_sigkill breaks by default (as
   # linux_sigkill does): the first report is a stop; the exit follows the continue
   st=$(wait_stop ${before:-0})
-  local stop_ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+  local stop_ms=$(printf '%.0f' $(( (EPOCHREALTIME - t0) * 1000 )))
   check D9_sigkill_stop 0x9 "$(exception_code "$st")"
   check D9_sigkill_stop_process_known 1 "$(process_count "$st")"
-  t0=$(date +%s%N)
+  t0=$EPOCHREALTIME
   ipc run >/dev/null
   for i in $(seq 1 100); do st=$(ipc state); [[ "$(process_count "$st")" == "0" ]] && break; done
-  local ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+  local ms=$(printf '%.0f' $(( (EPOCHREALTIME - t0) * 1000 )))
   check D9_exit_reported 0 "$(process_count "$st")"
   check D9_exit_code_is_signal 9 "$(field "$st" last_exit_code)"
   check_match D9_exit_within_500ms '^([0-9]|[1-9][0-9]|[1-4][0-9][0-9])$' "$ms"
@@ -1295,17 +1381,17 @@ scenarios+=(U1_zig_unwind)
 scenario_U1_zig_unwind() {
   if [[ ! -x $GEN || ! -f $GSRC ]]; then scenario=U1_zig_unwind; note "generator not built; skipped"; return; fi
   begin U1_zig_unwind $GEN || return
-  ipc "add_breakpoint --file_path:$GSRC:57" >/dev/null
+  ipc "add_breakpoint --file_path:$GSRC:$(line_of_pattern $GSRC 'while (try rng.next())')" >/dev/null
   local st=$(run_stop); st=$(go_cmd step_into)
-  check_match U1_in_next 'next' "$(stop_symbol "$st")"
-  check_match U1_frame1_main_after_step_into 'main' "$(concrete_frames "$st" | sed -n 2p)"
+  check_match U1_in_next '(^|\.)next$' "$(stop_symbol "$st")"
+  check_match U1_frame1_main_after_step_into '(^|\.)main$' "$(concrete_frames "$st" | sed -n 2p)"
   note "U1 stack after step into: $(call_stack "$st" | tr '\n' ' ')"
   # instruction-step through next() (up to its ret); frame 1 must stay main at every step
   local bad="" i steps=0
   for i in $(seq 1 120); do
     st=$(go_cmd step_into_inst); steps=$i
-    echo "$(stop_symbol "$st")" | grep -q next || break
-    if ! concrete_frames "$st" | sed -n 2p | grep -q main; then bad="pc=$(field "$st" ip) frames: $(concrete_frames "$st" | tr '\n' ' ')"; break; fi
+    echo "$(stop_symbol "$st")" | grep -q -E '(^|\.)next$' || break
+    if ! concrete_frames "$st" | sed -n 2p | grep -q -E '(^|\.)main$'; then bad="pc=$(field "$st" ip) frames: $(concrete_frames "$st" | tr '\n' ' ')"; break; fi
   done
   check U1_frame1_main_at_every_instruction_of_next "" "$bad"
   note "U1 instruction steps in next: $steps, left next at $(stop_symbol "$st") $(stop_file_line "$st")"

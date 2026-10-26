@@ -793,7 +793,10 @@ rd_eval_space_read(E_Space space, void *out, E_SpaceRangeInfo *out_range_info, R
         default:{}break;
         case D_EntityKind_Process:
         {
-          D_ProcessMemorySlice slice = d_process_memory_slice_from_vaddr_range(scratch.arena, entity->handle, range, 0, rd_state->frame_eval_memread_endt_us);
+          // NOTE: the views accept a page cached at an earlier generation (they re-evaluate
+          // every frame, the fresh page follows); a scripted `eval` asks for fresh pages,
+          // and waits for them up to its deadline (RD_CmdKind_Eval).
+          D_ProcessMemorySlice slice = d_process_memory_slice_from_vaddr_range(scratch.arena, entity->handle, range, rd_state->eval_memread_wait_for_fresh, rd_state->frame_eval_memread_endt_us);
           String8 data = slice.data;
           if(data.size == dim_1u64(range))
           {
@@ -11219,13 +11222,27 @@ rd_regs_fill_slot_from_string(RD_RegSlot slot, String8 query_expr, String8 strin
     //- rjf: basic string cases
     default:
     case RD_RegSlot_String:
-    case RD_RegSlot_FilePath:
     {
       String8TxtPtPair pair = str8_txt_pt_pair_from_string(string);
       rd_regs()->string = str8_copy(rd_frame_arena(), string);
       if(pair.pt.line != 0)
       {
         rd_regs()->file_path = str8_copy(rd_frame_arena(), pair.string);
+        rd_regs()->line_num = (U64)pair.pt.line;
+        rd_regs()->column_num = (U64)pair.pt.column;
+      }
+    }break;
+    case RD_RegSlot_FilePath:
+    {
+      // NOTE: a plain path fills the file path as well as `path:line[:column]` does
+      // (`save_project <path>` over IPC, the path queries); the line and column are
+      // only touched when the string carries them. a file path slot filled from a
+      // plain path used to leave the file path as it was (the focused tab's file).
+      String8TxtPtPair pair = str8_txt_pt_pair_from_string(string);
+      rd_regs()->string = str8_copy(rd_frame_arena(), string);
+      rd_regs()->file_path = str8_copy(rd_frame_arena(), pair.string);
+      if(pair.pt.line != 0)
+      {
         rd_regs()->line_num = (U64)pair.pt.line;
         rd_regs()->column_num = (U64)pair.pt.column;
       }
@@ -11449,6 +11466,24 @@ internal void
 rd_push_cmd(String8 name, RD_Regs *regs)
 {
   rd_cmd_list_push_new(rd_state->cmds_arenas[0], &rd_state->cmds[0], name, regs);
+}
+
+//- rjf: external driver refusals
+
+internal void
+rd_ipc_refuse_unconfirmed_cmdf(char *fmt, ...)
+{
+  // NOTE: a command an external driver (`--ipc`) sent would need a confirmation popup
+  // no one can answer: it is refused, the reason goes to the log (as a user error) and
+  // into the command's reply, so a script sees why nothing happened.
+  Temp scratch = scratch_begin(0, 0);
+  va_list args;
+  va_start(args, fmt);
+  String8 reason = push_str8fv(scratch.arena, fmt, args);
+  va_end(args);
+  log_user_error(reason);
+  str8_list_pushf(rd_state->cmd_output_arena, &rd_state->cmd_outputs, "error: %S\n", reason);
+  scratch_end(scratch);
 }
 
 //- rjf: iterating
@@ -12037,10 +12072,16 @@ rd_stop_inline_depth_from_event(D_Event *evt, B32 *has_lines_out)
         RD_Location loc = rd_location_from_cfg(bp);
         if(loc.file_path.size != 0 && loc.pt.line != 0)
         {
+          // NOTE: the debug info's path and the breakpoint's path may differ by a path map
+          // (or the build's prefix): the line and the file name decide, a full-path match
+          // is not required
+          String8 loc_file_name = str8_skip_last_slash(loc.file_path);
           U64 idx = 0;
           for(D_LineNode *n = lines.first; n != 0; n = n->next, idx += 1)
           {
-            if(n->v.pt.line == loc.pt.line && path_match_normalized(n->v.file_path, loc.file_path))
+            if(n->v.pt.line == loc.pt.line &&
+               (path_match_normalized(n->v.file_path, loc.file_path) ||
+                str8_match(str8_skip_last_slash(n->v.file_path), loc_file_name, StringMatchFlag_CaseInsensitive)))
             {
               inline_depth = idx;
               break;
@@ -13925,7 +13966,12 @@ rd_frame(void)
               U64 innermost_inline_depth = rd_innermost_inline_depth_from_thread(thread);
               if(rd_base_regs()->inline_depth < innermost_inline_depth)
               {
-                rd_cmd(RD_CmdKind_SelectUnwind, .unwind_count = 0, .inline_depth = rd_base_regs()->inline_depth+1);
+                // NOTE: selected directly, as the stop handler does: SelectUnwind needs the
+                // call stack within 10 ms and does nothing when it is not ready yet (a step
+                // into right after a stop, or a driver which never asked for the call stack)
+                rd_state->base_regs.v.unwind_count = 0;
+                rd_state->base_regs.v.inline_depth += 1;
+                rd_cmd(RD_CmdKind_FindThread, .thread = thread->handle, .unwind_count = 0, .inline_depth = rd_state->base_regs.v.inline_depth);
                 break;
               }
             }
@@ -14004,9 +14050,11 @@ rd_frame(void)
               params.vaddr         = rd_regs()->vaddr;
               // NOTE: a step is of the selected inline frame (the base registers; a command's
               // own registers may carry an older selection), when it steps the selected thread
+              // and the top frame is selected: an outer frame's inline depth says nothing
+              // about the frame the thread executes in.
               B32 is_step = (kind == RD_CmdKind_StepOver || kind == RD_CmdKind_StepInto || kind == RD_CmdKind_StepOut ||
                              kind == RD_CmdKind_StepOverInst || kind == RD_CmdKind_StepIntoInst);
-              if(is_step && d_handle_match(rd_regs()->thread, rd_base_regs()->thread))
+              if(is_step && d_handle_match(rd_regs()->thread, rd_base_regs()->thread) && rd_base_regs()->unwind_count == 0)
               {
                 params.inline_depth = rd_base_regs()->inline_depth;
               }
@@ -14154,6 +14202,10 @@ rd_frame(void)
             RD_CmdKindInfo *cmd_kind_info = rd_cmd_kind_info_from_string(cmd_kind_name);
             if(cmd_kind_info != &rd_nil_cmd_kind_info) RD_RegsScope()
             {
+              // rjf: mark the command as an external driver's: no interactive user is behind
+              // it, so a handler must never answer a confirmation for it (see Exit, SaveProject)
+              rd_regs()->external_driver = 1;
+              B32 explicit_file_path = 0;
               for EachNonZeroEnumVal(RD_RegSlot, s)
               {
                 String8 reg_slot_name = rd_reg_slot_code_name_table[s];
@@ -14161,6 +14213,10 @@ rd_frame(void)
                 if(value.size != 0)
                 {
                   rd_regs_fill_slot_from_string(s, cmd_kind_info->query.expr, value);
+                  if(s == RD_RegSlot_FilePath)
+                  {
+                    explicit_file_path = 1;
+                  }
                 }
               }
               String8 primary_args_string = {0};
@@ -14179,16 +14235,36 @@ rd_frame(void)
               if(primary_args_string.size != 0)
               {
                 rd_regs_fill_slot_from_string(cmd_kind_info->query.slot, cmd_kind_info->query.expr, primary_args_string);
+                if(cmd_kind_info->query.slot == RD_RegSlot_FilePath)
+                {
+                  explicit_file_path = 1;
+                }
+              }
+              // rjf: a file-path command without a path: the registers' file path is the
+              // focused tab's file, never a destination (`save_project` over IPC used to
+              // overwrite the focused source file with the project). the save commands
+              // default to the file the data lives in, which they may overwrite without
+              // asking; the other file-path commands get no path.
+              if(cmd_kind_info->query.slot == RD_RegSlot_FilePath && !explicit_file_path)
+              {
+                rd_regs()->file_path = str8_zero();
+                if(cmd_kind_info == &rd_cmd_kind_info_table[RD_CmdKind_SaveProject])
+                {
+                  rd_regs()->file_path = rd_state->project_path;
+                  rd_regs()->force_confirm = 1;
+                }
+                else if(cmd_kind_info == &rd_cmd_kind_info_table[RD_CmdKind_SaveUser])
+                {
+                  rd_regs()->file_path = rd_state->user_path;
+                  rd_regs()->force_confirm = 1;
+                }
               }
               rd_regs()->disable_addresses = 1;
-              // rjf: an external driver (e.g. `raddbg --ipc exit`) has no interactive
-              // user to answer the "still attached to a live process" confirmation
-              // popup, so it would otherwise hang the instance alive. force-confirm it:
-              // exit and tear down the debuggee, exactly like the GUI's confirmed close.
-              if(cmd_kind_info == &rd_cmd_kind_info_table[RD_CmdKind_Exit])
-              {
-                rd_regs()->force_confirm = 1;
-              }
+              // NOTE: an external driver has no interactive user to answer a confirmation
+              // popup (`exit` while attached to a live process, saving over an existing
+              // file): the handlers refuse such a command unless it carries
+              // `--force_confirm:1`, instead of opening the popup (which would hang the
+              // instance alive) or passing through one which is already open.
               rd_push_cmd(cmd_kind_name, rd_regs());
             }
             else
@@ -14201,6 +14277,7 @@ rd_frame(void)
             String8List state_parts = {0};
             str8_list_pushf(scratch.arena, &state_parts, "state:\n{\n");
             str8_list_pushf(scratch.arena, &state_parts, " version: \"%s\"\n", BUILD_TITLE_STRING_LITERAL);
+            str8_list_pushf(scratch.arena, &state_parts, " pid: %I64u\n", (U64)get_process_info()->pid);
             str8_list_pushf(scratch.arena, &state_parts, " running: %i\n", d_ctrl_targets_running());
             str8_list_pushf(scratch.arena, &state_parts, " run_gen: %I64u\n", d_run_gen());
             str8_list_pushf(scratch.arena, &state_parts, " stop_count: %I64u\n", d_stop_count());
@@ -14340,7 +14417,11 @@ rd_frame(void)
               D_Entity *thread = d_entity_from_handle(rd_base_regs()->thread);
               D_Entity *process = d_entity_ancestor_from_kind(thread, D_EntityKind_Process);
               ARCH_Info *arch_info = arch_info_from_arch(thread->arch);
-              D_CallStack call_stack = d_call_stack_from_thread(access, thread->handle, 1, now_time_us()+1000000);
+              // NOTE: a call stack is only built while the thread is stopped; a `state` poll
+              // of a running target takes what is cached. a stopped thread's stack is
+              // waited for (it is usually ready; the bound keeps a poll short)
+              U64 call_stack_endt_us = d_ctrl_targets_running() ? 0 : now_time_us()+250000;
+              D_CallStack call_stack = d_call_stack_from_thread(access, thread->handle, 1, call_stack_endt_us);
               str8_list_pushf(scratch.arena, &state_parts, " call_stack:\n {\n");
               U64 unwind_count = 0;
               for EachIndex(idx, call_stack.frames_count)
@@ -14457,7 +14538,38 @@ rd_frame(void)
             // we'd only be able to do that by setting up an entirely new evaluation context,
             // which is currently a ton of code & laborious & duplicative, so we need to tighten
             // that up first. @eval_regressions
+            //
+            // NOTE: a script gets this one answer (the views re-evaluate every frame, a value
+            // a frame late costs them nothing), so, within a bounded deadline, this evaluation
+            // waits for what the frame's own evaluation does not: fresh memory (a page cached
+            // at an earlier stop is not accepted; right after a stop it still holds the values
+            // from before the run), the selected thread's call stack when the frame's eval
+            // context was built before the call stack was ready (`cfa` 0 makes every
+            // frame-relative local read a wrong address), and the asynchronous debug info
+            // name search for identifiers (which otherwise answers "could not be found" for
+            // a few hundred milliseconds after a stop).
             String8 expr = rd_regs()->expr;
+            U64 eval_endt_us = now_time_us() + 1000000;
+            U64 memread_endt_us_restore = rd_state->frame_eval_memread_endt_us;
+            B32 wait_for_fresh_restore = rd_state->eval_memread_wait_for_fresh;
+            U64 dbgi_match_endt_us_restore = e_base_ctx->dbgi_match_endt_us;
+            rd_state->frame_eval_memread_endt_us = eval_endt_us;
+            rd_state->eval_memread_wait_for_fresh = 1;
+            e_base_ctx->dbgi_match_endt_us = eval_endt_us;
+            if(e_interpret_ctx->cfa == 0)
+            {
+              D_Entity *thread = d_entity_from_handle(rd_base_regs()->thread);
+              if(thread != &d_entity_nil)
+              {
+                Access *access = access_open();
+                D_CallStack call_stack = d_call_stack_from_thread(access, thread->handle, 1, eval_endt_us);
+                if(call_stack.concrete_frames_count != 0)
+                {
+                  e_interpret_ctx->cfa = call_stack.concrete_frames[rd_base_regs()->unwind_count % call_stack.concrete_frames_count]->cfa;
+                }
+                access_close(access);
+              }
+            }
             E_Eval eval = e_eval_from_string(expr);
             E_Eval type_eval = e_eval_from_stringf("typeof(%S)", expr);
             EV_StringParams string_params =
@@ -14478,6 +14590,9 @@ rd_frame(void)
             }
             StringJoin join = {.sep = s(". ")};
             String8 msgs_string = str8_list_join(scratch.arena, &msgs_strings, &join);
+            rd_state->frame_eval_memread_endt_us = memread_endt_us_restore;
+            rd_state->eval_memread_wait_for_fresh = wait_for_fresh_restore;
+            e_base_ctx->dbgi_match_endt_us = dbgi_match_endt_us_restore;
             str8_list_pushf(rd_state->cmd_output_arena, &rd_state->cmd_outputs, "eval:\n{\n");
             str8_list_pushf(rd_state->cmd_output_arena, &rd_state->cmd_outputs, " expr:  %S\n", expr);
             str8_list_pushf(rd_state->cmd_output_arena, &rd_state->cmd_outputs, " value: \"%S\"\n", escaped_from_raw_str8(scratch.arena, value_string));
@@ -14532,7 +14647,13 @@ rd_frame(void)
             // rjf: if control processes are live, but this is not force-confirmed, then
             // get confirmation from user
             UI_Key key = ui_key_from_string(ui_key_zero(), s("lossy_exit_confirmation"));
-            if(attached_to_live_processes && !rd_regs()->force_confirm && !ui_key_match(rd_state->popup_key, key))
+            if(attached_to_live_processes && !rd_regs()->force_confirm && rd_regs()->external_driver)
+            {
+              // rjf: an external driver cannot answer the popup, and must not pass through
+              // one which is open (a repeated command counts as the user's confirmation)
+              rd_ipc_refuse_unconfirmed_cmdf("exit: still attached to a live process; pass `--force_confirm:1` to exit and tear down the debuggee");
+            }
+            else if(attached_to_live_processes && !rd_regs()->force_confirm && !ui_key_match(rd_state->popup_key, key))
             {
               rd_state->popup_key = key;
               rd_state->popup_active = 1;
@@ -14870,7 +14991,17 @@ rd_frame(void)
             String8 new_path = rd_regs()->file_path;
             B32 file_will_be_overwritten = (properties_from_file_path(new_path).created != 0);
             UI_Key key = ui_key_from_string(ui_key_zero(), str8_lit("save_config_overwrite_confirm"));
-            if(file_will_be_overwritten && !rd_regs()->force_confirm && !ui_key_match(rd_state->popup_key, key))
+            if(new_path.size == 0 && rd_regs()->external_driver)
+            {
+              rd_ipc_refuse_unconfirmed_cmdf("%S: a destination path is required (`%S <path>` or `--file_path:<path>`)", rd_cmd_kind_info_table[kind].string, rd_cmd_kind_info_table[kind].string);
+            }
+            else if(file_will_be_overwritten && !rd_regs()->force_confirm && rd_regs()->external_driver)
+            {
+              // rjf: an external driver cannot answer the popup, and must not pass through
+              // one which is open (a repeated command counts as the user's confirmation)
+              rd_ipc_refuse_unconfirmed_cmdf("%S: '%S' exists; pass `--force_confirm:1` to overwrite it", rd_cmd_kind_info_table[kind].string, new_path);
+            }
+            else if(file_will_be_overwritten && !rd_regs()->force_confirm && !ui_key_match(rd_state->popup_key, key))
             {
               rd_state->popup_key = key;
               rd_state->popup_active = 1;

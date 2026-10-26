@@ -440,6 +440,7 @@ struct RD_State
   B32 override_focus_on_stop;
   S32 frame_depth;
   U64 frame_eval_memread_endt_us;
+  B32 eval_memread_wait_for_fresh; // set while a scripted `eval` runs: memory reads wait for fresh pages (RD_CmdKind_Eval)
   U64 exited_process_count;             // processes which ended since the debugger started, and ...
   U64 last_exit_code;                   // ... the exit code of the last one (reported by `--ipc state`)
   SOCK_Endpoint ipc_sock_endpoint;
@@ -920,6 +921,7 @@ internal RD_CmdKindInfo *rd_cmd_kind_info_from_string(String8 string);
 
 //- rjf: pushing
 internal void rd_push_cmd(String8 name, RD_Regs *regs);
+internal void rd_ipc_refuse_unconfirmed_cmdf(char *fmt, ...);
 #define rd_cmd(kind, ...) rd_push_cmd(rd_cmd_kind_info_table[kind].string, &(RD_Regs){rd_regs_lit_init_top __VA_ARGS__})
 
 //- rjf: iterating

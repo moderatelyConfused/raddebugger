@@ -4,14 +4,17 @@
 # Previously `raddbg --ipc exit` was ignored while attached to a live process: the
 # GUI Exit command opens an "are you sure?" confirmation popup that an IPC client
 # cannot answer, so the instance stayed alive (README open issue: "exit over IPC
-# does not quit an instance with a live process (kill it by pid)"). The external
-# driver (IPC) now force-confirms Exit, so it exits and tears down the debuggee
-# exactly like the GUI's confirmed close.
+# does not quit an instance with a live process (kill it by pid)"). An external
+# driver's command is never answered a confirmation for: a plain `exit` with a live
+# debuggee is refused with an error in its reply (the instance stays, no popup
+# opens), and `exit --force_confirm:1` exits and tears down the debuggee exactly
+# like the GUI's confirmed close.
 #
 # The script launches an instance, adds and runs a long-lived target (so there is
-# a live debuggee), confirms running==1 and the debuggee process exists, sends
-# `exit`, and checks the instance process is gone shortly after (and reports what
-# happened to the debuggee).
+# a live debuggee), confirms running==1 and the debuggee process exists, sends a
+# plain `exit` (must be refused, instance still alive), then `exit
+# --force_confirm:1`, and checks the instance process is gone shortly after (and
+# reports what happened to the debuggee).
 #
 # Settings: RADDBG, SLEEPER (a long-lived target binary; built if missing),
 # IPC_PORT (7607), HARNESS_DIR.
@@ -58,8 +61,17 @@ DBG_PID=$(pgrep -f "$SLEEPER" | head -1)
 echo "running=$(field "$(ipc state)" running)  debuggee pid=$DBG_PID  (live precondition: $live)"
 if [[ $live -ne 1 ]]; then echo "FAIL: could not establish a live debuggee"; kill -9 $PID 2>/dev/null; exit 1; fi
 
-echo "=== sending IPC exit ==="
-ipc exit >/dev/null 2>&1
+echo "=== sending a plain IPC exit (must be refused: a live debuggee needs --force_confirm:1) ==="
+refusal=$(ipc exit 2>&1 | head -1)
+echo "reply: $refusal"
+sleep 0.5
+refused=0
+if echo "$refusal" | grep -q "^error: exit: still attached" && pgrep -f "raddbg --ipc_port:$P" >/dev/null; then refused=1; fi
+echo "plain exit refused, instance still alive: $refused"
+if [[ $refused -ne 1 ]]; then echo "FAIL: a plain exit with a live debuggee was not refused"; pgrep -f "raddbg --ipc_port:$P" | xargs kill -9 2>/dev/null; kill -9 $DBG_PID 2>/dev/null; exit 1; fi
+
+echo "=== sending IPC exit --force_confirm:1 ==="
+ipc exit --force_confirm:1 >/dev/null 2>&1
 # the instance must terminate shortly
 gone=0
 for i in $(seq 1 50); do pgrep -f "raddbg --ipc_port:$P" >/dev/null || { gone=1; break; }; sleep 0.1; done

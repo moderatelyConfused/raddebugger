@@ -552,14 +552,87 @@ parts of the execution; calls to `next()` after the first jump straight to
   `write` themselves.
 * Driving the debugger from a script: `launch_and_step_into` sent over `--ipc`
   has no target in its registers and launches nothing; send `step_into` with
-  no process instead. `exit` over IPC now quits an instance even with a live
-  debuggee: the external-driver path force-confirms the "attached to a live
-  process" popup and tears the debuggee down like the GUI's close
-  (`tests/ipc_exit_live.sh`). A `step_into` at the first instruction of an
-  inlined call only selects the next inline frame, without a run. Each IPC
-  `state` renders a frame, so poll at 100ms or slower. The harness used
-  (`h.sh`: launch, breakpoint, run, step, printing every stop with its inline
-  frames) runs a breakpoint-and-steps scenario in about a second.
+  no process instead. A command an external driver sends is never answered a
+  confirmation for: `exit` with a live debuggee, or `save_project` /
+  `save_user` over an existing file, is refused with an `error:` line in the
+  reply (the popup, which no script could answer, does not open, and a
+  repeated command does not pass through an open one as the GUI's second
+  request does); with `--force_confirm:1` the command runs, `exit` tearing the
+  debuggee down like the GUI's confirmed close (`tests/ipc_exit_live.sh`
+  checks both). A `step_into` at the first instruction of an inlined call only
+  selects the next inline frame, without a run. Each IPC `state` renders a
+  frame, so poll at 100ms or slower. The harness used (`h.sh`: launch,
+  breakpoint, run, step, printing every stop with its inline frames) runs a
+  breakpoint-and-steps scenario in about a second.
+* Frontend / IPC round (2026-10-26, `run_flows.sh ipc_commands ipc_transport`
+  and the IPC proofs check all of it):
+  * After a stop which reports a breakpoint hit held back from an earlier run
+    (several threads hit at once), `eval` of a local in the newly selected
+    thread's frame read 0 for ~100 ms. Cause: the source view evaluates the
+    stopped frame's locals (its auto annotations, `rd_code_slice`) only when
+    the selected thread is the *first* thread listed on the line; with four
+    threads on the breakpoint line the later selections were never first, so
+    nothing read their stack pages, and `eval` (a frame's spare time at most)
+    answered from the pending read. The annotations now look for the selected
+    thread anywhere on the line (`raddbg_widgets.c`). Independently, a scripted
+    `eval` now waits, up to 1 s, for what the frame's own evaluation does not:
+    fresh memory (a page cached at an earlier stop was accepted as it was: the
+    `watchpoint` values lagging the store by one stop), the selected thread's
+    call stack when the frame's eval context was built before it was ready
+    (`cfa` 0), and the debug info name search ("could not be found" for a few
+    hundred ms after a stop). `--ipc eval` answers once; the runner's `ev` no
+    longer retries or waits for two agreeing evaluations.
+  * `save_project` / `save_user` over IPC without a path took the focused
+    tab's source file as the destination (the file-path register of the IPC
+    command's registers) and overwrote it; a plain path did not fill the file
+    path register at all (only `path:line` did). A file-path slot now takes a
+    plain path (`rd_regs_fill_slot_from_string`), the save commands without a
+    path save the file the data lives in, and an external driver's command
+    (`RD_Regs.external_driver`) never inherits the focused tab's path.
+  * Chained commands (`cmd1; cmd2`) lose no output: checked for 11
+    combinations (eval, state, add_breakpoint, step, select_thread,
+    select_unwind, run, halt, kill_all). The losses recorded earlier were the
+    4 KB reply cut fixed above (a `state; eval` reply ended inside `state`).
+  * Transport: `sock_send` cut a message larger than its 256 KB ring while
+    the IPC header announced the full size, so a `state` with many modules or
+    breakpoints (~150 B each) arrived truncated after the client's 10 s wait;
+    a message now goes into the ring as 64 KB packets, sent in order on the
+    connection, and partial `send`s are completed (`mac_socket.c`). The server
+    took one 4 KB recv chunk as the whole command (a long `eval` was cut
+    silently); it gathers the chunks by the header's size now, as the client
+    does for replies (`raddbg_main.c`). `ipc_transport` sends a 1000-breakpoint
+    chained command (~460 KB) and reads back a 400 KB `state` in ~1 s.
+  * `--ipc --pid:<dbgpid> attach --pid:<target>` attached the debugger to its
+    own pid: the client forwarded every argument but `--ipc` as command text,
+    and `cmd_line_insert_opt` keeps the first `pid`. The client's options
+    (`--ipc_port`, `--ipc_addr`, and a `--pid` *before* the command name) stay
+    out of the text now; a `--pid` after the command name is the command's
+    (`tests/ipc_pid_routing.sh`, `ipc_pid_attach`). The pid-derived port moved
+    from the ephemeral range (49152 + pid % 16384, where macOS hands out ports
+    to outgoing connections) to 20000 + pid % 20000; a listener whose bind
+    fails is no session at all (it used to listen on a kernel-chosen port no
+    client knew) and the instance logs it; `state` reports the instance's
+    `pid`, and a `--pid` client which gets no answer on the pid port probes the
+    default port and uses it only when the `state` there names the addressed
+    pid.
+  * A `state` poll of a running target waited up to 1 s for the selected
+    thread's call stack; it takes what is cached while running and waits
+    250 ms at most otherwise. The virtual step-into (an inlined call's first
+    instruction) selects the next inline frame directly, as the stop handler
+    does, instead of through SelectUnwind (which needed the call stack within
+    10 ms); a step issued with an outer frame selected no longer passes that
+    frame's inline depth as the top frame's; the breakpoint-line frame
+    selection matches the breakpoint's file by name when the debug info's
+    path differs (path maps).
+  * Found, not fixed (the evaluator is not this round's area): an expression
+    of ~1000 nested binary operators (`1+1+...`, 2 KB) overflows the main
+    thread's stack in `e_push_irtree_and_type_from_expr` and crashes the
+    debugger; `ipc_transport` therefore tests long commands with a 6 KB string
+    literal. Timing, not a bug: `threads_breakpoints/thread_count_at_stop`
+    assumes the four workers hit together (three held-back hits); under load
+    the first worker can hit alone, the following runs resume the others and
+    the earlier workers finish, so the fourth stop sees 2 threads (3 of 10
+    runs in one loop on a busy machine, 0 of 26 otherwise).
 
 * Frame selection after a stop is done by the stop handler itself (base
   registers set from the event's address, one FindThread) rather than through
@@ -683,9 +756,7 @@ impact:
   page it has as it is; the `watchpoint` NOTEs, the TODO at `RD_CmdKind_Eval`);
   `eval` of a global right after a stop can answer "could not be found" for a
   few hundred ms (the name search is asynchronous); the first `eval` of
-  another thread's call stack can come back empty while it is being built; a
-  stop in a thread created after another exited evaluates in the main thread's
-  context (`D7`). In an outer frame only the callee-saved registers (x19-x28,
+  another thread's call stack can come back empty while it is being built. In an outer frame only the callee-saved registers (x19-x28,
   fp, lr, sp) are the frame's own: a local held in another register (an
   argument register at -O2) reads the inner frame's value, since the unwinder's
   register blocks carry no availability (lldb shows those as unavailable).
@@ -696,12 +767,11 @@ impact:
   accessing instruction, while the thread's registers (`pc`) are one
   instruction past it (the demon steps the thread past the access after
   reporting it).
-* IPC: `save_project` without `--file_path:<path>:<line>` takes the focused
-  tab's source file as its destination, and a second call while the overwrite
-  confirmation is up goes through it; a FilePath register is only filled from
-  a `path:line` string; option values cannot contain spaces; outputs pushed by
-  a chained command are often lost (double-buffered command queue), so check
-  effects via `state` or the logs.
+* IPC: option values cannot contain spaces (`--string:i==3`); an expression of
+  ~1000 nested binary operators (`eval 1+1+...`, 2 KB) crashes the debugger
+  (stack overflow in `e_push_irtree_and_type_from_expr`); `--ipc --pid` to an
+  instance whose pid-derived port is held by another process reaches it through
+  the default port only when that port is this instance's.
 * Demon: exec of a platform binary (`/bin/echo`) kills the traced process with
   `SIGTRAP` (the OS drops the exception ports; lldb behaves the same). A
   traced process' blocking syscalls return `EINTR` for signals it ignores
@@ -973,16 +1043,25 @@ codes), plus `NOTE` lines for observations without a verdict.
   `--prefix`/`--cache-dir` under `build/flows`, the generator's directory is
   untouched). Lines the scenarios refer to carry `// @tag` comments; the
   runner looks the numbers up by tag.
-* Run: `zsh src/mac/tests/flows/run_flows.sh` (all, ~7 minutes),
+* Run: `zsh src/mac/tests/flows/run_flows.sh` (all, ~4 minutes),
   `run_flows.sh -l` (list), `run_flows.sh stepping_O0 eval_O0` (some).
-  `HARNESS_DIR` keeps the project files, the user file and `logs/`
-  (`ui_thread.raddbg_log`: trap nets; `ctrl_thread.raddbg_log`: demon
-  events); `FLOWS_KEEP_LOGS=1` copies each scenario's logs and the debuggee's
-  output to `$HARNESS_DIR/logs_<scenario>/`. Scenario names: plain = feature
-  flows, `F*` = stepping/inline-frame review, `D*` = demon review, `U*` =
-  unwinder review.
-* `--ipc` additions for scripting: `state` reports `processes` (pids),
-  `exited_process_count` / `last_exit_code`, `selected_thread`, each thread's
+  `IPC_PORT` defaults to 7500 + pid % 100 (two concurrent runs do not kill
+  each other's instances); the instance is found by its listener (`lsof`,
+  LISTEN on the port) and killed by that pid, never by a name pattern.
+  `HARNESS_DIR` (created if missing) keeps the project files, the user file
+  and `logs/` (`ui_thread.raddbg_log`: trap nets; `ctrl_thread.raddbg_log`:
+  demon events); `FLOWS_KEEP_LOGS=1` copies each scenario's logs and the
+  debuggee's output to `$HARNESS_DIR/logs_<scenario>/`. The debuggees are
+  rebuilt when a source under `debuggees/` is newer than the build. The Zig
+  generator is named as the demon scripts name it (`GENERATOR_SRC`, `ZIG`;
+  `FLOWS_ZIG_GENERATOR` / `FLOWS_ZIG` still work), and its lines are looked
+  up in `main.zig` by their text (`line_of_pattern`), not hard-coded. Scenario
+  names: plain = feature flows (`ipc_commands` / `ipc_transport` drive the
+  `--ipc` layer itself), `F*` = stepping/inline-frame review, `D*` = demon
+  review, `U*` = unwinder review.
+* `--ipc` additions for scripting: `state` reports the instance's `pid`, the
+  `processes` (pids), `exited_process_count` / `last_exit_code`,
+  `selected_thread`, each thread's
   `frozen` flag, the selected thread's `call_stack` (per frame `unwind_count`,
   `inline_depth`, `ip`, `module`, `symbol` (callers looked up at the call),
   `ip_symbol` (at the frame's pc itself), `file_name`, `line_num`), the
@@ -992,17 +1071,17 @@ codes), plus `NOTE` lines for observations without a verdict.
   `freeze_thread --thread:456`, `select_thread --thread:456`, `detach
   --process:123`); `--prefer_disasm:1` / `--force_confirm:1` set the boolean
   registers. Option values cannot contain spaces (`--string:i==3`).
-* Scripting caveats: right after a stop `eval` of a global can answer "`x`
-  could not be found" for a few hundred milliseconds (`di_match_from_string`
-  searches the debug infos asynchronously and `eval` does not wait), and a
-  value in memory the frontend has not read yet prints as 0 until the
-  asynchronous page read lands (`eval` waits a frame's spare time at most,
-  see the TODO at `RD_CmdKind_Eval`; the frontend's own views read the
-  stopping thread's frame at an ordinary stop before a script gets to it, but
-  not at a stop which reports a breakpoint hit held back from an earlier run,
-  `threads_breakpoints` since the fix below); the runner's `ev` retries the
-  former and accepts an answer only once two consecutive evaluations agree.
-  `eval` over `--ipc` runs with `disable_addresses`:
+* Scripting caveats: `eval` over `--ipc` evaluates once and waits, up to 1 s,
+  for fresh memory, the selected thread's call stack and the debug info name
+  search (`RD_CmdKind_Eval`), so one evaluation is the answer; the runner's
+  `ev` is a single `ipc eval` (it used to retry "could not be found" and to
+  accept an answer only once two consecutive evaluations agreed, when `eval`
+  waited a frame's spare time at most and the source view's auto annotations
+  had not read a held-back stop's frame, see "Frontend / IPC round" under
+  "Status and open issues"). A command needing a confirmation (`exit` with a
+  live debuggee, a save over an existing file) is refused with an `error:`
+  line unless it carries `--force_confirm:1`. `eval` over `--ipc` runs with
+  `disable_addresses`:
   pointers print their pointee, address casts give 0, a function's address
   cannot be read (`&inner` prints the signature); use the stop's `ip` from
   `state`. Never `wait` on a shell background process the debugger attached
@@ -1010,12 +1089,8 @@ codes), plus `NOTE` lines for observations without a verdict.
 
 ### Results and findings (2026-10-25, this branch)
 
-Last full run (2026-10-26, with the stepping fixes below): 403 checks passed,
-21 failed, 51 scenario runs in 210 s (the same tree before them: 362 passed,
-38 failed, 46 runs; nothing that passed then fails now; `U5`'s
-`tls_counter_after_access` is newly reached and fails for a reason of its own,
-see below). The run before the stepping work, with the breakpoint fixes: 316
-passed, 68 failed, 45 runs in 196 s. Every failure below is a
+Last full run: see the merged-tree summary at the end of this section (the
+per-branch numbers of the day's rounds are superseded). Every failure below is a
 recorded bug or observation; scenarios fully passing include
 launch/kill/restart/exit, the breakpoint flows (line, inline line, dylib
 before load, address, condition, hit counts, toggle/remove, function name
@@ -1318,6 +1393,10 @@ fixed since by the demon and unwinder work and are not repeated here):
   read has not landed (whichever form it is: evaluating `(*rec).name` first
   gives `""` for it and `"rec"` for `rec->name`), the scripting caveat above;
   the scenario evaluates `(*rec).name` first and checks `rec->name` after it.
+* `D7` (a stop in a thread created after another thread exited) passes: `idx`
+  reads 7 and `worker_body` is on the stack; the 0 it used to read was the
+  scripted `eval` answering before the frame's memory was read (fixed with the
+  held-back-stop evaluation, "Frontend / IPC round").
 * `dylib_host_O0` ends with exit code 0 and without its final `printf` output
   under the debugger (natively: "host done 8", exit 8) after the second
   `dlclose` (`modules/exit_code`).

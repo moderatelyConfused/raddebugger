@@ -584,10 +584,102 @@ internal D_WAKEUP_FUNCTION_DEF(wakeup_hook_ctrl)
 internal U16
 rd_ipc_port_from_pid(U64 pid)
 {
-  // rjf: into the IANA dynamic/ephemeral range (49152..65535), away from 7423
-  // and any well-known ports.
-  U16 port = (U16)(49152 + (pid % 16384));
+  // rjf: a window of the IANA registered range (20000..39999): the dynamic/ephemeral
+  // range (49152..65535, used before) is where macOS hands out ports to outgoing
+  // connections, so the pid-derived listener collided with them. away from 7423 and
+  // any well-known ports. src/mac/tests/ipc_pid_routing.sh derives the same port.
+  U16 port = (U16)(20000 + (pid % 20000));
   return port;
+}
+
+//- rjf: `--ipc` client round trip: sends a command text to an instance, returns its reply
+// (the outputs, 0-separated), or a zero string when nothing came back within the deadline.
+// a reply larger than the listener's recv chunk arrives as several ring packets (the first
+// carries the magic+size header); continuation packets are accumulated until the whole
+// message has been received.
+internal String8
+rd_ipc_round_trip(Arena *arena, SOCK_Session session, SOCK_Endpoint endpoint, U32 magic, String8 text, U64 endt_us)
+{
+  Temp scratch = scratch_begin(&arena, 1);
+  String8 result = {0};
+  String8 msg = {0};
+  {
+    String8List parts = {0};
+    U64 msg_size = text.size;
+    str8_list_push(scratch.arena, &parts, str8_struct(&magic));
+    str8_list_push(scratch.arena, &parts, str8_struct(&msg_size));
+    str8_list_push(scratch.arena, &parts, text);
+    msg = str8_list_join(scratch.arena, &parts, 0);
+  }
+  if(sock_send(session, SOCK_Protocol_TCP, endpoint, msg, endt_us))
+  {
+    SOCK_Protocol outputs_protocol = SOCK_Protocol_TCP;
+    SOCK_Endpoint outputs_endpoint = {0};
+    String8 packet = {0};
+    if(sock_recv(scratch.arena, session, &outputs_protocol, &outputs_endpoint, &packet, endt_us) &&
+       str8_match(packet, str8_struct(&magic), StringMatchFlag_RightSideSloppy) &&
+       packet.size >= sizeof(magic) + sizeof(U64))
+    {
+      U64 header_size = sizeof(magic) + sizeof(U64);
+      U64 msg_size = *(U64 *)(packet.str + sizeof(magic));
+      String8List msg_parts = {0};
+      str8_list_push(scratch.arena, &msg_parts, str8_skip(packet, header_size));
+      U64 got = packet.size - header_size;
+      while(got < msg_size)
+      {
+        String8 more = {0};
+        if(!sock_recv(scratch.arena, session, &outputs_protocol, &outputs_endpoint, &more, endt_us) || more.size == 0)
+        {
+          break;
+        }
+        str8_list_push(scratch.arena, &msg_parts, more);
+        got += more.size;
+      }
+      String8 joined = str8_list_join(scratch.arena, &msg_parts, 0);
+      joined.size = Min(joined.size, msg_size);
+      result = str8_copy(arena, joined);
+      if(result.size == 0)
+      {
+        // rjf: an empty reply is still a reply (a command without output)
+        result.str = push_array(arena, U8, 1);
+      }
+    }
+  }
+  scratch_end(scratch);
+  return result;
+}
+
+//- rjf: `--ipc` client: the routing options (`--pid`, `--ipc_port`, `--ipc_addr`) address
+// the instance and must not reach it as command text: `pid` is also a register slot, so
+// `--ipc --pid:<dbgpid> attach --pid:<target>` used to attach to the debugger's own pid
+// (cmd_line_insert_opt keeps the first occurrence).
+internal B32
+rd_ipc_arg_is_routing_option(String8 arg)
+{
+  B32 result = 0;
+  String8 names[] = { str8_lit_comp("pid"), str8_lit_comp("ipc_port"), str8_lit_comp("ipc_addr") };
+  String8 prefixes[] = { str8_lit_comp("--"), str8_lit_comp("-") };
+  String8 seps[] = { str8_lit_comp(":"), str8_lit_comp("=") };
+  for EachElement(name_idx, names)
+  {
+    for EachElement(prefix_idx, prefixes)
+    {
+      for EachElement(sep_idx, seps)
+      {
+        Temp scratch = scratch_begin(0, 0);
+        String8 opt = push_str8f(scratch.arena, "%S%S%S", prefixes[prefix_idx], names[name_idx], seps[sep_idx]);
+        if(str8_match(arg, opt, StringMatchFlag_RightSideSloppy))
+        {
+          result = 1;
+        }
+        scratch_end(scratch);
+        if(result) { break; }
+      }
+      if(result) { break; }
+    }
+    if(result) { break; }
+  }
+  return result;
 }
 
 ////////////////////////////////
@@ -729,6 +821,13 @@ entry_point(CmdLine *cmd_line)
       
       //- rjf: set up socket session for IPC
       SOCK_Session ipc_sock_session = sock_session_open((U16)ipc_port, wakeup_hook_ctrl);
+      if(ipc_sock_session.u64[0] == 0)
+      {
+        // NOTE: the port is held by another process (another instance, most likely): this
+        // instance answers no `--ipc` command on it. the session layer returns no session
+        // instead of listening on a kernel-chosen port no client knows.
+        log_user_errorf("Could not listen for `--ipc` commands on port %I64u (the port is in use); this instance cannot be driven over IPC.", ipc_port);
+      }
       
       //- rjf: also listen on a port derived from our own pid, so a client can address
       // *this* instance with `raddbg --ipc --pid:<pid> <cmd>` even when another instance
@@ -766,7 +865,10 @@ entry_point(CmdLine *cmd_line)
             }
             if(ipc_got_packet)
             {
-              // rjf: use header to determine message portion
+              // rjf: use header to determine message portion. a command longer than the
+              // listener's recv chunk (4 KB) arrives as several ring packets: the header's
+              // size says how much follows; continuation packets are gathered (briefly) until
+              // the whole command text is in, instead of cutting a long `eval` without notice.
               String8 msg = {0};
               {
                 U64 msg_size = 0;
@@ -774,10 +876,25 @@ entry_point(CmdLine *cmd_line)
                 if(str8_match(packet, str8_struct(&ipc_packet_magic_start), StringMatchFlag_RightSideSloppy) &&
                    packet.size >= header_size)
                 {
-                  U64 msg_size_cap = packet.size - header_size;
                   msg_size = *(U64 *)(packet.str + sizeof(ipc_packet_magic_start));
-                  msg_size = Min(msg_size, msg_size_cap);
-                  msg = str8_substr(packet, r1u64(header_size, header_size+msg_size));
+                  String8List msg_parts = {0};
+                  str8_list_push(scratch.arena, &msg_parts, str8_skip(packet, header_size));
+                  U64 got = packet.size - header_size;
+                  U64 recv_endt = now_time_us()+2000000;
+                  while(got < msg_size)
+                  {
+                    String8 more = {0};
+                    SOCK_Protocol more_protocol = SOCK_Protocol_TCP;
+                    SOCK_Endpoint more_endpoint = {0};
+                    if(!sock_recv(scratch.arena, ipc_reply_session, &more_protocol, &more_endpoint, &more, recv_endt) || more.size == 0)
+                    {
+                      break;
+                    }
+                    str8_list_push(scratch.arena, &msg_parts, more);
+                    got += more.size;
+                  }
+                  msg = str8_list_join(scratch.arena, &msg_parts, 0);
+                  msg.size = Min(msg.size, msg_size);
                 }
               }
               
@@ -915,66 +1032,95 @@ entry_point(CmdLine *cmd_line)
         }
       }
       
-      //- rjf: form message from command line inputs
-      String8List parts = {0};
+      //- rjf: form message from command line inputs. the client's own options (`--ipc`,
+      // `--ipc_port`, `--ipc_addr`, and a `--pid` *before* the command name, which addresses
+      // the instance) stay out of the command text; a `--pid` after the command name belongs
+      // to the command (`attach --pid:<target>`), and does not address an instance.
+      String8 text = {0};
       {
         String8List text_parts = {0};
+        B32 seen_cmd_name = 0;
+        U64 routing_pid = 0;
         for EachIndex(idx, cmd_line->argc-1)
         {
           String8 arg = str8_cstring(cmd_line->argv[idx+1]);
-          if(!str8_match(arg, s("--ipc"), 0) && !str8_match(arg, s("-ipc"), 0))
+          if(str8_match(arg, s("--ipc"), 0) || str8_match(arg, s("-ipc"), 0))
           {
-            str8_list_push(scratch.arena, &text_parts, arg);
+            continue;
           }
+          B32 is_option = (arg.size != 0 && arg.str[0] == '-');
+          if(!seen_cmd_name && !is_option)
+          {
+            seen_cmd_name = 1;
+          }
+          B32 is_routing = 0;
+          if(rd_ipc_arg_is_routing_option(arg))
+          {
+            B32 is_pid_opt = (str8_match(arg, s("--pid"), StringMatchFlag_RightSideSloppy) ||
+                              str8_match(arg, s("-pid"), StringMatchFlag_RightSideSloppy));
+            is_routing = (!is_pid_opt || !seen_cmd_name);
+            if(is_routing && is_pid_opt)
+            {
+              U64 colon_pos = str8_find_needle(arg, 0, s(":"), 0);
+              U64 eq_pos    = str8_find_needle(arg, 0, s("="), 0);
+              try_u64_from_str8_c_rules(str8_skip(arg, Min(colon_pos, eq_pos)+1), &routing_pid);
+            }
+          }
+          if(is_routing)
+          {
+            continue;
+          }
+          str8_list_push(scratch.arena, &text_parts, arg);
         }
         StringJoin join = {.sep = s(" ")};
-        String8 text = str8_list_join(scratch.arena, &text_parts, &join);
-        U64 msg_size = text.size;
-        str8_list_push(scratch.arena, &parts, str8_struct(&ipc_packet_magic_start));
-        str8_list_push(scratch.arena, &parts, str8_struct(&msg_size));
-        str8_list_push(scratch.arena, &parts, text);
-      }
-      String8 msg = str8_list_join(scratch.arena, &parts, 0);
-      
-      //- rjf: send to server, get outputs
-      String8List outputs = {0};
-      if(sock_send(ipc_sock_session, SOCK_Protocol_TCP, endpoint, msg, now_time_us()+10000000))
-      {
-        SOCK_Protocol outputs_protocol = SOCK_Protocol_TCP;
-        SOCK_Endpoint outputs_endpoint = {0};
-        String8 packet = {0};
-        if(sock_recv(scratch.arena, ipc_sock_session, &outputs_protocol, &outputs_endpoint, &packet, now_time_us()+10000000) &&
-           str8_match(packet, str8_struct(&ipc_packet_magic_start), StringMatchFlag_RightSideSloppy) &&
-           packet.size >= sizeof(ipc_packet_magic_start) + sizeof(U64))
+        text = str8_list_join(scratch.arena, &text_parts, &join);
+        // rjf: a `--pid` which follows the command name is not an address
+        if(routing_pid == 0 && ipc_target_pid != 0)
         {
-          U64 header_size = sizeof(ipc_packet_magic_start) + sizeof(U64);
-          U64 msg_size = *(U64 *)(packet.str + sizeof(ipc_packet_magic_start));
-          // rjf: a reply larger than the listener's recv chunk arrives as several ring
-          // packets (the first carries the magic+size header); accumulate continuation
-          // packets until the whole message has been received.
-          String8List msg_parts = {0};
-          str8_list_push(scratch.arena, &msg_parts, str8_skip(packet, header_size));
-          U64 got = packet.size - header_size;
-          U64 recv_endt = now_time_us()+10000000;
-          while(got < msg_size)
+          ipc_target_pid = 0;
+          if(!ipc_port_is_explicit)
           {
-            String8 more = {0};
-            if(!sock_recv(scratch.arena, ipc_sock_session, &outputs_protocol, &outputs_endpoint, &more, recv_endt) || more.size == 0)
-            {
-              break;
-            }
-            str8_list_push(scratch.arena, &msg_parts, more);
-            got += more.size;
+            endpoint.port = (U16)ipc_port;
           }
-          String8 msg = str8_list_join(scratch.arena, &msg_parts, 0);
-          msg.size = Min(msg.size, msg_size);
-          U8 split_char = 0;
-          outputs = str8_split(scratch.arena, msg, &split_char, 1, 0);
         }
       }
-      
+
+      //- rjf: send to server, get outputs
+      String8 reply = rd_ipc_round_trip(scratch.arena, ipc_sock_session, endpoint, ipc_packet_magic_start, text, now_time_us()+10000000);
+
+      //- rjf: `--pid` routing without a reply: the instance may not listen on its pid-derived
+      // port (the bind failed: another process held the port). a probe of the default port
+      // decides, by the pid `state` reports, whether the addressed instance is there; the
+      // command is only sent again when it is (never to some other instance).
+      if(reply.str == 0 && ipc_target_pid != 0 && !ipc_port_is_explicit && cmd_line_string(cmd_line, s("ipc_addr")).size == 0)
+      {
+        SOCK_Endpoint default_endpoint = endpoint;
+        default_endpoint.port = (U16)ipc_port;
+        String8 probe = rd_ipc_round_trip(scratch.arena, ipc_sock_session, default_endpoint, ipc_packet_magic_start, s("state"), now_time_us()+3000000);
+        String8 pid_needle = push_str8f(scratch.arena, " pid: %I64u\n", ipc_target_pid);
+        if(probe.str != 0 && str8_find_needle(probe, 0, pid_needle, 0) < probe.size)
+        {
+          fprintf(stderr, "raddbg: the instance with pid %llu does not answer on its pid-derived port %u; reached on port %llu instead\n", (unsigned long long)ipc_target_pid, rd_ipc_port_from_pid(ipc_target_pid), (unsigned long long)ipc_port);
+          reply = rd_ipc_round_trip(scratch.arena, ipc_sock_session, default_endpoint, ipc_packet_magic_start, text, now_time_us()+10000000);
+        }
+        else
+        {
+          fprintf(stderr, "raddbg: no instance with pid %llu answers (port %u, nor port %llu)\n", (unsigned long long)ipc_target_pid, rd_ipc_port_from_pid(ipc_target_pid), (unsigned long long)ipc_port);
+        }
+      }
+      String8List outputs = {0};
+      if(reply.str != 0)
+      {
+        U8 split_char = 0;
+        outputs = str8_split(scratch.arena, reply, &split_char, 1, 0);
+      }
+
       //- rjf: write outputs to stdout
-      if(outputs.node_count == 0)
+      if(reply.str == 0)
+      {
+        fprintf(stdout, "(no response)\n");
+      }
+      else if(outputs.node_count == 0)
       {
         fprintf(stdout, "(response received, no output)\n");
       }

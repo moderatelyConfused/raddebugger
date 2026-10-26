@@ -2504,8 +2504,21 @@ rd_code_slice(RD_CodeSliceParams *params, U64 *cursor, U64 *mark, S64 *preferred
       CFG_NodePtrList immediate_pins = {0};
       if(do_autos)
       {
+        // NOTE: the selected thread may be any of the threads stopped on this line, not
+        // only the first one listed (several threads hit a breakpoint at once: the stops
+        // which report the held-back hits select the other threads; their frames were not
+        // evaluated here, so their locals stayed unread until something else asked)
         D_EntityList line_ips = params->line_ips[line_idx];
-        if(line_ips.count > 0 && d_handle_match(line_ips.first->v->handle, rd_regs()->thread))
+        B32 selected_thread_is_on_line = 0;
+        for(D_EntityNode *n = line_ips.first; n != 0; n = n->next)
+        {
+          if(d_handle_match(n->v->handle, rd_regs()->thread))
+          {
+            selected_thread_is_on_line = 1;
+            break;
+          }
+        }
+        if(selected_thread_is_on_line)
         {
           for EachIndex(idx, auto_exprs.count)
           {
