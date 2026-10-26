@@ -193,6 +193,7 @@ mac_dmn_image_info_from_header_vaddr(mach_port_t task, U64 header_vaddr)
     info.valid        = 1;
     info.cputype      = hdr.cputype;
     info.filetype     = hdr.filetype;
+    info.flags        = hdr.flags;
     info.header_vaddr = header_vaddr;
     
     //- rjf: scan load commands
@@ -443,6 +444,181 @@ mac_dmn_symbol_vaddr_from_image(mach_port_t task, MAC_DMN_ImageInfo *image, Stri
 // image and mapping tables across the sub-cache files for the exact cache the
 // debuggee maps, a format that changes between releases; the memory route
 // reuses the parsing the demon already does for every image.
+//
+// Local symbols: the cache macOS 26.6 ships is a development-type cache
+// (`dyld_cache_header.cacheType` 0, `localSymbolsOffset` 0, `symbolFileUUID`
+// zero, no `.symbols` file on disk), and every image's `LC_SYMTAB` keeps its
+// locals (libsystem_c: 1299 `N_EXT`, 200 `N_PEXT`, 769 plain locals; lldb's
+// table of the image is the same set plus synthesized stub names), so the
+// symbol-only file names them all. A production cache (macOS 12-15 shipped
+// `dyld_shared_cache_<arch>.symbols`) strips the locals into that file's
+// `dyld_cache_local_symbols_info` chunk; reading it would go here, keyed by
+// the running cache's header, and has not been written for lack of such a
+// cache to test against.
+//
+// The images cache only grows (every macOS update changes every UUID), so the
+// first symbol-only file of a debugger session sweeps it (below).
+
+////////////////////////////////
+//~ rjf: Cache Directory Sweeping
+//
+// `path`'s subdirectories unused for more than `max_age_days` (their modification
+// time; the reuse path refreshes it) are removed, then the oldest of the rest
+// until they fit `max_total_size`. One listing of `path` and one of each
+// subdirectory (for its size); the images cache's thousand directories take a
+// few milliseconds. Returns the number of directories removed.
+
+#define MAC_DMN_IMAGES_CACHE_MAX_AGE_DAYS 30
+#define MAC_DMN_IMAGES_CACHE_MAX_SIZE     GB(1)
+
+typedef struct MAC_DMN_SweepEntry MAC_DMN_SweepEntry;
+struct MAC_DMN_SweepEntry
+{
+  String8 path;
+  U64 day_index;
+  U64 size;
+};
+
+internal U64
+mac_dmn_day_index_from_dense_time(DenseTime time)
+{
+  return time / (1000ull*61*60*24); // DenseTime: ..., day*24+hour, *60+min, *61+sec, *1000+msec
+}
+
+internal int
+mac_dmn_sweep_entry_compare(MAC_DMN_SweepEntry *a, MAC_DMN_SweepEntry *b)
+{
+  int result = 0;
+  if(0){}
+  else if(a->day_index < b->day_index) { result = -1; }
+  else if(a->day_index > b->day_index) { result = +1; }
+  return result;
+}
+
+internal U64
+mac_dmn_directory_size(String8 path, U64 depth)
+{
+  U64 result = 0;
+  if(depth < 8)
+  {
+    Temp scratch = scratch_begin(0, 0);
+    FileIter *iter = file_iter_begin(scratch.arena, path, 0);
+    for(FileInfo info = {0}; file_iter_next(scratch.arena, iter, &info);)
+    {
+      if(info.props.flags & FilePropertyFlag_IsFolder)
+      {
+        result += mac_dmn_directory_size(str8f(scratch.arena, "%S/%S", path, info.name), depth+1);
+      }
+      else
+      {
+        result += info.props.size;
+      }
+    }
+    file_iter_end(iter);
+    scratch_end(scratch);
+  }
+  return result;
+}
+
+internal B32
+mac_dmn_delete_directory_recursively(String8 path, U64 depth)
+{
+  B32 result = 0;
+  if(depth < 8)
+  {
+    Temp scratch = scratch_begin(0, 0);
+    FileIter *iter = file_iter_begin(scratch.arena, path, 0);
+    for(FileInfo info = {0}; file_iter_next(scratch.arena, iter, &info);)
+    {
+      String8 child = str8f(scratch.arena, "%S/%S", path, info.name);
+      if(info.props.flags & FilePropertyFlag_IsFolder)
+      {
+        mac_dmn_delete_directory_recursively(child, depth+1);
+      }
+      else
+      {
+        delete_file_at_path(child);
+      }
+    }
+    file_iter_end(iter);
+    result = delete_file_at_path(path); // remove(2) deletes an empty directory
+    scratch_end(scratch);
+  }
+  return result;
+}
+
+internal U64
+mac_dmn_delete_stale_subdirectories(String8 path, U64 max_age_days, U64 max_total_size)
+{
+  U64 removed_count = 0;
+  Temp scratch = scratch_begin(0, 0);
+
+  //- rjf: gather subdirectories
+  typedef struct Node Node;
+  struct Node { Node *next; MAC_DMN_SweepEntry v; };
+  Node *first = 0;
+  U64 count = 0;
+  U64 total_size = 0;
+  {
+    FileIter *iter = file_iter_begin(scratch.arena, path, FileIterFlag_SkipFiles|FileIterFlag_SkipHiddenFiles);
+    for(FileInfo info = {0}; file_iter_next(scratch.arena, iter, &info);)
+    {
+      Node *n = push_array(scratch.arena, Node, 1);
+      n->v.path      = str8f(scratch.arena, "%S/%S", path, info.name);
+      n->v.day_index = mac_dmn_day_index_from_dense_time(info.props.modified);
+      n->v.size      = mac_dmn_directory_size(n->v.path, 1);
+      SLLStackPush(first, n);
+      count += 1;
+      total_size += n->v.size;
+    }
+    file_iter_end(iter);
+  }
+
+  //- rjf: oldest first: remove while too old or too much
+  if(count != 0)
+  {
+    MAC_DMN_SweepEntry *entries = push_array_no_zero(scratch.arena, MAC_DMN_SweepEntry, count);
+    {
+      U64 idx = 0;
+      for(Node *n = first; n != 0; n = n->next, idx += 1)
+      {
+        entries[idx] = n->v;
+      }
+    }
+    quick_sort(entries, count, sizeof(MAC_DMN_SweepEntry), mac_dmn_sweep_entry_compare);
+    U64 today = mac_dmn_day_index_from_dense_time(dense_time_from_date_time(now_time_universal()));
+    for EachIndex(idx, count)
+    {
+      MAC_DMN_SweepEntry *e = &entries[idx];
+      B32 too_old  = (e->day_index < today && today - e->day_index > max_age_days);
+      B32 too_much = (total_size > max_total_size);
+      if(!too_old && !too_much)
+      {
+        break;
+      }
+      if(mac_dmn_delete_directory_recursively(e->path, 1))
+      {
+        removed_count += 1;
+      }
+      total_size -= Min(total_size, e->size);
+    }
+  }
+  scratch_end(scratch);
+  return removed_count;
+}
+
+// rjf: marks a cache directory used (its modification time is what the sweep judges)
+internal void
+mac_dmn_touch_directory(String8 path)
+{
+  Temp scratch = scratch_begin(0, 0);
+  String8 path_copy = push_str8_copy(scratch.arena, path);
+  utimes((char *)path_copy.str, 0);
+  scratch_end(scratch);
+}
+
+////////////////////////////////
+//~ rjf: Symbol-Only Image File Writing
 
 internal int
 mac_dmn_kept_symbol_compare(MAC_DMN_KeptSymbol *a, MAC_DMN_KeptSymbol *b)
@@ -710,7 +886,11 @@ mac_dmn_debug_info_path_from_image(Arena *arena, mach_port_t task, MAC_DMN_Image
     return result;
   }
 
-  //- rjf: the path is a file with this image's UUID -> that file is the debug info
+  //- rjf: the path is a file with this image's UUID -> that file is the debug info.
+  // (a shared-cache image never is one; skip the file open for those)
+#if defined(MH_DYLIB_IN_CACHE)
+  if(!(image->flags & MH_DYLIB_IN_CACHE))
+#endif
   {
     Guid file_uuid = {0};
     if(macho_uuid_from_file_path(path, &file_uuid) && MemoryMatch(&file_uuid, &image->uuid, sizeof(Guid)))
@@ -729,9 +909,25 @@ mac_dmn_debug_info_path_from_image(Arena *arena, mach_port_t task, MAC_DMN_Image
     String8 images_dir = str8f(scratch.arena, "%S/images", raddbg_dir);
     String8 image_dir  = str8f(scratch.arena, "%S/%S", images_dir, string_from_guid(scratch.arena, image->uuid));
     String8 file_path  = str8f(arena, "%S/%S", image_dir, image_name);
+
+    //- rjf: once per debugger session, sweep the cache: every macOS update changes every
+    // UUID, so without this it only grows (1018 directories, 1.4 GB with the RDIs the
+    // engine writes next to the images, on the author's machine)
+    if(!mac_dmn_state->images_cache_swept)
+    {
+      mac_dmn_state->images_cache_swept = 1;
+      U64 removed_count = mac_dmn_delete_stale_subdirectories(images_dir, MAC_DMN_IMAGES_CACHE_MAX_AGE_DAYS, MAC_DMN_IMAGES_CACHE_MAX_SIZE);
+      if(removed_count != 0)
+      {
+        log_infof("mac demon: removed %I64u image director%s from %S (unused for %u days, or beyond %I64u MB).\n", removed_count, removed_count == 1 ? "y" : "ies", images_dir, (U32)MAC_DMN_IMAGES_CACHE_MAX_AGE_DAYS, (U64)(MAC_DMN_IMAGES_CACHE_MAX_SIZE/MB(1)));
+      }
+    }
+
+    //- rjf: an existing file is reused, and its directory marked used for the sweep
     if(properties_from_file_path(file_path).size != 0)
     {
       result = file_path;
+      mac_dmn_touch_directory(image_dir);
     }
     else
     {
