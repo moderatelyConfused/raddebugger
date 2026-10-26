@@ -402,7 +402,16 @@ sock_session_open(U16 listener_port, SOCK_WakeupFunctionType *wakeup_hook)
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(listener_port);
-    bind(session->tcp_listen_socket, (struct sockaddr *)&server_addr, sizeof(server_addr));
+    // NOTE: without SO_REUSEADDR the bind fails while connections of a previous
+    // instance (e.g. `--ipc` clients) linger in TIME_WAIT on the port, and the
+    // listener is then silently unreachable for seconds; a restarted debugger
+    // did not answer IPC for ~10s.
+    int reuse_addr = 1;
+    setsockopt(session->tcp_listen_socket, SOL_SOCKET, SO_REUSEADDR, &reuse_addr, sizeof(reuse_addr));
+    if(bind(session->tcp_listen_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) != 0)
+    {
+      log_infof("mac socket: could not bind the IPC listener to port %u (errno %d)\n", (unsigned)listener_port, errno);
+    }
     listen(session->tcp_listen_socket, SOMAXCONN);
     mac_sock_kqueue_add(session->kqueue_fd, session->tcp_listen_socket, 0);
   }

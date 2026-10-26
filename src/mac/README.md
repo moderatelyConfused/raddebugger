@@ -201,9 +201,23 @@ parts of the execution; calls to `next()` after the first jump straight to
   the inlined callee; the stop now selects the frame of the breakpoint's own
   line (so main.zig:57 shows main.zig:57, with `next` as the frame below), and
   the find-thread retry and auto-unwind no longer override a selected frame.
+* Wake-ups from other threads (a stop on the control thread, an IPC message
+  on the socket listener thread) posted a Cocoa event from that thread, which
+  does not wake a main thread blocked in `-nextEventMatchingMask:untilDate:`;
+  stops and IPC commands were serviced seconds later, whenever something else
+  woke the loop. `mac_plat_send_wakeup_event` now posts from the main queue.
+  The IPC listener sets `SO_REUSEADDR` (a restarted debugger could not bind
+  while old connections lingered) and messages that arrive before the first
+  window exists are run and answered instead of dropped.
+* Still open in IPC: the *first* reply of a fresh instance is delivered to
+  the instance itself (its listener receives a packet of the reply's size
+  right after the reply is sent), so the first `--ipc` client waits out its
+  10 s timeout; every later command is answered within ~40 ms. The connection
+  lookup in `sock_async_tick` (`mac_socket.c`) is where to look.
 * Driving the debugger from a script: `launch_and_step_into` sent over `--ipc`
   has no target in its registers and launches nothing; send `step_into` with
-  no process instead. `exit` over IPC does not quit an instance with a live
+  no process instead. Fire one throwaway command in the background right
+  after the port accepts connections, to absorb the first-reply stall. `exit` over IPC does not quit an instance with a live
   process (kill it by pid). A `step_into` at the first instruction of an
   inlined call only selects the next inline frame, without a run. Each IPC
   `state` renders a frame, so poll at 100ms or slower. The harness used

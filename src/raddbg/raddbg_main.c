@@ -778,6 +778,28 @@ entry_point(CmdLine *cmd_line)
                   rd_state->ipc_sock_endpoint = ipc_endpoint;
                 }
               }
+              
+              // rjf: no window yet (the message arrived during startup) -> run the
+              // commands without a window's context, and still reply: a client
+              // whose message is dropped otherwise waits out its whole timeout
+              // (the first `--ipc` command after launching took 10 seconds).
+              else
+              {
+                RD_RegsScope()
+                {
+                  for EachNode(n, String8Node, cmd_parts_of_msg.first)
+                  {
+                    String8 cmd_string = str8_skip_chop_whitespace(n->string);
+                    if(cmd_string.size != 0)
+                    {
+                      rd_cmd(RD_CmdKind_RunExternalDriverTextCommand, .string = cmd_string);
+                    }
+                  }
+                  rd_request_frame();
+                  ipc_command_frame = 1;
+                  rd_state->ipc_sock_endpoint = ipc_endpoint;
+                }
+              }
             }
             scratch_end(scratch);
           }

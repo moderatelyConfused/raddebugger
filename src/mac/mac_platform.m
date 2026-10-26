@@ -1642,8 +1642,8 @@ mac_plat_clear_events(void)
   mac_plat_events_count = 0;
 }
 
-void
-mac_plat_send_wakeup_event(void)
+static void
+mac_plat_post_wakeup_event_on_main_thread(void)
 {
   @autoreleasepool
   {
@@ -1660,6 +1660,27 @@ mac_plat_send_wakeup_event(void)
                                              data2:0];
       [NSApp postEvent:event atStart:YES];
     }
+  }
+}
+
+void
+mac_plat_send_wakeup_event(void)
+{
+  // NOTE: the callers are other threads (the control thread on a stop, the
+  // socket listener thread on an IPC message). an event posted from another
+  // thread does not wake a main thread blocked in -nextEventMatchingMask:
+  // untilDate:distantFuture; it was only seen at the next wakeup from some
+  // other source (seconds later: stops and IPC commands appeared to idle).
+  // post it from the main queue, which does wake the main run loop.
+  if([NSThread isMainThread])
+  {
+    mac_plat_post_wakeup_event_on_main_thread();
+  }
+  else
+  {
+    dispatch_async(dispatch_get_main_queue(), ^{
+      mac_plat_post_wakeup_event_on_main_thread();
+    });
   }
 }
 
