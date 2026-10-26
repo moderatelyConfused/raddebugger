@@ -259,6 +259,38 @@ bundled with Zig: `zig cc -target aarch64-macos -fsyntax-only ...`).
   `b`/`br` right after the frame record pop (or any stack pop) is a tail call.
   The prologue replay is relaxed the same way, so argument moves between the
   stack adjustment and the stores do not end it.
+* Shrink-wrapping (Apple clang -O2 by default): a function's early-exit test,
+  or a whole loop (`int h(int n, int *p) { for (...) if (p[i] < 0) return i;
+  return g(p)*2; }`), runs before the frame is set up, while the compact entry
+  still says `UNWIND_ARM64_MODE_FRAME`. The prologue replay and the forward
+  scan for a frame setup therefore fall through conditional branches, as the
+  epilogue scan does: pc is only reachable from the start by falling through
+  the branches before it, a forward target skips past pc, and a loop ahead of
+  the frame setup contains no pushes in compiler output. The backward scan
+  for the pushes already made still stops at one (the code behind a loop's
+  back edge was entered from before it). Before this a pc in such a loop, at
+  the `stp` or at `mov x29, sp` read as a body, the frame rule read `[fp]`,
+  frame 1 was the caller's caller and step out overshot by a frame. The error
+  path of a syscall stub past its `b.lo` is covered the same way.
+* Callee-saved registers. The relaxed replay would take the whole body of a
+  frameless leaf which saves x19-x22 (`UNWIND_ARM64_MODE_FRAMELESS` with pair
+  bits) for a prologue, and the prologue state restores nothing, so the
+  caller's x19-x22 kept the callee's values (register-resident -O2 locals of
+  the caller read garbage). The decoder now reports writes of x19-x28 and
+  v8-v15 (`writes_callee_saved`: data processing, loads, writeback bases, SIMD
+  destinations, `mrs`), and the first such instruction ends the replay, since
+  no compiler-generated prologue writes a callee-saved register before the
+  saves are done. In the epilogue state only the registers whose pops still
+  lie ahead of pc are restored, each from the slot its `ldp`/`ldr` names
+  (`UWND_ARM64_Analysis.pending`, in every mode; DWARF mode used to
+  re-evaluate the CFI row with `fp` pointed back at the frame record); the
+  others already hold the caller's values. That matters at a `ret` shared
+  between an early exit and the epilogue, where the slots the compact layout
+  names may never have been written. A failed read of a pending slot is
+  returned for the engine's fetch-and-retry instead of being answered from
+  the code alone. `macho_uwnd_step` runs the analysis once, above the mode
+  dispatch, and the moduleless unwinder shares the frame-chain step
+  (`uwnd_arm64_step_frame_chain`) and the pending restore with it.
 * Outer frames hold return addresses. `UWND_ModuleInfo.pc_is_return_address`
   (set by the engine for every frame but the first) makes the module lookup,
   the `__unwind_info` lookup, the FDE search and the CFI row selection use
@@ -267,15 +299,27 @@ bundled with Zig: `zig cc -target aarch64-macos -fsyntax-only ...`).
   noreturn function was attributed to the function that follows it in the
   binary, and the unwind stopped there. A CIE with the `S` augmentation marks
   a signal trampoline: `UWND_StepResult.is_signal_frame` is surfaced so the
-  engine does not treat the frame above it as a return address.
+  engine does not treat the frame above it as a return address. The engine
+  records the bit per frame (`D_UnwindFrame.pc_is_return_address`), and
+  `d_call_stack_from_unwind` looks the module, the procedure and the inline
+  sites of an outer frame up at pc-1 as well, like `state`'s `call_stack`
+  dump: at pc an inlined block beginning exactly at the return address added
+  a bogus inline frame, a call as the last instruction of an inlined block
+  dropped one, and a frame whose call does not return was named after the
+  following function.
 * The end of a frame-pointer chain (`fp == 0`) is the outermost frame (pc 0,
   a good step) rather than an error, in both the compact-frame rule and the
-  moduleless unwinder, and the engine keeps the frames it has when an outer
-  frame's step fails or needs memory it cannot read; a thread blocked in
-  `sleep` shows `__semwait_signal` up to `thread_start`. When the code at the
-  *stopped* pc cannot be read at all (a call through a bad pointer),
-  `pc_code_unreadable` is set and the moduleless unwinder treats the stop as
-  the callee's first instruction (return address in `lr`), as lldb does.
+  moduleless unwinder, and a step to pc 0 ends the engine's loop (it used to
+  run the unwinder once more at pc 0, find the code unreadable and invent a
+  frame from `lr`). The engine keeps the frames it has when a step fails or
+  needs memory it cannot read, the stopped frame included (a misaligned `fp`
+  or an unreadable frame record at frame 0 used to produce no call stack at
+  all) - unless the registers or memory changed under the unwind, which makes
+  it stale and the caller retries; a thread blocked in `sleep` shows
+  `__semwait_signal` up to `thread_start`. When the code at the *stopped* pc
+  cannot be read at all (a call through a bad pointer), `pc_code_unreadable`
+  is set and both unwinders treat the stop as the callee's first instruction
+  (return address in `lr`), as lldb does.
 * Function starts. `UWND_ModuleInfo.function_vaddr` carries the start of the
   function containing the stopped frame's pc, which `d_unwind_from_thread`
   takes from the RDI procedure containing it (`rdi_scope_from_voff` ->
@@ -289,7 +333,8 @@ bundled with Zig: `zig cc -target aarch64-macos -fsyntax-only ...`).
   function's `ret`, and a stop at a function's first instruction (an
   instruction step into a call) showed `locals_frame start`. With the start
   known the replay has nothing to replay at the entry and reports the prologue
-  state (lldb's rule: pc = lr, cfa = sp); the frame-setup-ahead heuristic now
+  state (lldb's rule: pc = lr, cfa = sp) without reading any code (one round
+  trip less per step-into stop); the frame-setup-ahead heuristic now
   also runs whenever the replay did not establish the prologue, so an unknown,
   far or wrong start degrades to the old behaviour instead of to the frame
   pointer chain. Functions the unwind info does not describe get the same
@@ -305,16 +350,28 @@ bundled with Zig: `zig cc -target aarch64-macos -fsyntax-only ...`).
   stub or from a function's entry returns to it (flows
   `stepping_O0/inst_into_call_stack`, `into_strlen_frame1_is_caller`,
   `inst_out`). Not covered: a known start more than 128 bytes before pc with
-  the frame still unbuilt (the window is 32 instructions behind pc), and the
-  error path of a syscall stub past its `b.lo` (a conditional branch ends the
-  replay).
+  the frame still unbuilt (the window is 32 instructions behind pc).
 * Decoder: `stp`/`ldp` to `[sp]` are recognized by `(code & 0x3a000000) ==
   0x28000000` (bit 25 clear); the old mask also matched logical
   shifted-register ops with `Rn = xzr`, so `mov xN, xM` counted as a 16-byte
   pair store. `src/mac/tests/unwind_arm64_test.c` checks the decoder and the
-  analysis on hand-assembled sequences (build line in its header; 110 checks,
-  among them the syscall stub, the linker stubs and the shared entry above);
-  `./run_tests.sh` builds and runs it on macOS/arm64 before torture.
+  analysis on hand-assembled sequences (build line in its header; 221 checks,
+  among them the syscall stub, the linker stubs, the shared entry above, the
+  shrink-wrapped `_f`/`_h` and the frameless leaf from the review), and
+  includes `macho/unwind/macho_unwind.c` with a hand-built `__unwind_info`
+  (one frame entry saving x19/x20, one frameless entry saving x19-x22) and an
+  `ARM64_RegBlock` over a stack page, checking the register restore of
+  `macho_uwnd_step` and the moduleless unwinder in the prologue, body and
+  epilogue states, at the shared early-exit `ret`, with `fp == 0`, and the
+  fetch-and-retry of an unread slot; `./run_tests.sh` builds and runs it on
+  macOS/arm64 before torture. The flow debuggees have no shrink-wrapped
+  function, so there is no flow scenario for it; the live check was a private
+  -O2 probe (`h` from the review, breakpoint in its loop: the call stack is
+  `h main start` where it was `h start`; a step out leaves the loop's scope
+  first - raddbg's step out is scope-based - with the frame still unbuilt and
+  the call stack intact, and the next one lands in `main`). When driving a
+  renamed copy of the debugger over IPC, kill it by pid: the harness's
+  `kill_test_instances` matches `raddbg --ipc_port:<port>` by name.
 
 ## Display scaling
 
@@ -617,11 +674,6 @@ impact:
   from a line into which LLVM scheduled a helper's instruction stops at that
   instruction (flows `F1`/`F2`); a breakpoint on an inlined line stops first
   in whichever instance comes first in the code (`F4b`).
-* Frame names of outer frames come from the raw return address (the UI and
-  `d_call_stack_from_unwind` look symbols and scopes up at pc, not pc-1), so
-  a frame whose call does not return (`fn a() void { @panic("x"); }`) is
-  named after the function which follows it in the binary; the unwind itself
-  is right (`state`'s `call_stack` already looks callers up at pc-1).
 * Evaluation (the fixes are under "Scripted feature-flow suite", "Evaluation
   fixes"): over `--ipc`, the first `eval` touching a memory page the frontend
   has not read yet answers from nothing (an empty string for a `char *`, 0 for
@@ -643,10 +695,7 @@ impact:
   At a watchpoint stop `state`'s `ip` is the stop event's address, the
   accessing instruction, while the thread's registers (`pc`) are one
   instruction past it (the demon steps the thread past the access after
-  reporting it). A watchpoint's condition is not evaluated (`D8`): the run
-  loop gathers conditions for traps whose `vaddr` equals the event's
-  instruction pointer, and a watchpoint's trap carries the data address (the
-  event's `address`); `event->user_data != 0` then stops unconditionally.
+  reporting it).
 * IPC: `save_project` without `--file_path:<path>:<line>` takes the focused
   tab's source file as its destination, and a second call while the overwrite
   confirmation is up goes through it; a FilePath register is only filled from

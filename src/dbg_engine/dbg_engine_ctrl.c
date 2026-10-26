@@ -2065,11 +2065,12 @@ d_unwind_from_thread(Arena *arena, D_Handle thread, U64 endt_us)
         }
         
         // rjf: if we failed to read memory, try to read that memory, equip to memory map.
-        // if it is stale and we run out of time, we will need to mark the whole unwind as
-        // stale. if it can't be read, the unwind fails - unless we already have outer
-        // frames (a frame pointer or return address off the stack ends the unwind with
-        // the frames found), or it is the code at the stop's ip which cannot be read (a
-        // call through a bad pointer, most likely: unwind without analyzing the code).
+        // if it can't be read, the frames found stand on their own (a frame pointer or
+        // return address off the stack ends the unwind; the stopped frame alone is a
+        // call stack too) - unless the registers or memory changed under the unwind,
+        // in which case the whole unwind is stale and the caller retries it; or it is
+        // the code at the stop's ip which cannot be read (a call through a bad pointer,
+        // most likely: unwind without analyzing the code).
         if(step.status == UWND_StepStatus_FailedMemoryRead)
         {
           U64 size_desired = dim_1u64(step.missed_read_vaddr_range);
@@ -2083,7 +2084,7 @@ d_unwind_from_thread(Arena *arena, D_Handle thread, U64 endt_us)
           {
             unwinder_module_info.pc_code_unreadable = 1;
           }
-          else if(frame_node_count > 1)
+          else if(frame_node_count > 1 || (d_reg_gen() == reg_gen && d_mem_gen() == mem_gen))
           {
             unwind_ended = 1;
           }
@@ -2092,12 +2093,13 @@ d_unwind_from_thread(Arena *arena, D_Handle thread, U64 endt_us)
             unwind.flags |= D_UnwindFlag_Error;
           }
         }
-        
-        // rjf: if the step itself failed, we just fail out - unless we already have
-        // outer frames, which stand on their own.
+
+        // rjf: if the step itself failed (a misaligned frame pointer, say), the frames
+        // found stand on their own, the stopped frame included - unless the unwind
+        // is stale.
         else if(step.status == UWND_StepStatus_Error)
         {
-          if(frame_node_count > 1)
+          if(frame_node_count > 1 || (d_reg_gen() == reg_gen && d_mem_gen() == mem_gen))
           {
             unwind_ended = 1;
           }
@@ -2123,23 +2125,31 @@ d_unwind_from_thread(Arena *arena, D_Handle thread, U64 endt_us)
       // (b) advance ip to 0
       // (c) do not modify either ip *or* sp (just one is fine)
       //
-      B32 step_made_progress = (arch_ip_from_reg_block(arch_info, regs_block) != start_ip ||
+      // an outer frame's ip is the return address of a call, unless the frame it was
+      // unwound from is a signal trampoline (the interrupted instruction itself)
+      //
+      U64 new_ip = arch_ip_from_reg_block(arch_info, regs_block);
+      B32 step_made_progress = (new_ip != start_ip ||
                                 arch_sp_from_reg_block(arch_info, regs_block) != start_sp);
-      if(step_is_good && step_made_progress && arch_ip_from_reg_block(arch_info, regs_block) != 0)
+      if(step_is_good && step_made_progress && new_ip != 0)
       {
         D_UnwindFrameNode *frame_node = push_array(scratch.arena, D_UnwindFrameNode, 1);
         D_UnwindFrame *f = &frame_node->v;
         f->regs = push_array_no_zero(arena, U8, arch_reg_block_size);
+        f->pc_is_return_address = !prev_step_is_signal_frame;
         MemoryCopy(f->regs, regs_block, arch_reg_block_size);
         DLLPushBack(first_frame_node, last_frame_node, frame_node);
         frame_node_count += 1;
       }
-      
+
       //- rjf: close access
       access_close(access);
-      
-      //- rjf: exit if we made no progress on the unwind
-      if(!step_made_progress)
+
+      //- rjf: exit if we made no progress on the unwind, or reached the end of the
+      // chain (a step to ip 0: the outermost frame has no caller; without this the
+      // next step would run at ip 0, find its code unreadable, and invent a frame
+      // from lr)
+      if(!step_made_progress || (step_is_good && new_ip == 0))
       {
         break;
       }
@@ -2198,12 +2208,17 @@ d_call_stack_from_unwind(Arena *arena, D_Entity *process, D_Unwind *base_unwind)
     U64 frame_count = 0;
     for(U64 base_frame_idx = 0; base_frame_idx < base_unwind->frames.count; base_frame_idx += 1)
     {
-      // rjf: unpack
+      // rjf: unpack. an outer frame's ip is the return address of a call: the call's
+      // own address (ip-1) names the module, the procedure and the inline sites (an
+      // inlined block may begin exactly at the return address, a call may be the last
+      // instruction of one, and after a call which does not return the return address
+      // belongs to the next function in the binary)
       ARCH_Info *arch_info = arch_info_from_arch(arch);
       D_UnwindFrame *src = &base_unwind->frames.v[base_frame_idx];
       U64 rip_vaddr = arch_ip_from_reg_block(arch_info, src->regs);
-      D_Entity *module = d_module_from_process_vaddr(process, rip_vaddr);
-      U64 rip_voff = d_voff_from_vaddr(module, rip_vaddr);
+      U64 lookup_vaddr = rip_vaddr - ((src->pc_is_return_address && rip_vaddr != 0) ? 1 : 0);
+      D_Entity *module = d_module_from_process_vaddr(process, lookup_vaddr);
+      U64 rip_voff = d_voff_from_vaddr(module, lookup_vaddr);
       DI_Key dbgi_key = d_dbgi_key_from_module(module);
       RDI_Parsed *rdi = di_rdi_from_key(access, dbgi_key, 0, 0);
       RDI_Scope *scope = rdi_scope_from_voff(rdi, rip_voff);
@@ -2302,7 +2317,7 @@ d_call_stack_frame_from_unwind_and_inline_depth(D_CallStack *call_stack, U64 unw
         base_frame_idx += 1;
       }
     }
-    if(f != 0 && call_stack->frames + inline_depth < f)
+    if(f != 0 && call_stack->frames + inline_depth <= f)
     {
       f -= inline_depth;
     }

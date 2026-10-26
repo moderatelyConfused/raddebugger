@@ -986,11 +986,8 @@ scenario_F6_visit_qsort_O2() {
   begin F6_visit_qsort_O2 $B/visit_qsort_O2 || return
   local src=$D/visit_qsort.c; bp_tag $src visit_line >/dev/null
   local st=$(run_stop); check_stop at_visit_line "$st" $src visit_line
-  # the first hit is in the copy of visit inlined into main (root): clang describes only `sum`
-  # there (`DW_OP_consts 10, DW_OP_stack_value`), `node` has no DWARF entry in that instance, so
-  # "could not be found" is the right answer; the later hits (visit inlined into the block, node
-  # in x22) read it
-  check F6_inlined_in_main 1 "$(field "$st" inline_depth)"
+  # `visit` is out of line now (noinline, so that the recursion through the callback re-enters
+  # it); at the first hit `sum` is the node's value, `node` may be register-located at -O2
   check F6_sum_constant_location 10 "$(ev sum)"
   note "F6: node at the first hit (main's inlined visit, not described by the DWARF): node='$(ev node)' msgs: $(ev_msgs node)"
   local sp0=$(ev sp) frame0=$(concrete_frames "$st" | head -1)

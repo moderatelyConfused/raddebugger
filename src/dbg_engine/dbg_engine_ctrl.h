@@ -25,6 +25,7 @@ struct D_UnwindFrame
 {
   void *regs;
   U64 cfa;
+  B32 pc_is_return_address; // an outer frame reached by a return: its pc is the return address of a call, so the call's own address (pc-1) names the module, the procedure and the inline sites (the frame below a signal trampoline holds the interrupted instruction instead)
 };
 
 typedef struct D_UnwindFrameNode D_UnwindFrameNode;
