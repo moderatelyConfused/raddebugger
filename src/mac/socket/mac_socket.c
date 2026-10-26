@@ -351,11 +351,30 @@ sock_async_tick(void)
       ep_socket = con->socket;
     }
 
-    // rjf: got socket? -> send (SIGPIPE is suppressed per-socket via SO_NOSIGPIPE)
+    // rjf: got socket? -> send (SIGPIPE is suppressed per-socket via SO_NOSIGPIPE). a
+    // send may take only part of a large packet (a full socket buffer); the rest follows.
     B32 send_failed = 0;
-    if(ep_socket != -1 && send(ep_socket, t->data.str, t->data.size, 0) == -1)
+    if(ep_socket != -1)
     {
-      send_failed = 1;
+      U64 wait_count = 0;
+      for(U64 sent = 0; sent < t->data.size;)
+      {
+        ssize_t n = MAC_RETRY_ON_EINTR(send(ep_socket, t->data.str + sent, t->data.size - sent, 0));
+        if(n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && wait_count < 10)
+        {
+          // rjf: the peer is not reading yet: wait for room (10 x 1 s at most)
+          struct pollfd pfd = {ep_socket, POLLOUT, 0};
+          poll(&pfd, 1, 1000);
+          wait_count += 1;
+          continue;
+        }
+        if(n <= 0)
+        {
+          send_failed = 1;
+          break;
+        }
+        sent += (U64)n;
+      }
     }
 
     // rjf: got a socket, but send failed? -> connection closed
@@ -418,7 +437,15 @@ sock_session_open(U16 listener_port, SOCK_WakeupFunctionType *wakeup_hook)
     setsockopt(session->tcp_listen_socket, SOL_SOCKET, SO_REUSEADDR, &reuse_addr, sizeof(reuse_addr));
     if(bind(session->tcp_listen_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) != 0)
     {
+      // NOTE: a listener which could not bind its port must not be used: `listen` on the
+      // unbound socket would succeed on a kernel-chosen port no client knows, and the
+      // session would look alive. the caller gets a zero session (and the log the reason).
       log_infof("mac socket: could not bind the IPC listener to port %u (errno %d)\n", (unsigned)listener_port, errno);
+      close(session->tcp_listen_socket);
+      close(session->kqueue_fd);
+      arena_release(arena);
+      SOCK_Session zero = {0};
+      return zero;
     }
     listen(session->tcp_listen_socket, SOMAXCONN);
     mac_sock_kqueue_add(session->kqueue_fd, session->tcp_listen_socket, 0);
@@ -457,25 +484,45 @@ sock_send(SOCK_Session session, SOCK_Protocol protocol, SOCK_Endpoint endpoint, 
 {
   B32 result = 0;
   MAC_SOCK_Session *s = (MAC_SOCK_Session *)session.u64[0];
+  if(s == 0)
+  {
+    return result;
+  }
   RingGuard guard = guarded_ring_open(s->u2s_ring);
   {
+    // NOTE: the user -> socket ring holds 256 KB; a message larger than that used to be
+    // cut to the ring (`Min(data.size, size_cap)`), silently: an `--ipc state` reply
+    // with ~1500 modules announced its full size in its header and arrived truncated.
+    // a large message now goes into the ring as several packets of at most 64 KB, which
+    // the async tick sends in order on the same connection (a TCP stream carries no
+    // packet boundaries; the receiver reassembles by the message's own header).
     U64 header[5] = {0};
-    U64 size_cap = s->u2s_ring->ring->size - sizeof(header);
-    U64 size = Min(data.size, size_cap);
+    U64 chunk_size_cap = KB(64);
+    U64 sent_size = 0;
+    for(;;)
     {
-      // NOTE: the endpoint kind rides in the high 32 bits of the protocol word (see
-      // the listener thread); sock_async_tick reconstructs the full endpoint from it
-      // so the connection-cache lookup matches what was stored on accept.
-      header[0] = (U64)protocol | ((U64)endpoint.kind << 32);
-      header[1] = (U64)endpoint.port;
-      header[2] = endpoint.address_u64[0];
-      header[3] = endpoint.address_u64[1];
-      header[4] = size;
-    }
-    if(guarded_ring_write_or_wait(&guard, sizeof(header), header, endt_us))
-    {
-      guarded_ring_write_or_wait(&guard, size, data.str, max_U64);
+      U64 size = Min(data.size - sent_size, chunk_size_cap);
+      {
+        // NOTE: the endpoint kind rides in the high 32 bits of the protocol word (see
+        // the listener thread); sock_async_tick reconstructs the full endpoint from it
+        // so the connection-cache lookup matches what was stored on accept.
+        header[0] = (U64)protocol | ((U64)endpoint.kind << 32);
+        header[1] = (U64)endpoint.port;
+        header[2] = endpoint.address_u64[0];
+        header[3] = endpoint.address_u64[1];
+        header[4] = size;
+      }
+      if(!guarded_ring_write_or_wait(&guard, sizeof(header), header, endt_us))
+      {
+        break;
+      }
+      guarded_ring_write_or_wait(&guard, size, data.str + sent_size, max_U64);
+      sent_size += size;
       result = 1;
+      if(sent_size >= data.size)
+      {
+        break;
+      }
     }
   }
   guarded_ring_close(&guard);
@@ -495,8 +542,9 @@ sock_recv(Arena *arena, SOCK_Session session, SOCK_Protocol *protocol_out, SOCK_
 {
   B32 result = 0;
   U64 header_size = sizeof(*protocol_out) + sizeof(*endpoint_out) + sizeof(U64);
+  MAC_SOCK_Session *s = (MAC_SOCK_Session *)session.u64[0];
+  if(s != 0)
   {
-    MAC_SOCK_Session *s = (MAC_SOCK_Session *)session.u64[0];
     RingGuard guard = guarded_ring_open(s->s2u_ring);
     {
       U64 header[5] = {0};

@@ -488,7 +488,7 @@ RD_NameSchemaInfo rd_name_schema_info_table[39] =
 {str8_lit_comp("thread"), 0, str8_lit_comp("x:{'label':code_string, 'id':u64, @no_expand 'active':bool, 'call_stack':set}")},
 };
 
-String8 rd_reg_slot_code_name_table[56] =
+String8 rd_reg_slot_code_name_table[57] =
 {
 {0},
 str8_lit_comp("server"),
@@ -528,6 +528,7 @@ str8_lit_comp("reg_slot"),
 str8_lit_comp("ctx_expr"),
 str8_lit_comp("pid"),
 str8_lit_comp("force_confirm"),
+str8_lit_comp("external_driver"),
 str8_lit_comp("force_focus"),
 str8_lit_comp("prefer_disasm"),
 str8_lit_comp("no_rich_tooltip"),
@@ -548,7 +549,7 @@ str8_lit_comp("cmd_name"),
 str8_lit_comp("wm_event"),
 };
 
-Rng1U64 rd_reg_slot_range_table[56] =
+Rng1U64 rd_reg_slot_range_table[57] =
 {
 {0},
 {OffsetOf(RD_Regs, server), OffsetOf(RD_Regs, server) + sizeof(D_Handle)},
@@ -588,6 +589,7 @@ Rng1U64 rd_reg_slot_range_table[56] =
 {OffsetOf(RD_Regs, ctx_expr), OffsetOf(RD_Regs, ctx_expr) + sizeof(String8)},
 {OffsetOf(RD_Regs, pid), OffsetOf(RD_Regs, pid) + sizeof(U32)},
 {OffsetOf(RD_Regs, force_confirm), OffsetOf(RD_Regs, force_confirm) + sizeof(B32)},
+{OffsetOf(RD_Regs, external_driver), OffsetOf(RD_Regs, external_driver) + sizeof(B32)},
 {OffsetOf(RD_Regs, force_focus), OffsetOf(RD_Regs, force_focus) + sizeof(B32)},
 {OffsetOf(RD_Regs, prefer_disasm), OffsetOf(RD_Regs, prefer_disasm) + sizeof(B32)},
 {OffsetOf(RD_Regs, no_rich_tooltip), OffsetOf(RD_Regs, no_rich_tooltip) + sizeof(B32)},
