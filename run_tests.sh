@@ -4,6 +4,10 @@ cd "$(dirname "$0")"
 
 target_values=(raddbg raddbg_non_graphical radlink radbin torture)
 cc_values=(clang gcc)
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  # macOS: clang only (build.sh always compiles with clang there; `gcc` is an alias of it)
+  cc_values=(clang)
+fi
 mode_values=(debug release)
 run_torture=1
 torture_args=()
@@ -20,6 +24,10 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     gcc)
+      if [[ "$(uname -s)" == "Darwin" ]]; then
+        echo "gcc is not supported on macOS; use clang"
+        exit 1
+      fi
       cc_values=("$1")
       shift
       ;;

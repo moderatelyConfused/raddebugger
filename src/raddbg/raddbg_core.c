@@ -11619,8 +11619,12 @@ rd_init(CmdLine *cmdln)
       {
         String8 arg = str8_cstring(cmdln->argv[idx]);
         B32 is_flag = (str8_match(str8_prefix(arg, 1), s("-"), 0) ||
-                       str8_match(str8_prefix(arg, 1), s("--"), 0) ||
-                       str8_match(str8_prefix(arg, 1), s("/"), 0));
+                       str8_match(str8_prefix(arg, 1), s("--"), 0));
+#if OS_WINDOWS
+        // NOTE: `/option` style flags; on the POSIX systems an argument starting with `/`
+        // is an absolute path (e.g. the target executable)
+        is_flag = is_flag || str8_match(str8_prefix(arg, 1), s("/"), 0);
+#endif
         B32 is_cfg = 0;
         B32 is_dmp = 0;
         if(!is_flag && !after_first_non_flag)

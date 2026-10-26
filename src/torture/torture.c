@@ -293,11 +293,12 @@ t_cl_path(void)
     wchar_t full_path[MAX_PATH];
     DWORD full_path_size = SearchPathW(0, L"cl.exe", 0, ArrayCount(full_path), full_path, 0);
     g_cl_path = str8_from_16(arena, str16((U16*)full_path, full_path_size));
+    AssertAlways(g_cl_path.size);
 #else
+    // no MSVC on this host; tests that need it skip (T_SkipWithoutCl)
     g_cl_path = str8_zero();
 #endif
   }
-  AssertAlways(g_cl_path.size);
   return g_cl_path;
 }
 
@@ -528,7 +529,12 @@ t_invoke_env(String8 exe_path, String8 cmdline, String8List env, U64 timeout_us)
   
   LinuxCapture captures_linux[2] = {0};
   for EachElement(i, captures_linux) {
-    if (pipe2(captures_linux[i].fds, 0) != 0) {
+#if OS_LINUX
+    int pipe_result = pipe2(captures_linux[i].fds, 0);
+#else
+    int pipe_result = pipe(captures_linux[i].fds);
+#endif
+    if (pipe_result != 0) {
       fprintf(stderr, "ERROR: failed to create pipe for output capture\n");
       goto exit;
     }
@@ -828,6 +834,118 @@ t_invoke_env(String8 exe_path, String8 cmdline, String8List env, U64 timeout_us)
   if (close(pidfd) < 0) {
     fprintf(stderr, "ERROR: failed to close process handle %d\n", pidfd);
   }
+#elif OS_MAC
+  // close handle so read(2) does not block
+  for EachElement(i, write_capture_handles) {
+    close((int)write_capture_handles[i].u64[0]);
+    MemoryZeroStruct(&write_capture_handles[i]);
+  }
+  
+  // rjf: macOS has no pidfd; a kqueue waits on the process exit and the pipes together
+  pid_t pid = (pid_t)process_handle.u64[0];
+  int   kq  = kqueue();
+  if (kq < 0) {
+    fprintf(stderr, "ERROR: failed to create kqueue for process %d\n", pid);
+    goto exit;
+  }
+  {
+    struct kevent changes[3] = {0};
+    EV_SET(&changes[0], pid, EVFILT_PROC, EV_ADD, NOTE_EXIT, 0, 0);
+    EV_SET(&changes[1], captures_linux[0].fds[0], EVFILT_READ, EV_ADD, 0, 0, 0);
+    EV_SET(&changes[2], captures_linux[1].fds[0], EVFILT_READ, EV_ADD, 0, 0, 0);
+    if (MAC_RETRY_ON_EINTR(kevent(kq, changes, ArrayCount(changes), 0, 0, 0)) < 0) {
+      fprintf(stderr, "ERROR: failed to register process %d with kqueue, errno %d\n", pid, errno);
+    }
+  }
+  
+  B32  is_process_live          = 1;
+  U64  endt_us                  = ENDT_US(timeout_us);
+  U64  read_buffer_default_size = MB(1);
+  U64  read_buffer_size         = read_buffer_default_size;
+  U8  *read_buffer              = push_array(scratch.arena, U8, read_buffer_default_size);
+  for (;;) {
+    // exit if there is nothing left to wait on
+    if (!is_process_live && !captures_linux[0].is_live && !captures_linux[1].is_live) { break; }
+    
+    // compute wait time
+    struct timespec  wait_ts  = {0};
+    struct timespec *wait_ptr = 0;
+    if (timeout_us != max_U64) {
+      U64 now_us  = now_time_us();
+      U64 left_us = now_us < endt_us ? endt_us - now_us : 0;
+      wait_ts.tv_sec  = left_us / 1000000;
+      wait_ts.tv_nsec = (left_us % 1000000) * 1000;
+      wait_ptr = &wait_ts;
+    }
+    
+    // wait for kernel to signal any of the wait handles
+    struct kevent evts[3] = {0};
+    int evt_count = kevent(kq, 0, 0, evts, ArrayCount(evts), wait_ptr);
+    if (evt_count < 0) {
+      if (errno == EINTR) { continue; }
+      fprintf(stderr, "ERROR: kevent failed with errno %d\n", errno);
+      break;
+    }
+    if (evt_count == 0) {
+      fprintf(stderr, "WARNING: kevent timeout\n");
+      break;
+    }
+    
+    for (int evt_idx = 0; evt_idx < evt_count; evt_idx += 1) {
+      struct kevent *evt = &evts[evt_idx];
+      
+      // process exited -> reap
+      if (evt->filter == EVFILT_PROC) {
+        int status;
+        if (waitpid(pid, &status, 0) >= 0) {
+          g_last_exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : max_U64;
+        } else {
+          fprintf(stderr, "ERROR: failed to reap process %d\n", pid);
+        }
+        is_process_live = 0;
+        continue;
+      }
+      
+      // pipe readable -> drain what is available
+      for EachElement(i, captures_linux) {
+        if (captures_linux[i].is_live && evt->ident == (uintptr_t)captures_linux[i].fds[0]) {
+          if (evt->data > 0) {
+            if (read_buffer_size == 0) {
+              read_buffer_size = read_buffer_default_size;
+              read_buffer      = push_array(scratch.arena, U8, read_buffer_default_size);
+            }
+            U64     read_max  = Min((U64)evt->data, read_buffer_size);
+            ssize_t read_size = MAC_RETRY_ON_EINTR(read(captures_linux[i].fds[0], read_buffer, read_max));
+            if (read_size > 0) {
+              str8_list_push(scratch.arena, captures_linux[i].parts, str8(read_buffer, read_size));
+              read_buffer      += read_size;
+              read_buffer_size -= read_size;
+            } else if (read_size < 0) {
+              fprintf(stderr, "ERROR: failed to read pipe, errno %d\n", errno);
+              captures_linux[i].is_live = 0;
+            }
+          }
+          if ((evt->flags & EV_EOF) && evt->data <= 0) {
+            captures_linux[i].is_live = 0;
+          }
+        }
+      }
+    }
+  }
+  
+  // (timeout) kill process if alive
+  if (is_process_live) {
+    kill(pid, SIGKILL);
+    int status;
+    if (waitpid(pid, &status, 0) >= 0) {
+      g_last_exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : max_U64;
+    }
+  }
+  
+  // close process handle
+  if (close(kq) < 0) {
+    fprintf(stderr, "ERROR: failed to close kqueue %d\n", kq);
+  }
 #endif
   
   t_infof("Invoke: {\n");
@@ -910,7 +1028,7 @@ t_kill_all(String8 pattern)
     if (str8_match_wildcard(info.name, pattern, StringMatchFlag_CaseInsensitive|StringMatchFlag_SlashInsensitive)) {
 #if OS_WINDOWS
       if (!t_invoke(str8_lit("taskkill"), str8f(scratch.arena, "/PID %u /F", info.pid), max_U64)) { fprintf(stderr, "ERROR: failed to invoke taskkill\n"); }
-#elif OS_LINUX
+#elif OS_LINUX || OS_MAC
       NotImplemented; // TODO: test
       if (!t_invoke(str8_lit("kill"), str8f(scratch.arena, " -9 %u", info.pid), max_U64)) { fprintf(stderr, "ERROR: failed to invoke kill\n"); }
 #else

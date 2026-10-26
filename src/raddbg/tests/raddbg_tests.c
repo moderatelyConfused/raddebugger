@@ -12,14 +12,75 @@ rd_test__raddbg_path(Arena *arena, CmdLine *cmdline)
   return raddbg_exe_filename;
 }
 
+internal U64
+rd_test__ipc_port(TestCtx *ctx)
+{
+  // rjf: the instances launched by the tests listen on a port of their own (`-ipc_port:<n>`,
+  // or one derived from this process' pid), so that a debugger the developer has open on the
+  // default port is left alone, and concurrent test runs do not drive each other's instances.
+  U64 port = 0;
+  if(!try_u64_from_str8_c_rules(cmd_line_string(ctx->cmdline, s("ipc_port")), &port) || port == 0 || port > 65535)
+  {
+    port = 7700 + (get_process_info()->pid % 100);
+  }
+  return port;
+}
+
+internal String8 rd_test__ipc_cmd(Arena *arena, TestCtx *ctx, U64 ipc_port, String8 string);
+
 internal Process
-rd_test__open_debugger(TestCtx *ctx, String8 target_cmd_line)
+rd_test__open_debugger(TestCtx *ctx, U64 ipc_port, String8 target_cmd_line)
 {
   Temp scratch = scratch_begin(0, 0);
   String8 raddbg_path = rd_test__raddbg_path(scratch.arena, ctx->cmdline);
   String8 user_file_path = str8f(scratch.arena, "%S/test.raddbg_user", ctx->artifacts_path);
+  String8 project_file_path = str8f(scratch.arena, "%S/test.raddbg_project", ctx->artifacts_path);
+  String8 output_path = str8f(scratch.arena, "%S/debugger_output", ctx->artifacts_path);
   delete_file_at_path(user_file_path);
-  Process process = launch_cmd_linef("%S --gen_crash_dump --no_focus_on_stop --user:%S --logs:logs %S", raddbg_path, user_file_path, target_cmd_line);
+  delete_file_at_path(project_file_path);
+  delete_file_at_path(output_path);
+
+  // rjf: launch; the debugger's console output (and the target's, which inherits its handles)
+  // goes to a file in the artifacts directory rather than into the test runner's output
+  Process process = {0};
+  {
+    file_close(file_open(AccessFlag_Write|AccessFlag_Read, output_path));
+    File output_file = file_open(AccessFlag_Write|AccessFlag_Append|AccessFlag_ShareRead|AccessFlag_ShareWrite|AccessFlag_Inherited, output_path);
+    ProcessLaunchParams params = {0};
+    str8_list_push(scratch.arena, &params.cmd_line, raddbg_path);
+    str8_list_push(scratch.arena, &params.cmd_line, s("--gen_crash_dump"));
+    str8_list_push(scratch.arena, &params.cmd_line, s("--no_focus_on_stop"));
+    str8_list_pushf(scratch.arena, &params.cmd_line, "--ipc_port:%I64u", ipc_port);
+    str8_list_pushf(scratch.arena, &params.cmd_line, "--user:%S", user_file_path);
+    str8_list_pushf(scratch.arena, &params.cmd_line, "--project:%S", project_file_path);
+    str8_list_push(scratch.arena, &params.cmd_line, s("--logs:logs"));
+    str8_list_push(scratch.arena, &params.cmd_line, target_cmd_line);
+    params.path        = str8_chop_last_slash(raddbg_path);
+    params.inherit_env = 1;
+    params.stdout_file = output_file;
+    params.stderr_file = output_file;
+    process = process_launch(&params);
+    file_close(output_file);
+  }
+  
+  // rjf: wait for the instance to answer IPC (a command sent before its listener is up is
+  // lost, and its sender waits out the whole reply timeout; the listener is up ~50ms after
+  // launch, so probe only after a short pause)
+  if(!process_match(process, process_zero()))
+  {
+    for(U64 start_us = now_time_us(); now_time_us() - start_us < 60000000;)
+    {
+      sleep_ms(100);
+      Temp scratch2 = scratch_begin(&scratch.arena, 1);
+      String8 response = rd_test__ipc_cmd(scratch2.arena, ctx, ipc_port, s("state"));
+      B32 is_up = (str8_find_needle(response, 0, s("version:"), 0) < response.size);
+      scratch_end(scratch2);
+      if(is_up)
+      {
+        break;
+      }
+    }
+  }
   scratch_end(scratch);
   return process;
 }
@@ -31,12 +92,12 @@ rd_test__close_debugger(Process process)
 }
 
 internal String8
-rd_test__ipc_cmd(Arena *arena, TestCtx *ctx, U64 debugger_pid, String8 string)
+rd_test__ipc_cmd(Arena *arena, TestCtx *ctx, U64 ipc_port, String8 string)
 {
   Temp scratch = scratch_begin(&arena, 1);
   String8 raddbg_path = rd_test__raddbg_path(scratch.arena, ctx->cmdline);
   String8 stdout_path = str8f(scratch.arena, "%S/ipc_output", ctx->artifacts_path);
-  Process process = launch_cmd_linef("%S --ipc --pid:%I64u %S > %S", raddbg_path, debugger_pid, string, stdout_path);
+  Process process = launch_cmd_linef("%S --ipc --ipc_port:%I64u %S > %S", raddbg_path, ipc_port, string, stdout_path);
   process_join(process, max_U64, 0);
   String8 response = data_from_file_path(arena, stdout_path);
   delete_file_at_path(stdout_path);
@@ -61,6 +122,7 @@ rd_test__exemplar_test_finish(Arena *arena, TestCtx *ctx, String8List test_log_s
   make_directory(ctx->exemplars_path);
   String8 exemplar_path = str8f(scratch.arena, "%S/exemplar_%S", ctx->exemplars_path, lower_from_str8(scratch.arena, string_from_operating_system(OperatingSystem_CURRENT)));
   String8 exemplar_data = data_from_file_path(scratch.arena, exemplar_path);
+  B32 exemplar_exists = (exemplar_data.size != 0);
   String8List exemplar_data_lines = str8_split(scratch.arena, exemplar_data, (U8 *)"\n", 1, StringSplitFlag_KeepEmpties);
   String8List exemplar_data_lines_sanitized = {0};
   for EachNode(n, String8Node, exemplar_data_lines.first)
@@ -75,13 +137,13 @@ rd_test__exemplar_test_finish(Arena *arena, TestCtx *ctx, String8List test_log_s
   exemplar_data = str8_list_join(scratch.arena, &exemplar_data_lines_sanitized, &(StringJoin){.sep = s("\n"), .post = s("\n")});
   
   // rjf: if exemplar data is empty -> just save our output as the new exemplar
-  if(exemplar_data.size == 0)
+  if(!exemplar_exists)
   {
     copy_file_path(exemplar_path, test_log_current_path);
   }
   
   // rjf: if we have exemplar data, then we need to check that it matches
-  if(exemplar_data.size != 0)
+  if(exemplar_exists)
   {
     B32 current_matches_exemplar = str8_match(str8_skip_chop_whitespace(test_log_current), str8_skip_chop_whitespace(exemplar_data), 0);
     if(!current_matches_exemplar)
@@ -98,35 +160,50 @@ rd_test__exemplar_test_finish(Arena *arena, TestCtx *ctx, String8List test_log_s
 }
 
 ////////////////////////////////
+//~ rjf: Debuggee Building Helpers
+
+internal String8
+rd_test__build_debuggee(Arena *arena, TestCtx *ctx, String8 source_name)
+{
+  // rjf: compiles one of the mule debuggee sources (src/mule/old_test_debuggees) into the
+  // artifacts directory, unoptimized and with debug info, in the host's native executable
+  // format; returns the binary path, or an empty string when the compile failed.
+  Temp scratch = scratch_begin(&arena, 1);
+  String8 root_path = str8_chop_last_slash(get_process_info()->binary_path);
+  String8 source_path = str8f(scratch.arena, "%S/src/mule/old_test_debuggees/%S", root_path, source_name);
+  String8 binary_path = str8f(arena, "%S/%S%S", ctx->artifacts_path, str8_chop_last_dot(source_name), program_ext_postfix_from_os(OperatingSystem_CURRENT, 1));
+  B32 compiled = t_invoke(t_clang_path(), str8f(scratch.arena, "-g -O0 -o %S %S", binary_path, source_path), max_U64) && g_last_exit_code == 0;
+  if(!compiled)
+  {
+    test_outf("Could not build debuggee %S (exit code %I64u):\n%S\n", source_name, g_last_exit_code, g_errors);
+    binary_path = str8_zero();
+  }
+  scratch_end(scratch);
+  return binary_path;
+}
+
+////////////////////////////////
 //~ rjf: Test Helpers
 
 internal void
-rd_test__stepping_regressions(Arena *arena, TestCtx *ctx, String8 target_binary, String8 start_symbol, B32 step_over_on_even)
+rd_test__stepping_regressions_from_binary(Arena *arena, TestCtx *ctx, String8 binary_path, String8 start_symbol, B32 step_over_on_even)
 {
   Temp scratch = scratch_begin(&arena, 1);
   String8List test_log_strings = {0};
+  String8 target_binary = str8_chop_last_dot(str8_skip_last_slash(binary_path));
   
-  // rjf: get binary path
-  String8 binary_path = test_input_exe_path(arena, ctx, str8f(scratch.arena, "%S/%S", target_binary, target_binary));
-  B32 binary_exists_locally = (properties_from_file_path(binary_path).modified != 0);
-  
-  // rjf: if binary does not exist -> skip this test, 
-  if(!binary_exists_locally)
+  // rjf: start debugger
   {
-    TestSkip();
-  }
-  
-  // rjf: otherwise run
-  else
-  {
-    // rjf: start debugger
-    Process debugger = rd_test__open_debugger(ctx, binary_path);
-    U64 debugger_pid = pid_from_process(debugger);
+    U64 ipc_port = rd_test__ipc_port(ctx);
+    Process debugger = rd_test__open_debugger(ctx, ipc_port, binary_path);
     
     // rjf: step & gather info
+    B32 timed_out = 0;
     {
       U64 last_stop_count = max_U64;
       B32 ready_for_next_operation = 0;
+      B32 saw_process = 0;
+      U64 deadline_us = now_time_us() + 300000000;
       String8 next_step_cmd = {0};
       for(U64 cmd_idx = 0;;)
       {
@@ -139,7 +216,8 @@ rd_test__stepping_regressions(Arena *arena, TestCtx *ctx, String8 target_binary,
           String8 step_cmd = s("step_into");
           if(cmd_idx == 0)
           {
-            step_cmd = str8f(scratch2.arena, "run_to_name %S", start_symbol);
+            // rjf: launch: run to the start symbol, or, without one, stop at the entry point
+            step_cmd = (start_symbol.size != 0 ? str8f(scratch2.arena, "run_to_name %S", start_symbol) : s("step_into"));
           }
           else if((cmd_idx % 2 == 0 && step_over_on_even) || (cmd_idx % 2 == 1 && !step_over_on_even))
           {
@@ -150,15 +228,47 @@ rd_test__stepping_regressions(Arena *arena, TestCtx *ctx, String8 target_binary,
             step_cmd = next_step_cmd;
             MemoryZeroStruct(&next_step_cmd);
           }
-          String8 step_response = rd_test__ipc_cmd(scratch2.arena, ctx, debugger_pid, step_cmd);
+          String8 step_response = rd_test__ipc_cmd(scratch2.arena, ctx, ipc_port, step_cmd);
           (void)step_response;
+          test_outf("command %I64u: %S\n", cmd_idx, step_cmd);
           cmd_idx += 1;
         }
         
         // rjf: query state, parse
-        String8 state_response = rd_test__ipc_cmd(scratch2.arena, ctx, debugger_pid, s("state"));
+        String8 state_response = rd_test__ipc_cmd(scratch2.arena, ctx, ipc_port, s("state"));
         MD_Node *state_response_tree = md_tree_from_string(scratch2.arena, state_response);
         MD_Node *state = md_child_from_string(state_response_tree, s("state"), 0);
+        
+        // rjf: first stop after the launch, without line info yet? -> the debug info may still
+        // be converting; wait for it, so that the log does not depend on the conversion's timing
+        if(cmd_idx == 1)
+        {
+          for(U64 wait_start_us = now_time_us(); now_time_us() - wait_start_us < 15000000;)
+          {
+            U64 stop_count = 0;
+            try_u64_from_str8_c_rules(md_child_from_string(state, s("stop_count"), 0)->first->string, &stop_count);
+            B32 is_stopped = (stop_count != last_stop_count);
+            B32 has_lines = (md_child_from_string(state, s("lines"), 0)->first != &md_nil_node);
+            if(!is_stopped || has_lines)
+            {
+              break;
+            }
+            sleep_ms(50);
+            state_response = rd_test__ipc_cmd(scratch2.arena, ctx, ipc_port, s("state"));
+            state_response_tree = md_tree_from_string(scratch2.arena, state_response);
+            state = md_child_from_string(state_response_tree, s("state"), 0);
+          }
+        }
+        
+        // rjf: the process is gone once threads were seen and none are left (and nothing runs)
+        B32 process_exited = 0;
+        {
+          U64 running = 0;
+          try_u64_from_str8_c_rules(md_child_from_string(state, s("running"), 0)->first->string, &running);
+          B32 has_threads = (md_child_from_string(state, s("threads"), 0)->first != &md_nil_node);
+          saw_process = saw_process || has_threads;
+          process_exited = (saw_process && !has_threads && running == 0);
+        }
         
         // rjf: we are only ready for next step command when the stop count has changed
         {
@@ -176,6 +286,9 @@ rd_test__stepping_regressions(Arena *arena, TestCtx *ctx, String8 target_binary,
         {
           MD_Node *ip_module = md_child_from_string(state, s("ip_module"), 0);
           String8 ip_module_name = ip_module->first->string;
+          test_outf("stop %I64u: module \"%S\", %S %S\n", last_stop_count, ip_module_name,
+                    md_child_from_string(state, s("ip_voff"), 0)->first->string,
+                    md_child_from_string(state, s("ip_voff_symbol"), 0)->first->string);
           if(str8_match(str8_chop_last_dot(ip_module_name), target_binary, 0))
           {
             MD_Node *lines = md_child_from_string(state, s("lines"), 0);
@@ -202,21 +315,65 @@ rd_test__stepping_regressions(Arena *arena, TestCtx *ctx, String8 target_binary,
         }
         
         scratch_end(scratch2);
-        if(cmd_idx >= 100)
+        if(process_exited)
         {
+          test_outf("process exited after %I64u commands\n", cmd_idx);
+        }
+        if(cmd_idx >= 100 || process_exited)
+        {
+          break;
+        }
+        if(now_time_us() >= deadline_us)
+        {
+          test_outf("Timed out driving the debugger (last command index %I64u, stop count %I64u)\n", cmd_idx, last_stop_count);
+          timed_out = 1;
           break;
         }
       }
     }
     
-    // rjf: end exemplar test
-    rd_test__exemplar_test_finish(arena, ctx, test_log_strings);
-    
     // rjf: close debugger
     rd_test__close_debugger(debugger);
+    
+    // rjf: end exemplar test (a run which never stopped in the target is not a baseline)
+    TestCheck(!timed_out);
+    TestCheck(test_log_strings.node_count != 0);
+    rd_test__exemplar_test_finish(arena, ctx, test_log_strings);
   }
   
   scratch_end(scratch);
+}
+
+internal void
+rd_test__stepping_regressions(Arena *arena, TestCtx *ctx, String8 target_binary, String8 start_symbol, B32 step_over_on_even)
+{
+  Temp scratch = scratch_begin(&arena, 1);
+  
+  // rjf: get binary path
+  String8 binary_path = test_input_exe_path(arena, ctx, str8f(scratch.arena, "%S/%S", target_binary, target_binary));
+  B32 binary_exists_locally = (properties_from_file_path(binary_path).modified != 0);
+  
+  // rjf: if binary does not exist -> skip this test,
+  if(!binary_exists_locally)
+  {
+    TestSkip();
+  }
+  
+  // rjf: otherwise run
+  else
+  {
+    rd_test__stepping_regressions_from_binary(arena, ctx, binary_path, start_symbol, step_over_on_even);
+  }
+  
+  scratch_end(scratch);
+}
+
+internal void
+rd_test__built_debuggee_stepping_regressions(Arena *arena, TestCtx *ctx, String8 source_name, String8 start_symbol, B32 step_over_on_even)
+{
+  String8 binary_path = rd_test__build_debuggee(arena, ctx, source_name);
+  TestCheck(binary_path.size != 0);
+  rd_test__stepping_regressions_from_binary(arena, ctx, binary_path, start_symbol, step_over_on_even);
 }
 
 internal void
@@ -239,27 +396,27 @@ rd_test__eval_regressions(Arena *arena, TestCtx *ctx, String8 target_binary, Str
   else
   {
     // rjf: start debugger
-    Process debugger = rd_test__open_debugger(ctx, binary_path);
-    U64 debugger_pid = pid_from_process(debugger);
+    U64 ipc_port = rd_test__ipc_port(ctx);
+    Process debugger = rd_test__open_debugger(ctx, ipc_port, binary_path);
     
     // rjf: query state
     U64 initial_stop_count = 0;
     {
-      String8 response = rd_test__ipc_cmd(scratch.arena, ctx, debugger_pid, s("state"));
+      String8 response = rd_test__ipc_cmd(scratch.arena, ctx, ipc_port, s("state"));
       MD_Node *state = md_child_from_string(md_tree_from_string(scratch.arena, response), s("state"), 0);
       MD_Node *stop_count = md_child_from_string(state, s("stop_count"), 0);
       try_u64_from_str8_c_rules(stop_count->first->string, &initial_stop_count);
     }
     
     // rjf: run to target line
-    rd_test__ipc_cmd(scratch.arena, ctx, debugger_pid, str8f(scratch.arena, "run_to_line %S", target_line));
+    rd_test__ipc_cmd(scratch.arena, ctx, ipc_port, str8f(scratch.arena, "run_to_line %S", target_line));
     
     // rjf: wait for stop, collect locals
     String8List locals = {0};
     for(;;)
     {
       Temp scratch2 = scratch_begin(&scratch.arena, 1);
-      String8 response = rd_test__ipc_cmd(scratch.arena, ctx, debugger_pid, s("state"));
+      String8 response = rd_test__ipc_cmd(scratch.arena, ctx, ipc_port, s("state"));
       MD_Node *state = md_child_from_string(md_tree_from_string(scratch.arena, response), s("state"), 0);
       MD_Node *stop_count = md_child_from_string(state, s("stop_count"), 0);
       U64 new_stop_count = 0;
@@ -284,7 +441,7 @@ rd_test__eval_regressions(Arena *arena, TestCtx *ctx, String8 target_binary, Str
     }
     StringJoin join = {.sep = s(" ; ")};
     String8 eval_msg = str8_list_join(scratch.arena, &eval_cmd_strings, &join);
-    String8 response = rd_test__ipc_cmd(scratch.arena, ctx, debugger_pid, eval_msg);
+    String8 response = rd_test__ipc_cmd(scratch.arena, ctx, ipc_port, eval_msg);
     MD_Node *response_tree = md_tree_from_string(scratch.arena, response);
     for MD_EachNode(n, response_tree->first)
     {
@@ -328,6 +485,29 @@ SkippedTest(mule_main_9ff1e58f_type_coverage_eval_regressions)
   // TODO(rjf): see @eval_regressions
   rd_test__eval_regressions(arena, ctx, s("mule_main_9ff1e58f"), s("C:/devel/raddebugger/src/mule/mule_main.cpp:723"));
 }
+
+// NOTE: the prebuilt test inputs are Windows executables; on the POSIX hosts the stepping
+// regressions run over the single-file mule debuggees, compiled with the host clang. They
+// start at the entry point (`run_to_name main` as the first command races the debug info
+// conversion of a freshly built binary: `main` is over before the breakpoint resolves).
+#if OS_MAC || OS_LINUX
+
+Test(basic_stepping_test_step_regressions_0)
+{
+  rd_test__built_debuggee_stepping_regressions(arena, ctx, s("basic_stepping_test.c"), str8_zero(), 0);
+}
+
+Test(basic_stepping_test_step_regressions_1)
+{
+  rd_test__built_debuggee_stepping_regressions(arena, ctx, s("basic_stepping_test.c"), str8_zero(), 1);
+}
+
+Test(step_into_for_goto_step_regressions)
+{
+  rd_test__built_debuggee_stepping_regressions(arena, ctx, s("step_into_for_goto.c"), str8_zero(), 0);
+}
+
+#endif
 
 #if 0
 ////////////////////////////////
