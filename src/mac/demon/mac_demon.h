@@ -85,6 +85,7 @@ extern int ptrace(int request, pid_t pid, caddr_t addr, int data);
 #endif
 
 extern kern_return_t task_for_pid(mach_port_name_t target_tport, int pid, mach_port_name_t *t);
+extern kern_return_t pid_for_task(mach_port_name_t t, int *x);
 
 ////////////////////////////////
 //~ rjf: Mach Exception Message Layouts
@@ -190,6 +191,7 @@ struct MAC_DMN_Thread
   B32 is_seen;                  // scratch mark used when diffing task_threads()
   B32 stop_reported;            // this stop's events have been generated already
   B32 force_ignore_on_reply;    // the pending exception must be suppressed when replied (internal signals)
+  B32 force_deliver_on_reply;   // the pending soft signal must be delivered when replied, whatever the run's ignore flag (escalation of an exception the engine passed)
   
   // rjf: pending exception reply
   B32 has_pending_exception;
@@ -203,6 +205,7 @@ struct MAC_DMN_Thread
   U64 last_exception_code;
   B32 escalated_exception;      // last reply escalated a hardware exception to a signal (KERN_FAILURE)
   U64 escalated_ip;
+  U64 escalated_exception_type; // EXC_* type of that exception
   
   // rjf: thread names
   U64 last_name_hash;
@@ -263,6 +266,8 @@ struct MAC_DMN_Process
   B32 debug_subprocesses;
   B32 is_child;                 // launched by us (must be reaped via waitpid)
   B32 has_exited;
+  B32 is_detached;              // detached; its exit events are synthesized (and it is released) by the next run
+  B32 did_exec;                 // exec'd during the run in progress; traps written before must not be restored into the new image
   B32 needs_initial_continue;   // spawned start-suspended; first resume must also continue the BSD process
   U64 exit_code;
   U64 task_suspend_count;       // number of task_suspend() calls we must balance
@@ -378,6 +383,11 @@ struct MAC_DMN_State
   U64 process_count;
   U64 process_pending_creation;
   
+  // rjf: traps of the run in progress (to restore inherited trap instructions in forked children)
+  DMN_TrapChunkList *run_traps;
+  U8 *run_trap_swap_bytes;
+  B8 *run_trap_is_written;
+  
   // rjf: mach exception port / kqueue
   mach_port_t exception_port;
   mach_port_t port_set;
@@ -466,5 +476,15 @@ internal U64  mac_dmn_strip_pac(U64 ptr);
 internal B32  mac_dmn_process_find_dyld_notification(MAC_DMN_Process *process, U64 dyld_header_vaddr, B32 dyld_is_rebased);
 internal void mac_dmn_process_check_images(Arena *arena, DMN_EventList *events, MAC_DMN_Process *process);
 internal B32  mac_dmn_process_init_ctx(Arena *arena, DMN_EventList *events, MAC_DMN_Process *process, B32 is_launch);
+
+////////////////////////////////
+//~ rjf: Fork / Exec / Detach Helpers
+
+internal B32  mac_dmn_unknown_task_restore_trap(MAC_DMN_ExceptionRaiseRequest *req);
+internal B32  mac_dmn_signo_is_escalation_of_exception(U64 signo, U64 exception_type);
+internal B32  mac_dmn_process_detect_exec(MAC_DMN_Process *process);
+internal void mac_dmn_process_handle_exec(Arena *arena, DMN_EventList *events, MAC_DMN_Process *process, MAC_DMN_Thread *thread);
+internal B32  mac_dmn_process_is_sstop(MAC_DMN_Process *process);
+internal void mac_dmn_process_continue_initial(MAC_DMN_Process *process);
 
 #endif // MAC_DEMON_H

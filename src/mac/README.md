@@ -33,9 +33,22 @@ bundled with Zig: `zig cc -target aarch64-macos -fsyntax-only ...`).
   first instruction; the main executable's header address is taken from the
   top of the stack and dyld's from a page scan below the PC.
 * Attach: `task_for_pid` + `PT_ATTACHEXC`; the resulting `SIGSTOP` soft
-  signal is the initial stop.
+  signal is the initial stop. Launch and attach fail when the exception ports
+  cannot be installed.
+* Detach: `PT_DETACH` needs the BSD process in `SSTOP`, which under
+  `PT_ATTACHEXC` only holds while a thread is inside a soft-signal exception,
+  and the signal of that exception is delivered once the tracer is gone. So
+  `dmn_ctrl_detach` answers the pending exceptions (hardware ones escalated to
+  their signal), lets the process run, sends it `SIGCONT` (a traced process
+  reports every signal), restores the exception ports and `PT_DETACH`es at
+  that exception, then replies with plain continues and resumes; the `SIGCONT`
+  the process takes afterwards does nothing. The process is marked detached and
+  the next `dmn_ctrl_run` synthesizes `ExitThread` / `UnloadModule` /
+  `ExitProcess` and frees it (Win32's queued-detach path). If `PT_DETACH`
+  fails the process stays attached and the detach reports failure.
 * Waiting: a kqueue with `EVFILT_MACHPORT` (exception port set),
-  `EVFILT_PROC` (`NOTE_EXIT`) and `EVFILT_USER` (halt requests).
+  `EVFILT_PROC` (`NOTE_EXIT`, `NOTE_EXEC`; `NOTE_EXITSTATUS` only for our own
+  children, the kernel refuses it otherwise) and `EVFILT_USER` (halt requests).
 * Stops: on the first exception message the whole task is suspended with
   `task_suspend`, stragglers are drained, `task_threads` is diffed against the
   known thread list (thread create/exit events), and registers are read with
@@ -43,11 +56,37 @@ bundled with Zig: `zig cc -target aarch64-macos -fsyntax-only ...`).
 * Resume: pending exception messages are replied to (`PT_THUPDATE` chooses
   the signal to deliver for soft signals; `KERN_FAILURE` escalates a hardware
   exception to its BSD signal when the engine did not ask to ignore it),
-  frozen threads are `thread_suspend`ed, then `task_resume`.
+  frozen threads are `thread_suspend`ed, then `task_resume`. A frozen thread
+  keeps its pending exception (and its reported mark) until it runs again: the
+  run which resumes it decides what to do with it, as on Linux. A soft signal
+  which is the kernel's escalation of a hardware exception the engine passed
+  (same pc, the exception's signal) is not re-reported as a repeated exception;
+  it is delivered whatever the next run's ignore flag says, so signal handlers
+  run.
 * Breakpoints: `brk #0`; the PC points at the trap instruction when reported
   (no rollback). Single stepping: `MDSCR_EL1.SS` via `ARM_DEBUG_STATE64`.
   Watchpoints: `DBGWCR/DBGWVR` via `ARM_DEBUG_STATE64`; since arm64 reports
-  them before the access, the demon steps past the access internally.
+  them before the access, the demon steps past the access internally; the
+  event carries the trap id (`user_data`), which attributes the stop to its
+  data breakpoint.
+* Forked children inherit the exception ports and the trap instructions in
+  their copy-on-write image. An exception from a task the demon does not debug
+  is failed (`KERN_FAILURE`: the child takes the signal's default action, or
+  its handler), unless it is an `EXC_BREAKPOINT` at one of our traps (the dyld
+  trap, or a trap of the run in progress, found through the child's
+  ancestry), in which case the original instruction is written back into the
+  child and it continues. Children are not debugged (`debug_subprocesses` is
+  recorded, not acted on).
+* Exec: the kernel replaces the task's kernel port but keeps the exception
+  ports, so the post-exec `SIGTRAP` soft signal arrives under a new task port
+  name; it is matched to the process by pid and the new port adopted. A
+  `SIGTRAP` at a fresh image (`dyld_all_image_infos` with an empty image list)
+  unloads every module, reports the vanished threads, re-runs the launch-style
+  discovery (main header at `[sp]`, dyld by scan from `pc`) and is swallowed;
+  traps written before the exec are not restored into the new image. Exec of
+  a platform binary (e.g. `/bin/echo`) kills the process with `SIGTRAP`: the
+  exec drops the exception ports for a debugger without Apple's private
+  task-port entitlement (lldb dies the same way).
 * Modules: a permanent `brk` on dyld's debugger-notification function
   (`x0` = mode, `x1` = count, `x2` = `dyld_image_info[]`) reports loads and
   unloads; the demon steps over its own trap internally. Mode 3
@@ -67,7 +106,8 @@ bundled with Zig: `zig cc -target aarch64-macos -fsyntax-only ...`).
   that struct's notifier. Module info is parsed from the in-memory Mach-O header
   (`__unwind_info`, `__eh_frame`, UUID, entry point, `__thread_vars`).
 * Exception codes reported to the engine: BSD signal numbers, or
-  `0x10000 + EXC_*` for Mach exception types (see `mac/mac.mdesk`).
+  `0x10000 + EXC_*` for Mach exception types (see `mac/mac.mdesk`); soft
+  `SIGSEGV` / `SIGBUS` and `EXC_BAD_ACCESS` report the fault address.
 * TLS: `dmn_thread_get_module_tls_vaddr` returns the thread's TLS block for
   an image (`*(TPIDRRO_EL0 + 8*key)`, key from the image's first TLV
   descriptor).
@@ -304,7 +344,59 @@ parts of the execution; calls to `next()` after the first jump straight to
   (`h.sh`: launch, breakpoint, run, step, printing every stop with its inline
   frames) runs a breakpoint-and-steps scenario in about a second.
 
+Demon review fixes (2026-10-25, night; `src/mac/tests/demon/run_all.sh`, one
+script per item, each building a small C debuggee and driving a private
+instance through `tests/ipc_harness.sh`): detach never completed (the process
+was released before the engine's wait for its `ExitProcess`; and `PT_DETACH`
+needs `SSTOP`), forked children spun forever on inherited `brk`s, a passed
+hardware exception's signal was re-reported instead of delivered (so `SIGSEGV`
+handlers never ran), frozen threads had their pending exception answered with
+another run's ignore flag, a reported thread's exit went unreported when a new
+thread's exception arrived first, exec was not handled (and the post-exec
+image would have had the old traps restored into it), plus the small items
+(exception-port install failures, watchpoint attribution, a leaked reply
+right, the `EVFILT_PROC` registration, the fault address). What the checks
+showed and what they could not: `detach.sh` (the Zig generator detached at a
+breakpoint runs to completion, the debugger reports no process within a
+second; with a second process attached by pid the other stays known and
+runnable), `fork_child.sh`, `signal_handler.sh` (`recovered` printed, one
+first-chance event, clean exit), `frozen_thread.sh` (`select_thread` cannot be
+driven over IPC, so the frozen-thread situation is produced by the engine's
+own step-past-trap run of a second thread while the faulting thread is frozen;
+continuing stops on the fault again instead of a dead process),
+`thread_exit.sh`, `exec.sh` (into a binary of our own; `/bin/echo` is run for
+information: see Exec above), `watchpoint.sh` (hit count 1 in a saved copy
+of the project).
+
 Open:
+
+* **Exception stops are never enabled on macOS by the UI.** `raddbg.mdesk`'s
+  project schema has `win32_*` and `linux_*` "Break on ..." settings but no
+  `mac_*` ones, so `rd_setting_b32_from_name("mac_sigsegv")` is 0 and the
+  engine filters (passes) every Mach exception and signal at first chance.
+  Before the demon fixes above an unhandled crash still stopped, by accident,
+  at the re-reported escalation; now it terminates the debuggee, as the
+  settings say. A setting written by hand into the project or user file works
+  (`mac_exc_bad_access: 1`, `mac_sigsegv: 1`, ... names from
+  `MAC_ExceptionCodeTable` prefixed with `mac_`; `tests/demon/frozen_thread.sh`
+  relies on it); the fix is a `mac_*` block in `raddbg.mdesk` mirroring the
+  Linux one, with the table's `break_default` values.
+* Exec of a platform binary (`/bin/echo`, ...) kills the traced process with
+  `SIGTRAP` (the OS drops the exception ports; lldb behaves the same).
+* IPC: commands with entity query slots (`select_thread`, `freeze_thread`,
+  `detach` of a process other than the selected one) cannot name their entity
+  (`--thread:`/`--process:` options are ignored: `rd_regs_fill_slot_from_string`
+  has no case for them). `save_project` without `--file_path:<path>:<line>`
+  takes the focused tab's file path, i.e. the source file, as its destination,
+  and a second call while the overwrite confirmation popup is up goes through
+  it (`tests/demon/watchpoint.sh` saves to a new path). A FilePath register is
+  only filled from a `path:line` string.
+* `&global` evaluates to 0 for clang `-g` binaries (`&main` works), so a data
+  breakpoint on a global cannot be expressed directly; the global's address is
+  missing from the converted RDI.
+* A demon-side gap left: forked children are only continued over traps of the
+  run in progress and the dyld trap; a child which hits a trap written by an
+  earlier run (breakpoint since removed) takes `SIGTRAP`.
 
 * **Step-into and code without line info.** Every Zig `threadlocal` access
   calls dyld's TLV getter through an indirect `blr`, and a step into on such
@@ -416,6 +508,15 @@ code that the line program attributes to an inlinee's line outside the site's
 ranges keeps that line in the enclosing table (the row-merging heuristic; a
 Rust `dealloc` example is in `RESULTS.md`).
 ## Tests
+
+Demon checks: `zsh src/mac/tests/demon/run_all.sh` (settings in `common.sh`:
+`IPC_PORT`, default 7950, `HARNESS_DIR`, `RADDBG`; `detach.sh` needs the Zig
+generator project and `zig`, see its header). Each script builds its debuggee
+with the host clang (two steps, so that the object file the debug map points at
+survives; the debugger's converter then reads the dSYM), writes a project file
+(the `// raddbg ... project file` header line is required, or the file is taken
+for a new, empty project) and asserts on `--ipc state`, the debuggee's
+`stdout_path` file and `ctrl_thread.raddbg_log`.
 
 `./run_tests.sh clang debug` (or `release`) builds `raddbg`, `raddbg_non_graphical`,
 `radlink`, `radbin` and `torture` with `./build.sh meta ...` and runs `build/torture`

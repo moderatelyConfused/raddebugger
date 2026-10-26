@@ -480,11 +480,16 @@ mac_dmn_process_alloc(pid_t pid, mach_port_t task, MAC_DMN_ProcessState state, B
     DLLPushBack_NP(mac_dmn_state->process_from_pid_slots[slot_idx].first, mac_dmn_state->process_from_pid_slots[slot_idx].last, process, pid_next, pid_prev);
   }
   
-  // rjf: register exit notification
+  // rjf: register exit & exec notifications (the exit status is only available for our own
+  // children; the kernel drops the registration itself after NOTE_EXIT)
   {
     struct kevent kev = {0};
-    EV_SET(&kev, (uintptr_t)pid, EVFILT_PROC, EV_ADD|EV_ENABLE|EV_ONESHOT, NOTE_EXIT|NOTE_EXITSTATUS, 0, 0);
-    kevent(mac_dmn_state->kq, &kev, 1, 0, 0, 0);
+    u_int fflags = NOTE_EXIT|NOTE_EXEC|(is_child ? NOTE_EXITSTATUS : 0);
+    EV_SET(&kev, (uintptr_t)pid, EVFILT_PROC, EV_ADD|EV_ENABLE|EV_CLEAR, fflags, 0, 0);
+    if(kevent(mac_dmn_state->kq, &kev, 1, 0, 0, 0) < 0)
+    {
+      log_infof("kqueue error: failed to register pid %d for exit notifications (errno %d); its exit will be detected by polling.\n", (int)pid, errno);
+    }
   }
   return process;
 }
@@ -991,6 +996,7 @@ mac_dmn_thread_reply_pending_exception(MAC_DMN_Thread *thread, B32 ignore_except
       {
         thread->escalated_exception = 1;
         thread->escalated_ip = mac_dmn_ip_from_thread(thread);
+        thread->escalated_exception_type = (U64)req->exception;
       }
     }break;
   }
@@ -1009,6 +1015,7 @@ mac_dmn_thread_reply_pending_exception(MAC_DMN_Thread *thread, B32 ignore_except
   }
   thread->has_pending_exception = 0;
   thread->stop_kind = MAC_DMN_StopKind_Suspended;
+  thread->stop_reported = 0;
 }
 
 internal void
@@ -1074,11 +1081,12 @@ mac_dmn_process_sync_threads(Arena *arena, DMN_EventList *events, MAC_DMN_Proces
     }
   }
   
-  // rjf: threads not reported anymore have exited
+  // rjf: threads not reported anymore have exited (a thread the engine knows about is left to
+  // the next reporting sync, so that its exit is reported)
   for(MAC_DMN_Thread *t = process->first_thread, *next = 0; t != 0; t = next)
   {
     next = t->next;
-    if(!t->is_seen)
+    if(!t->is_seen && (report || !t->is_reported))
     {
       if(report)
       {
@@ -1152,9 +1160,49 @@ mac_dmn_process_receive_exceptions(MAC_DMN_Process *process_filter, U64 timeout_
     // rjf: find process
     MAC_DMN_ExceptionRaiseRequest *req = &buf.request;
     MAC_DMN_Process *process = mac_dmn_process_from_task(req->task.name);
+    B32 keep_task_right = 0;
+
+    // rjf: exec replaces the task's kernel port (the exception ports survive): a message from one
+    // of our pids under an unknown task port comes from that process, exec'd; adopt the new port
+    if(process == 0)
+    {
+      int pid = 0;
+      if(pid_for_task(req->task.name, &pid) == KERN_SUCCESS && pid > 0)
+      {
+        MAC_DMN_Process *exec_process = mac_dmn_process_from_pid((pid_t)pid);
+        if(exec_process != 0 && !exec_process->has_exited)
+        {
+          log_infof("mac demon: pid %d raised an exception under a new task port (%u, was %u): it exec'd.\n", pid, (unsigned)req->task.name, (unsigned)exec_process->task);
+          mach_port_deallocate(mach_task_self(), exec_process->task);
+          exec_process->task = req->task.name;
+          keep_task_right = 1;
+          process = exec_process;
+        }
+      }
+    }
     if(process == 0 || process->has_exited)
     {
-      // rjf: not ours (or already gone) -> reply success so the thread continues
+      // rjf: not ours: a child forked off a debuggee (it inherits the exception ports, and its
+      // copy-on-write image carries our trap instructions). if it hit one of our traps, put the
+      // original instruction back and let it continue; otherwise fail the exception, so that the
+      // kernel delivers the corresponding signal (default action, or the child's handler) instead
+      // of re-executing the faulting instruction forever. a late message from a process which
+      // already exited is simply continued.
+      kern_return_t ret_code = KERN_FAILURE;
+      if(process != 0)
+      {
+        ret_code = KERN_SUCCESS;
+      }
+      else if(req->exception == EXC_BREAKPOINT && mac_dmn_unknown_task_restore_trap(req))
+      {
+        ret_code = KERN_SUCCESS;
+      }
+      else
+      {
+        int pid = 0;
+        pid_for_task(req->task.name, &pid);
+        log_infof("mach: exception %d (codes 0x%I64x, 0x%I64x) from a task we do not debug (pid %d); failing it.\n", (int)req->exception, (U64)((req->code_count > 0) ? req->code[0] : 0), (U64)((req->code_count > 1) ? req->code[1] : 0), pid);
+      }
       MAC_DMN_ExceptionRaiseReply reply = {0};
       reply.head.msgh_bits        = MACH_MSGH_BITS(MACH_MSGH_BITS_REMOTE(req->head.msgh_bits), 0);
       reply.head.msgh_size        = sizeof(reply);
@@ -1162,7 +1210,7 @@ mac_dmn_process_receive_exceptions(MAC_DMN_Process *process_filter, U64 timeout_
       reply.head.msgh_local_port  = MACH_PORT_NULL;
       reply.head.msgh_id          = req->head.msgh_id + 100;
       reply.ndr                   = NDR_record;
-      reply.ret_code              = KERN_SUCCESS;
+      reply.ret_code              = ret_code;
       mach_msg(&reply.head, MACH_SEND_MSG, reply.head.msgh_size, 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
       mach_port_deallocate(mach_task_self(), req->thread.name);
       mach_port_deallocate(mach_task_self(), req->task.name);
@@ -1175,37 +1223,35 @@ mac_dmn_process_receive_exceptions(MAC_DMN_Process *process_filter, U64 timeout_
       mac_dmn_process_suspend(process);
     }
     
-    // rjf: find thread (sync first, in case it is new)
+    // rjf: find thread. a new one is recorded right here, owning the send right carried by the
+    // message; threads which have gone are left to the reporting sync at the stop, so that their
+    // exit is reported.
     MAC_DMN_Thread *thread = mac_dmn_thread_from_port(req->thread.name);
-    if(thread == 0 && process->ctx != 0)
-    {
-      mac_dmn_process_sync_threads(0, 0, process, 0);
-      thread = mac_dmn_thread_from_port(req->thread.name);
-    }
-    if(thread == 0 && process->ctx == 0)
-    {
-      // rjf: process context not yet created (initial attach stop) -> create a bare thread record
-      MAC_DMN_ProcessCtx *ctx = &mac_dmn_entity_alloc(MAC_DMN_EntityKind_ProcessCtx)->process_ctx;
-      ctx->arena = arena_alloc();
-      ctx->arch = Arch_arm64;
-      ctx->module_slots_count = 4096;
-      ctx->module_slots = push_array(ctx->arena, MAC_DMN_ModuleSlot, ctx->module_slots_count);
-      ctx->ref_count = 1;
-      process->ctx = ctx;
-      mac_dmn_process_sync_threads(0, 0, process, 0);
-      thread = mac_dmn_thread_from_port(req->thread.name);
-    }
-    
-    // rjf: drop the extra send rights carried by the message
-    mach_port_deallocate(mach_task_self(), req->thread.name);
-    mach_port_deallocate(mach_task_self(), req->task.name);
-    
     if(thread == 0)
     {
-      log_infof("mach: exception from unknown thread port %u.\n", (unsigned)req->thread.name);
-      continue;
+      if(process->ctx == 0)
+      {
+        // rjf: process context not yet created (initial attach stop)
+        MAC_DMN_ProcessCtx *ctx = &mac_dmn_entity_alloc(MAC_DMN_EntityKind_ProcessCtx)->process_ctx;
+        ctx->arena = arena_alloc();
+        ctx->arch = Arch_arm64;
+        ctx->module_slots_count = 4096;
+        ctx->module_slots = push_array(ctx->arena, MAC_DMN_ModuleSlot, ctx->module_slots_count);
+        ctx->ref_count = 1;
+        process->ctx = ctx;
+      }
+      thread = mac_dmn_thread_alloc(process, req->thread.name);
     }
-    
+    else
+    {
+      // rjf: we already hold a send right under this name; drop the extra one
+      mach_port_deallocate(mach_task_self(), req->thread.name);
+    }
+    if(!keep_task_right)
+    {
+      mach_port_deallocate(mach_task_self(), req->task.name);
+    }
+
     // rjf: record on thread
     if(thread->has_pending_exception && thread->pending_exception.head.msgh_remote_port != MACH_PORT_NULL)
     {
@@ -1220,6 +1266,8 @@ mac_dmn_process_receive_exceptions(MAC_DMN_Process *process_filter, U64 timeout_
     thread->stop_signo = 0;
     thread->stop_hw_trap_vaddr = 0;
     thread->force_ignore_on_reply = 0;
+    thread->force_deliver_on_reply = 0;
+    thread->stop_reported = 0;
     {
       exception_type_t exception = req->exception;
       S64 code0 = (req->code_count > 0) ? req->code[0] : 0;
@@ -1893,6 +1941,8 @@ mac_dmn_thread_step_over_internal(MAC_DMN_Process *process, MAC_DMN_Thread *thre
     mac_dmn_thread_read_reg_block(thread);
   }
   mac_dmn_thread_set_single_step(thread, 0);
+  // rjf: the step completion is internal: nothing to report (the stop keeps its reported mark)
+  thread->stop_reported = 1;
   if(thread->stop_kind == MAC_DMN_StopKind_SingleStep)
   {
     // rjf: step completion; its pending reply is a plain continue
@@ -2191,8 +2241,22 @@ dmn_ctrl_launch(DMN_CtrlCtx *ctx, ProcessLaunchParams *params)
     else
     {
       MAC_DMN_Process *process = mac_dmn_process_alloc(pid, task, MAC_DMN_ProcessState_Launch, params->debug_subprocesses, 1);
-      mac_dmn_process_install_exception_ports(process);
-      if(ptrace(PT_ATTACHEXC, pid, 0, 0) != 0)
+      if(!mac_dmn_process_install_exception_ports(process))
+      {
+        // rjf: without our exception ports no stop would ever be seen; give up on this process
+        log_infof("mac demon: could not install exception ports for pid %d; killing it.\n", (int)pid);
+        mac_dmn_process_restore_exception_ports(process);
+        mac_dmn_process_release(process);
+        kill(pid, SIGKILL);
+        for(U64 attempt = 0; attempt < 200; attempt += 1)
+        {
+          pid_t r = waitpid(pid, 0, WNOHANG);
+          if(r == pid || (r < 0 && errno != EINTR)) { break; }
+          usleep(1000);
+        }
+        pid = 0;
+      }
+      else if(ptrace(PT_ATTACHEXC, pid, 0, 0) != 0)
       {
         log_infof("mac demon: ptrace(PT_ATTACHEXC, %d) failed (errno %d); signals will not be reported as exceptions.\n", (int)pid, errno);
       }
@@ -2218,8 +2282,13 @@ dmn_ctrl_attach(DMN_CtrlCtx *ctx, U32 pid)
   else
   {
     MAC_DMN_Process *process = mac_dmn_process_alloc((pid_t)pid, task, MAC_DMN_ProcessState_Attach, 1, 0);
-    mac_dmn_process_install_exception_ports(process);
-    if(ptrace(PT_ATTACHEXC, (pid_t)pid, 0, 0) != 0)
+    if(!mac_dmn_process_install_exception_ports(process))
+    {
+      log_infof("mac demon: could not install exception ports for pid %d; cannot attach.\n", (int)pid);
+      mac_dmn_process_restore_exception_ports(process);
+      mac_dmn_process_release(process);
+    }
+    else if(ptrace(PT_ATTACHEXC, (pid_t)pid, 0, 0) != 0)
     {
       // rjf: without PT_ATTACHEXC no initial stop arrives and signals would not be
       // reported; treat as a failed attach
@@ -2266,17 +2335,116 @@ dmn_ctrl_detach(DMN_CtrlCtx *ctx, DMN_Handle process_handle)
   B32 result = 0;
   mutex_take(mac_dmn_state->halter_mutex);
   MAC_DMN_Process *process = mac_dmn_process_from_handle(process_handle);
-  if(process != 0)
+  if(process != 0 && !process->has_exited && !process->is_detached)
   {
-    if(!process->has_exited)
+    //- rjf: take our state out of the process: the dyld trap and single stepping (the run's
+    // traps and watchpoints are already gone at a stop), and write back modified registers
+    mac_dmn_process_set_dyld_notification_trap(process, 0);
+    for EachNode(thread, MAC_DMN_Thread, process->first_thread)
     {
-      mac_dmn_process_set_dyld_notification_trap(process, 0);
+      if(thread->is_single_stepping)
+      {
+        mac_dmn_thread_set_single_step(thread, 0);
+      }
+      if(thread->is_reg_block_dirty && thread->regs_are_valid)
+      {
+        thread->is_reg_block_dirty = !mac_dmn_thread_write_reg_block(thread);
+      }
+    }
+
+    //- rjf: PT_DETACH requires the BSD process to be stopped, which under PT_ATTACHEXC is only
+    // the case while a thread is inside a soft signal exception (the kernel marks the process
+    // SSTOP until the signal is answered); the signal is then delivered once we are gone, as
+    // PT_DETACH leaves it in place. so the detach happens at a SIGCONT exception, harmless to a
+    // running process: if no such exception is pending, answer what is pending (hardware
+    // exceptions escalated, so that they turn into their signal; a SIGSTOP dropped), let the
+    // process run and send it SIGCONT. (a traced process reports every signal, SIGCONT included.)
+    B32 is_ready = 0;
+    for EachNode(thread, MAC_DMN_Thread, process->first_thread)
+    {
+      if(thread->has_pending_exception && thread->stop_kind == MAC_DMN_StopKind_SoftSignal && thread->stop_signo != SIGSTOP)
+      {
+        is_ready = 1;
+      }
+    }
+    if(!is_ready)
+    {
       for EachNode(thread, MAC_DMN_Thread, process->first_thread)
       {
-        if(thread->is_single_stepping)
+        if(thread->state == MAC_DMN_ThreadState_Exited) { continue; }
+        B32 escalate = (thread->stop_kind == MAC_DMN_StopKind_HardException || thread->stop_kind == MAC_DMN_StopKind_Breakpoint);
+        mac_dmn_thread_reply_pending_exception(thread, !escalate);
+        if(thread->is_suspended_by_us)
         {
-          mac_dmn_thread_set_single_step(thread, 0);
+          thread_resume(thread->port);
+          thread->is_suspended_by_us = 0;
         }
+        thread->state = MAC_DMN_ThreadState_Running;
+        thread->regs_are_valid = 0;
+      }
+      mac_dmn_process_resume(process);
+      if(process->needs_initial_continue)
+      {
+        process->needs_initial_continue = 0;
+        mac_dmn_process_continue_initial(process);
+      }
+      kill(process->pid, SIGCONT);
+      for(U64 deadline_us = now_time_us() + 2000000; !is_ready && now_time_us() < deadline_us;)
+      {
+        mac_dmn_process_receive_exceptions(process, 50);
+        for EachNode(thread, MAC_DMN_Thread, process->first_thread)
+        {
+          if(thread->has_pending_exception && thread->stop_kind == MAC_DMN_StopKind_SoftSignal && thread->stop_signo != SIGSTOP)
+          {
+            is_ready = 1;
+          }
+        }
+        if(!is_ready && process->task_suspend_count != 0)
+        {
+          // rjf: something else stopped the task first (a re-faulting instruction, a foreign brk,
+          // a SIGSTOP): answer it and keep going
+          for EachNode(thread, MAC_DMN_Thread, process->first_thread)
+          {
+            B32 escalate = (thread->stop_kind == MAC_DMN_StopKind_HardException || thread->stop_kind == MAC_DMN_StopKind_Breakpoint);
+            mac_dmn_thread_reply_pending_exception(thread, !escalate);
+          }
+          mac_dmn_process_resume(process);
+        }
+      }
+      if(process->task_suspend_count == 0)
+      {
+        mac_dmn_process_suspend(process);
+      }
+    }
+    
+    //- rjf: detach: restore the exception ports first (nothing runs in between: the task is
+    // suspended, the stopping thread waits for our reply), then PT_DETACH
+    if(is_ready)
+    {
+      mac_dmn_process_restore_exception_ports(process);
+      if(ptrace(PT_DETACH, process->pid, 0, 0) == 0)
+      {
+        result = 1;
+      }
+      else
+      {
+        log_infof("ptrace error: PT_DETACH of pid %d failed (errno %d; BSD state %s); staying attached.\n", (int)process->pid, errno, mac_dmn_process_is_sstop(process) ? "SSTOP" : "not stopped");
+        mac_dmn_process_install_exception_ports(process);
+      }
+    }
+    else
+    {
+      log_infof("mac demon: pid %d did not report the SIGCONT sent for detaching; staying attached.\n", (int)process->pid);
+    }
+
+    //- rjf: detached: the pending exceptions get plain continues (the process is not traced
+    // anymore; the SIGCONT it then takes does nothing), our thread suspensions are released and
+    // the task resumed. its exit events are generated by the next run, which also frees it.
+    if(result)
+    {
+      for EachNode(thread, MAC_DMN_Thread, process->first_thread)
+      {
+        thread->stop_kind = MAC_DMN_StopKind_Suspended;
         mac_dmn_thread_reply_pending_exception(thread, 1);
         if(thread->is_suspended_by_us)
         {
@@ -2284,11 +2452,31 @@ dmn_ctrl_detach(DMN_CtrlCtx *ctx, DMN_Handle process_handle)
           thread->is_suspended_by_us = 0;
         }
       }
-      mac_dmn_process_restore_exception_ports(process);
-      result = (ptrace(PT_DETACH, process->pid, 0, 0) == 0);
       mac_dmn_process_resume(process);
+      process->is_detached = 1;
     }
-    mac_dmn_process_release(process);
+
+    //- rjf: still attached: the process is stopped, possibly at the SIGCONT we sent, which must
+    // be swallowed when it is answered
+    else
+    {
+      for EachNode(thread, MAC_DMN_Thread, process->first_thread)
+      {
+        if(thread->state == MAC_DMN_ThreadState_Exited) { continue; }
+        if(thread->has_pending_exception && thread->stop_kind == MAC_DMN_StopKind_SoftSignal && (thread->stop_signo == SIGSTOP || thread->stop_signo == SIGCONT))
+        {
+          thread->force_ignore_on_reply = 1;
+          thread->stop_reported = 1;
+        }
+        if(thread->state == MAC_DMN_ThreadState_Running)
+        {
+          thread->state = MAC_DMN_ThreadState_Stopped;
+          thread->is_reg_block_dirty = 0;
+          mac_dmn_thread_read_reg_block(thread);
+        }
+      }
+      mac_dmn_process_set_dyld_notification_trap(process, 1);
+    }
   }
   mutex_drop(mac_dmn_state->halter_mutex);
   return result;
@@ -2353,15 +2541,16 @@ mac_dmn_process_resume_for_run(MAC_DMN_Process *process, B32 ignore_previous_exc
     {
       thread->is_reg_block_dirty = !mac_dmn_thread_write_reg_block(thread);
     }
-    B32 ignore = (ignore_previous_exception || thread->force_ignore_on_reply);
+    // rjf: a frozen thread keeps its pending exception (and its reported mark) until it runs
+    // again; the run which resumes it decides what to do with it, as on Linux
+    if(thread->is_suspended_by_us) { continue; }
+    B32 ignore = ((ignore_previous_exception || thread->force_ignore_on_reply) && !thread->force_deliver_on_reply);
     thread->force_ignore_on_reply = 0;
+    thread->force_deliver_on_reply = 0;
     mac_dmn_thread_reply_pending_exception(thread, ignore);
-    if(!thread->is_suspended_by_us)
-    {
-      thread->state = MAC_DMN_ThreadState_Running;
-      thread->is_reg_block_dirty = 0;
-      thread->regs_are_valid = 0;
-    }
+    thread->state = MAC_DMN_ThreadState_Running;
+    thread->is_reg_block_dirty = 0;
+    thread->regs_are_valid = 0;
   }
   mac_dmn_process_resume(process);
   
@@ -2406,7 +2595,7 @@ mac_dmn_process_handle_exit(Arena *arena, DMN_EventList *events, MAC_DMN_Process
   for EachNode(thread, MAC_DMN_Thread, process->first_thread)
   {
     thread->state = MAC_DMN_ThreadState_Exited;
-    thread->has_pending_exception = 0;
+    // NOTE: a pending exception's reply right is released with the thread (below)
     DMN_Event *e = dmn_event_list_push(arena, events);
     e->kind    = DMN_EventKind_ExitThread;
     e->process = mac_dmn_handle_from_process(process);
@@ -2521,7 +2710,7 @@ mac_dmn_process_handle_dyld_notification(Arena *arena, DMN_EventList *events, MA
 }
 
 internal DMN_ExceptionKind
-mac_dmn_exception_kind_from_thread(MAC_DMN_Thread *thread)
+mac_dmn_exception_kind_from_thread(MAC_DMN_Thread *thread, U64 *fault_vaddr_out)
 {
   DMN_ExceptionKind kind = DMN_ExceptionKind_Null;
   arm_exception_state64_t es = {0};
@@ -2543,8 +2732,221 @@ mac_dmn_exception_kind_from_thread(MAC_DMN_Thread *thread)
         kind = DMN_ExceptionKind_MemoryExecute;
       }break;
     }
+    // rjf: the fault address register holds the address of the last abort
+    if(kind != DMN_ExceptionKind_Null && fault_vaddr_out != 0)
+    {
+      fault_vaddr_out[0] = es.__far;
+    }
   }
   return kind;
+}
+
+////////////////////////////////
+//~ rjf: Fork / Exec / Detach Helpers
+
+//- rjf: a task we do not debug raised EXC_BREAKPOINT: if it is a child forked off one of our
+// processes and the trap instruction is one of ours (inherited with the copy-on-write image),
+// write the original instruction back. returns 1 if the child can simply continue.
+
+internal B32
+mac_dmn_unknown_task_restore_trap(MAC_DMN_ExceptionRaiseRequest *req)
+{
+  B32 restored = 0;
+
+  //- rjf: find the debuggee this task descends from
+  MAC_DMN_Process *ancestor = 0;
+  {
+    int pid = 0;
+    if(pid_for_task(req->task.name, &pid) == KERN_SUCCESS)
+    {
+      for(U64 depth = 0; depth < 8 && pid > 1 && ancestor == 0; depth += 1)
+      {
+        struct kinfo_proc kp = {0};
+        size_t kp_size = sizeof(kp);
+        int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, pid};
+        if(sysctl(mib, 4, &kp, &kp_size, 0, 0) != 0 || kp_size == 0)
+        {
+          break;
+        }
+        pid = (int)kp.kp_eproc.e_ppid;
+        ancestor = mac_dmn_process_from_pid((pid_t)pid);
+      }
+    }
+  }
+
+  //- rjf: the faulting pc must hold a brk; find its original instruction
+  if(ancestor != 0 && ancestor->ctx != 0)
+  {
+    arm_thread_state64_t ts = {0};
+    mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+    U32 inst = 0;
+    if(thread_get_state(req->thread.name, ARM_THREAD_STATE64, (thread_state_t)&ts, &count) == KERN_SUCCESS &&
+       mac_dmn_read_struct(req->task.name, ts.__pc, &inst) == sizeof(inst) &&
+       arm64_inst_is_brk(inst))
+    {
+      U64 pc = ts.__pc;
+
+      // rjf: the dyld notification trap
+      if(ancestor->dyld_notification_trap_is_set && pc == ancestor->dyld_notification_vaddr)
+      {
+        restored = mac_dmn_write_struct(req->task.name, pc, &ancestor->dyld_notification_orig_inst);
+      }
+
+      // rjf: a trap of the run in progress
+      else if(mac_dmn_state->run_traps != 0)
+      {
+        DMN_Handle ancestor_handle = mac_dmn_handle_from_process(ancestor);
+        U64 bytes_per_trap = arch_info_from_arch(Arch_arm64)->trap_instruction.size;
+        U64 trap_idx = 0;
+        for EachNode(n, DMN_TrapChunkNode, mac_dmn_state->run_traps->first)
+        {
+          for EachIndex(n_idx, n->count)
+          {
+            DMN_Trap *trap = n->v+n_idx;
+            if(trap->flags == 0 && mac_dmn_state->run_trap_is_written[trap_idx] && trap->vaddr == pc && dmn_handle_match(trap->process, ancestor_handle))
+            {
+              restored = mac_dmn_write(req->task.name, r1u64(pc, pc + bytes_per_trap), mac_dmn_state->run_trap_swap_bytes + trap_idx*bytes_per_trap);
+              goto dbl_break_find_inherited_trap;
+            }
+            trap_idx += 1;
+          }
+        }
+        dbl_break_find_inherited_trap:;
+      }
+      log_infof("mac demon: a child forked off pid %d hit an inherited trap at 0x%I64x; %s.\n", (int)ancestor->pid, pc, restored ? "restored the original instruction" : "letting it take SIGTRAP");
+    }
+  }
+  return restored;
+}
+
+//- rjf: the signal the kernel delivers for a hardware exception it was told to fail
+
+internal B32
+mac_dmn_signo_is_escalation_of_exception(U64 signo, U64 exception_type)
+{
+  B32 result = 0;
+  switch(exception_type)
+  {
+    default:{}break;
+    case EXC_BAD_ACCESS:      {result = (signo == SIGSEGV || signo == SIGBUS);}break;
+    case EXC_BAD_INSTRUCTION: {result = (signo == SIGILL);}break;
+    case EXC_ARITHMETIC:      {result = (signo == SIGFPE);}break;
+    case EXC_EMULATION:       {result = (signo == SIGEMT);}break;
+    case EXC_SOFTWARE:        {result = (signo == SIGSYS || signo == SIGPIPE || signo == SIGABRT || signo == SIGTRAP);}break;
+    case EXC_BREAKPOINT:      {result = (signo == SIGTRAP);}break;
+  }
+  return result;
+}
+
+//- rjf: exec: the kernel sends a traced process SIGTRAP at the first instruction of the new
+// image's dyld, whose image list is still empty
+
+internal B32
+mac_dmn_process_detect_exec(MAC_DMN_Process *process)
+{
+  B32 result = 0;
+  task_dyld_info_data_t dyld_info = {0};
+  mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
+  if(process->ctx != 0 && process->state == MAC_DMN_ProcessState_Normal &&
+     task_info(process->task, TASK_DYLD_INFO, (task_info_t)&dyld_info, &count) == KERN_SUCCESS &&
+     dyld_info.all_image_info_addr != 0)
+  {
+    struct dyld_all_image_infos infos = {0};
+    U64 read_size = mac_dmn_read(process->task, r1u64(dyld_info.all_image_info_addr, dyld_info.all_image_info_addr + sizeof(infos)), &infos);
+    if(read_size >= OffsetOf(struct dyld_all_image_infos, infoArray) + sizeof(infos.infoArray) &&
+       infos.infoArrayCount == 0 && infos.infoArray == 0 &&
+       (dyld_info.all_image_info_addr != process->all_image_infos_vaddr || process->last_image_info_count != 0))
+    {
+      result = 1;
+    }
+  }
+  return result;
+}
+
+internal void
+mac_dmn_process_handle_exec(Arena *arena, DMN_EventList *events, MAC_DMN_Process *process, MAC_DMN_Thread *thread)
+{
+  Temp scratch = scratch_begin(&arena, 1);
+  log_infof("mac demon: pid %d exec'd; rediscovering its images.\n", (int)process->pid);
+
+  //- rjf: the old address space is gone, and the dyld trap with it (nothing to restore); so
+  // are all modules
+  process->dyld_notification_trap_is_set = 0;
+  process->dyld_notification_vaddr = 0;
+  process->dyld_base_vaddr = 0;
+  process->last_image_info_count = 0;
+  process->all_image_infos_vaddr = 0;
+  process->did_exec = 1;
+  for(MAC_DMN_Module *m = process->ctx->first_module, *next = 0; m != 0; m = next)
+  {
+    next = m->order_next;
+    mac_dmn_push_event_unload_module(arena, events, process, m);
+    mac_dmn_module_release(process->ctx, m);
+  }
+
+  //- rjf: exec replaces the threads: report the ones which vanished (and the new one, if not seen yet)
+  mac_dmn_process_sync_threads(arena, events, process, 1);
+
+  //- rjf: launch-style discovery: the thread is at dyld's first instruction, with the main
+  // executable's header address on top of its stack
+  {
+    task_dyld_info_data_t dyld_info = {0};
+    mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
+    if(task_info(process->task, TASK_DYLD_INFO, (task_info_t)&dyld_info, &count) == KERN_SUCCESS)
+    {
+      process->all_image_infos_vaddr = dyld_info.all_image_info_addr;
+    }
+  }
+  ARM64_RegBlock *regs = (ARM64_RegBlock *)thread->reg_block;
+  U64 main_header_vaddr = 0;
+  U64 dyld_header_vaddr = mac_dmn_image_header_vaddr_from_vaddr_scan(process->task, regs->pc, MH_DYLINKER);
+  {
+    U64 mh = 0;
+    struct mach_header_64 hdr = {0};
+    if(mac_dmn_read_struct(process->task, regs->sp, &mh) == sizeof(mh) &&
+       mac_dmn_read_struct(process->task, mh, &hdr) == sizeof(hdr) &&
+       hdr.magic == MH_MAGIC_64 && hdr.filetype == MH_EXECUTE)
+    {
+      main_header_vaddr = mh;
+    }
+  }
+  String8 main_path = {0};
+  {
+    char *buffer = push_array(scratch.arena, char, PROC_PIDPATHINFO_MAXSIZE);
+    int size = proc_pidpath(process->pid, buffer, PROC_PIDPATHINFO_MAXSIZE);
+    if(size > 0)
+    {
+      main_path = str8((U8 *)buffer, (U64)size);
+    }
+  }
+  if(main_header_vaddr != 0)
+  {
+    mac_dmn_push_event_load_module(arena, events, process, thread, main_header_vaddr, main_path, 1, 0);
+  }
+  else
+  {
+    log_infof("mac demon: could not locate the main executable of pid %d after its exec; its images will be picked up at the next stop.\n", (int)process->pid);
+  }
+  if(dyld_header_vaddr != 0)
+  {
+    mac_dmn_push_event_load_module(arena, events, process, thread, dyld_header_vaddr, str8_lit("/usr/lib/dyld"), 0, 1);
+    if(mac_dmn_process_find_dyld_notification(process, dyld_header_vaddr, 0))
+    {
+      mac_dmn_process_set_dyld_notification_trap(process, 1);
+    }
+  }
+  scratch_end(scratch);
+}
+
+//- rjf: the BSD process state (PT_DETACH & co. require SSTOP)
+
+internal B32
+mac_dmn_process_is_sstop(MAC_DMN_Process *process)
+{
+  struct kinfo_proc kp = {0};
+  size_t kp_size = sizeof(kp);
+  int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)process->pid};
+  return (sysctl(mib, 4, &kp, &kp_size, 0, 0) == 0 && kp_size != 0 && kp.kp_proc.p_stat == SSTOP);
 }
 
 ////////////////////////////////
@@ -2561,6 +2963,39 @@ dmn_ctrl_run(Arena *arena, DMN_CtrlCtx *ctx, DMN_RunCtrls *ctrls)
   //
   mutex_take(mac_dmn_state->halter_mutex);
   
+  //////////////////////////////
+  //- rjf: report detached processes: from the debugger's point of view their threads, modules
+  // and the processes themselves are gone (see dmn_ctrl_detach)
+  //
+  for(MAC_DMN_Process *process = mac_dmn_state->first_process, *next = 0; process != 0; process = next)
+  {
+    next = process->next;
+    if(process->is_detached)
+    {
+      DMN_Handle process_handle = mac_dmn_handle_from_process(process);
+      for EachNode(thread, MAC_DMN_Thread, process->first_thread)
+      {
+        DMN_Event *e = dmn_event_list_push(arena, &events);
+        e->kind    = DMN_EventKind_ExitThread;
+        e->process = process_handle;
+        e->thread  = mac_dmn_handle_from_thread(thread);
+      }
+      if(process->ctx != 0)
+      {
+        for(MAC_DMN_Module *module = process->ctx->first_module; module != 0; module = module->order_next)
+        {
+          mac_dmn_push_event_unload_module(arena, &events, process, module);
+        }
+      }
+      {
+        DMN_Event *e = dmn_event_list_push(arena, &events);
+        e->kind    = DMN_EventKind_ExitProcess;
+        e->process = process_handle;
+      }
+      mac_dmn_process_release(process);
+    }
+  }
+
   //////////////////////////////
   //- rjf: report newly launched processes; they are stopped at the first
   // instruction of dyld, and stay stopped until the next run.
@@ -2645,6 +3080,9 @@ dmn_ctrl_run(Arena *arena, DMN_CtrlCtx *ctx, DMN_RunCtrls *ctrls)
           trap_idx += 1;
         }
       }
+      mac_dmn_state->run_traps           = &ctrls->traps;
+      mac_dmn_state->run_trap_swap_bytes = trap_swap_bytes;
+      mac_dmn_state->run_trap_is_written = trap_is_written;
     }
     
     ////////////////////////////
@@ -2775,6 +3213,14 @@ dmn_ctrl_run(Arena *arena, DMN_CtrlCtx *ctx, DMN_RunCtrls *ctrls)
         got_stop = 1;
       }
       
+      //////////////////////////
+      //- rjf: process execs (handled at the SIGTRAP stop which follows; see mac_dmn_process_detect_exec)
+      //
+      if(kev_count > 0 && kev.filter == EVFILT_PROC && (kev.fflags & NOTE_EXEC))
+      {
+        log_infof("mac demon: pid %d exec'd.\n", (int)kev.ident);
+      }
+
       //////////////////////////
       //- rjf: process exits
       //
@@ -2956,6 +3402,7 @@ dmn_ctrl_run(Arena *arena, DMN_CtrlCtx *ctx, DMN_RunCtrls *ctrls)
             case MAC_DMN_StopKind_Watchpoint:
             {
               U64 address = thread->stop_hw_trap_vaddr;
+              U64 user_data = 0;
               for EachNode(n, DMN_TrapChunkNode, ctrls->traps.first)
               {
                 for EachIndex(n_idx, n->count)
@@ -2965,6 +3412,7 @@ dmn_ctrl_run(Arena *arena, DMN_CtrlCtx *ctx, DMN_RunCtrls *ctrls)
                   if(trap->flags != 0 && dmn_handle_match(trap->process, process_handle) && contains_1u64(r1u64(trap->vaddr, trap->vaddr+size), address))
                   {
                     address = trap->vaddr;
+                    user_data = trap->id;
                   }
                 }
               }
@@ -2974,6 +3422,7 @@ dmn_ctrl_run(Arena *arena, DMN_CtrlCtx *ctx, DMN_RunCtrls *ctrls)
               e->thread              = thread_handle;
               e->instruction_pointer = ip;
               e->address             = address;
+              e->user_data           = user_data;
               // rjf: arm64 watchpoints fire before the access; step past it now
               mac_dmn_thread_step_over_internal(process, thread);
             }break;
@@ -2995,13 +3444,26 @@ dmn_ctrl_run(Arena *arena, DMN_CtrlCtx *ctx, DMN_RunCtrls *ctrls)
                   }
                 }
               }
+              // rjf: the kernel's escalation of a hardware exception the engine chose to pass (our
+              // KERN_FAILURE reply at this pc): not a new exception; deliver the signal, whatever
+              // the next run's ignore flag says about its own event
+              else if(thread->escalated_exception && thread->escalated_ip == ip && mac_dmn_signo_is_escalation_of_exception(signo, thread->escalated_exception_type))
+              {
+                thread->force_deliver_on_reply = 1;
+              }
+              // rjf: SIGTRAP at the first instruction of a fresh image: the process exec'd
+              else if(signo == SIGTRAP && mac_dmn_process_detect_exec(process))
+              {
+                thread->force_ignore_on_reply = 1;
+                mac_dmn_process_handle_exec(arena, &events, process, thread);
+              }
               else
               {
                 is_exception = 1;
                 exception_code = signo;
                 if(signo == SIGSEGV || signo == SIGBUS)
                 {
-                  exception_kind = mac_dmn_exception_kind_from_thread(thread);
+                  exception_kind = mac_dmn_exception_kind_from_thread(thread, &exception_address);
                 }
               }
             }break;
@@ -3017,7 +3479,7 @@ dmn_ctrl_run(Arena *arena, DMN_CtrlCtx *ctx, DMN_RunCtrls *ctrls)
               if(req->exception == EXC_BAD_ACCESS)
               {
                 if(req->code_count > 1) { exception_address = (U64)req->code[1]; }
-                exception_kind = mac_dmn_exception_kind_from_thread(thread);
+                exception_kind = mac_dmn_exception_kind_from_thread(thread, 0);
               }
             }break;
           }
@@ -3029,11 +3491,6 @@ dmn_ctrl_run(Arena *arena, DMN_CtrlCtx *ctx, DMN_RunCtrls *ctrls)
             B32 is_second_chance = (is_repeatable &&
                                     thread->last_exception_ip == ip &&
                                     thread->last_exception_code == exception_code);
-            // rjf: a signal produced by escalating a hardware exception at this ip is its second chance
-            if(thread->escalated_exception && thread->escalated_ip == ip && thread->stop_kind == MAC_DMN_StopKind_SoftSignal)
-            {
-              is_second_chance = 1;
-            }
             thread->escalated_exception = 0;
             if(is_repeatable)
             {
@@ -3064,12 +3521,9 @@ dmn_ctrl_run(Arena *arena, DMN_CtrlCtx *ctx, DMN_RunCtrls *ctrls)
       //
       if(events.count == 0 && !is_halt_done)
       {
+        // NOTE: the replies reset the threads' reported marks; frozen threads keep theirs, with their pending exception
         for EachNode(process, MAC_DMN_Process, mac_dmn_state->first_process)
         {
-          for EachNode(thread, MAC_DMN_Thread, process->first_thread)
-          {
-            thread->stop_reported = 0;
-          }
           mac_dmn_process_resume_for_run(process, 0);
         }
         continue;
@@ -3089,13 +3543,12 @@ dmn_ctrl_run(Arena *arena, DMN_CtrlCtx *ctx, DMN_RunCtrls *ctrls)
     }
     
     ////////////////////////////
-    //- rjf: clear stop-reported marks, single stepping, hardware traps
+    //- rjf: clear single stepping, hardware traps (reported marks live with their pending exceptions)
     //
     for EachNode(process, MAC_DMN_Process, mac_dmn_state->first_process)
     {
       for EachNode(thread, MAC_DMN_Thread, process->first_thread)
       {
-        thread->stop_reported = 0;
         if(thread->is_single_stepping)
         {
           mac_dmn_thread_set_single_step(thread, 0);
@@ -3116,11 +3569,23 @@ dmn_ctrl_run(Arena *arena, DMN_CtrlCtx *ctx, DMN_RunCtrls *ctrls)
           DMN_Trap *trap = n->v+n_idx;
           if(trap->flags == 0 && trap_is_written[trap_idx])
           {
-            dmn_process_write(trap->process, r1u64(trap->vaddr, trap->vaddr + bytes_per_trap), trap_swap_bytes + trap_idx*bytes_per_trap);
+            // rjf: not into an image which replaced the one the trap was written to (exec)
+            MAC_DMN_Process *trap_process = mac_dmn_process_from_handle(trap->process);
+            if(trap_process == 0 || !trap_process->did_exec)
+            {
+              dmn_process_write(trap->process, r1u64(trap->vaddr, trap->vaddr + bytes_per_trap), trap_swap_bytes + trap_idx*bytes_per_trap);
+            }
           }
           trap_idx += 1;
         }
       }
+      mac_dmn_state->run_traps           = 0;
+      mac_dmn_state->run_trap_swap_bytes = 0;
+      mac_dmn_state->run_trap_is_written = 0;
+    }
+    for EachNode(process, MAC_DMN_Process, mac_dmn_state->first_process)
+    {
+      process->did_exec = 0;
     }
   }
   
