@@ -1379,6 +1379,14 @@ d_entity_store_apply_events(D_EntityCtxRWStore *store, D_EventList *list)
             }
           }
           thread->stack_base = event->stack_base;
+          if(thread->stack_base == 0)
+          {
+            // NOTE: a demon which does not report the new thread's stack (the mac demon)
+            // leaves it 0: the stack pointer at the thread's start is as good a top of its
+            // stack as any (the trap net logic tells stacks apart by it, see
+            // d_ctrl_thread__stack_switched)
+            thread->stack_base = d_sp_from_thread(thread->handle);
+          }
           thread->tls_root_vaddr = event->tls_root;
         }
       }break;
@@ -5095,6 +5103,175 @@ d_ctrl_thread__detach(DMN_CtrlCtx *ctrl_ctx, D_Msg *msg)
   ProfEnd();
 }
 
+////////////////////////////////
+//~ rjf: Control Thread: Stepping Helpers
+
+//- rjf: code lookups for the trap net logic
+//
+// after a single step took a call or jump whose destination the trap net could not know
+// (an indirect one, or a tail call), the trap net logic needs to know whether the new pc
+// has line info, and whether it still lies in the function the step began in.
+
+typedef struct D_CtrlCodeInfo D_CtrlCodeInfo;
+struct D_CtrlCodeInfo
+{
+  D_Entity *module;
+  RDI_Unit *unit;
+  B32 has_line_info;
+  U32 line_file_idx; // the unit's line at the address (the outermost call site, in inlined code)
+  U32 line_num;
+  U32 proc_idx;      // the procedure of the scope containing the address, in the module's RDI; 0 if none
+};
+
+internal D_CtrlCodeInfo
+d_ctrl_thread__code_info_from_vaddr(Access *access, D_Entity *process, U64 vaddr, U64 endt_us)
+{
+  D_CtrlCodeInfo result = {&d_entity_nil, 0, 0};
+  D_Entity *module = d_module_from_process_vaddr(process, vaddr);
+  result.module = module;
+  if(module != &d_entity_nil)
+  {
+    DI_Key dbgi_key = d_dbgi_key_from_module(module);
+    RDI_Parsed *rdi = di_rdi_from_key(access, dbgi_key, 1, endt_us);
+    if(rdi != &rdi_parsed_nil)
+    {
+      U64 voff = d_voff_from_vaddr(module, vaddr);
+      RDI_Unit *unit = rdi_unit_from_voff(rdi, voff);
+      RDI_LineTable *line_table = rdi_line_table_from_unit(rdi, unit);
+      RDI_ParsedLineTable parsed_line_table = {0};
+      rdi_parsed_from_line_table(rdi, line_table, &parsed_line_table);
+      U64 line_info_idx = rdi_line_info_idx_from_voff(&parsed_line_table, voff);
+      if(line_info_idx < parsed_line_table.count)
+      {
+        RDI_Line *line = &parsed_line_table.lines[line_info_idx];
+        result.has_line_info = (line->file_idx != 0 && line->line_num != 0);
+        result.line_file_idx = line->file_idx;
+        result.line_num = line->line_num;
+      }
+      result.unit = unit;
+      RDI_Scope *scope = rdi_scope_from_voff(rdi, voff);
+      result.proc_idx = scope->proc_idx;
+    }
+  }
+  return result;
+}
+
+internal B32
+d_ctrl_thread__code_info_same_function(D_CtrlCodeInfo *a, D_CtrlCodeInfo *b)
+{
+  B32 result = (a->module == b->module && a->module != &d_entity_nil && a->proc_idx == b->proc_idx);
+  return result;
+}
+
+internal B32
+d_ctrl_thread__code_info_same_line(D_CtrlCodeInfo *a, D_CtrlCodeInfo *b)
+{
+  B32 result = (a->module == b->module && a->module != &d_entity_nil &&
+                a->has_line_info && b->has_line_info &&
+                a->unit == b->unit && a->line_file_idx == b->line_file_idx && a->line_num == b->line_num);
+  return result;
+}
+
+//- rjf: did a jump take the thread to another stack?
+//
+// a coroutine's context switch sets sp to a stack of its own; a frame growing within the
+// thread's stack (an alloca or VLA of any size) does not. the thread's stack is known by
+// its top (the stack pointer at the thread's start, `stack_base`) and a generous size below
+// it. off the thread's stack (fibers), two addresses are two stacks when they lie farther
+// apart than a fiber's frame grows (fiber stacks are small; the Zig generator's lie 64 KB
+// apart).
+
+internal B32
+d_ctrl_thread__stack_switched(D_Entity *thread, U64 sp_before, U64 sp_after)
+{
+  B32 result = 0;
+  U64 distance = (sp_after > sp_before) ? (sp_after - sp_before) : (sp_before - sp_after);
+  U64 stack_base = thread->stack_base;
+  if(stack_base != 0)
+  {
+    Rng1U64 stack_rng = r1u64((stack_base > MB(32)) ? stack_base - MB(32) : 0, stack_base + KB(64));
+    B32 before_on_stack = contains_1u64(stack_rng, sp_before);
+    B32 after_on_stack  = contains_1u64(stack_rng, sp_after);
+    result = ((before_on_stack != after_on_stack) || (!before_on_stack && !after_on_stack && distance >= KB(16)));
+    log_infof("thread stack: [0x%I64x, 0x%I64x); sp before: 0x%I64x (%s), after: 0x%I64x (%s)\n", stack_rng.min, stack_rng.max, sp_before, before_on_stack ? "on it" : "off it", sp_after, after_on_stack ? "on it" : "off it");
+  }
+  else
+  {
+    result = (distance >= KB(256));
+    log_infof("thread stack unknown; sp before: 0x%I64x, after: 0x%I64x\n", sp_before, sp_after);
+  }
+  return result;
+}
+
+//- rjf: hits held back from an earlier run (see d_ctrl_thread__run)
+
+internal DMN_Event *
+d_ctrl_thread__held_bp_event_from_thread(D_ServerState *ss, DMN_Handle thread)
+{
+  DMN_Event *result = 0;
+  for(DMN_EventNode *n = ss->first_held_bp_event_node; n != 0; n = n->next)
+  {
+    if(dmn_handle_match(n->v.thread, thread))
+    {
+      result = &n->v;
+      break;
+    }
+  }
+  return result;
+}
+
+//- rjf: the address a thread which just entered a function (by a call, or by a tail jump
+// after its caller's frame was torn down) returns to, with the stack pointer it has when
+// it gets there: `lr` and sp on arm64; `[sp]` and sp+8 on x64, where the call pushed it.
+
+internal B32
+d_ctrl_thread__return_address_from_thread(D_Handle thread, U64 *ret_vaddr_out, U64 *ret_sp_out)
+{
+  B32 result = 0;
+  Temp scratch = scratch_begin(0, 0);
+  D_Entity *thread_entity = d_entity_from_handle(thread);
+  D_Entity *process = d_entity_ancestor_from_kind(thread_entity, D_EntityKind_Process);
+  Arch arch = thread_entity->arch;
+  ARCH_Info *arch_info = arch_info_from_arch(arch);
+  void *reg_block = push_array(scratch.arena, U8, arch_info->reg_block_size);
+  if(d_thread_read_reg_block(thread, reg_block))
+  {
+    U64 sp = arch_sp_from_reg_block(arch_info, reg_block);
+    switch(arch)
+    {
+      default:{}break;
+      case Arch_arm64:
+      {
+        U64 lr = 0;
+        ARCH_RegCode lr_code = arch_reg_code_from_name(arch_info, str8_lit("lr"));
+        if(lr_code != 0 &&
+           arch_reg_block_read_range(arch_info, reg_block, arch_info->reg_code_rng_table[lr_code], &lr) &&
+           lr != 0)
+        {
+          *ret_vaddr_out = lr;
+          *ret_sp_out = sp;
+          result = 1;
+        }
+      }break;
+      case Arch_x64:
+      case Arch_x86:
+      {
+        U64 size = (arch == Arch_x64) ? 8 : 4;
+        U64 ret = 0;
+        if(d_process_read(process->handle, r1u64(sp, sp+size), &ret) == size && ret != 0)
+        {
+          *ret_vaddr_out = ret;
+          *ret_sp_out = sp + size;
+          result = 1;
+        }
+      }break;
+    }
+  }
+  scratch_end(scratch);
+  return result;
+}
+
+
 internal void
 d_ctrl_thread__run(DMN_CtrlCtx *ctrl_ctx, D_Msg *msg)
 {
@@ -5157,6 +5334,14 @@ d_ctrl_thread__run(DMN_CtrlCtx *ctrl_ctx, D_Msg *msg)
   //
   U64 sp_check_value = d_sp_from_thread(target_thread);
   U64 step_start_sp = sp_check_value;
+  U64 step_start_ip = d_ip_from_thread(target_thread);
+  D_ServerState *ss = d_ctrl_thread__server_state_from_id(D_ServerID_LocalHost);
+
+  //////////////////////////////
+  //- rjf: traps the trap net logic adds while running (the return address of a call or
+  // jump out of the function, known only once it was taken; see D_TrapFlag_TrapReturnAddress)
+  //
+  D_TrapList extra_traps = {0};
   log_infof("sp_check_value := 0x%I64x\n", sp_check_value);
   
   //////////////////////////////
@@ -5195,7 +5380,12 @@ d_ctrl_thread__run(DMN_CtrlCtx *ctrl_ctx, D_Msg *msg)
           // rjf: determine if thread sits on a trap it hit, with the hit not reported yet (another
           // thread's hit stopped that run; see the run loop below): it is not stuck, its hit is
           // the next stop
-          B32 thread_has_unreported_bp_hit = thread->has_unreported_bp_hit;
+          B32 thread_has_unreported_bp_hit = 0;
+          if(ss != 0)
+          {
+            DMN_Event *held = d_ctrl_thread__held_bp_event_from_thread(ss, d_dmn_from_handle(thread->handle));
+            thread_has_unreported_bp_hit = (held != 0 && held->address == 0 && held->instruction_pointer == rip);
+          }
           if(thread_has_unreported_bp_hit)
           {
             log_infof("thread [0x%I64x] holds an unreported breakpoint hit at 0x%I64x: not stepped off\n", d_dmn_from_handle(thread->handle).u64[0], rip);
@@ -5391,65 +5581,85 @@ d_ctrl_thread__run(DMN_CtrlCtx *ctrl_ctx, D_Msg *msg)
       run_ctrls.traps = *trap_list;
       
       //////////////////////////
-      //- rjf: report a breakpoint hit held back from an earlier run
+      //- rjf: report a breakpoint or watchpoint hit held back from an earlier run
       //
-      // A thread marked by the end of an earlier run (see "hold back the other
-      // threads' unreported breakpoint hits" below) still sits on the trap it
-      // hit; nothing has moved it (it is exempt from the stuck-thread stepping
-      // above). If this run has a user trap there, its hit is the next event:
-      // the demon delivered that stop long ago, so nothing is resumed for it,
-      // and the regular breakpoint handling below (conditions, thread filters)
-      // decides about the stop. If the breakpoint is gone, or the thread was
-      // moved (by a single step of its own, say), the hit is dropped: the
-      // thread runs on from the original instruction. A frozen thread keeps
-      // its hit for the run which thaws it.
+      // The end of an earlier run held back the hits of other threads, which the
+      // demon reported together with the stop (see "hold back the other threads'
+      // unreported hits" below). A thread whose breakpoint hit was held back still
+      // sits on the trap; nothing has moved it (it is exempt from the stuck-thread
+      // stepping above). If this run has a user trap there, its hit is the next
+      // event: the demon delivered that stop long ago, so nothing is resumed for
+      // it, and the regular breakpoint handling below (conditions, thread filters)
+      // decides about the stop. If the breakpoint is gone, or the thread was moved
+      // (by a single step of its own, say), the hit is dropped: the thread runs on
+      // from the original instruction. A watchpoint hit (the demon stepped the
+      // thread past the access) is reported if a watchpoint still covers the
+      // address. A frozen thread keeps its hit for the run which thaws it; a thread
+      // not known yet (its creation is still queued behind the stop) for the run
+      // which sees it.
       //
       DMN_Event *event = 0;
-      for(D_Entity *machine = entity_ctx->root->first; machine != &d_entity_nil && event == 0; machine = machine->next)
+      if(ss != 0) for(DMN_EventNode *n = ss->first_held_bp_event_node, *prev = 0, *next = 0; n != 0 && event == 0; n = next)
       {
-        if(machine->kind != D_EntityKind_Server) { continue; }
-        for(D_Entity *process = machine->first; process != &d_entity_nil && event == 0; process = process->next)
+        next = n->next;
+        DMN_Event *held = &n->v;
+        D_Entity *process = d_entity_from_handle(d_handle_from_dmn(D_ServerID_LocalHost, held->process));
+        D_Entity *thread = d_entity_from_handle(d_handle_from_dmn(D_ServerID_LocalHost, held->thread));
+        B32 is_watchpoint_hit = (held->address != 0);
+        if(process != &d_entity_nil && (thread == &d_entity_nil || thread->is_frozen))
         {
-          if(process->kind != D_EntityKind_Process) { continue; }
-          DMN_Handle process_dmn = d_dmn_from_handle(process->handle);
-          for(D_Entity *thread = process->first; thread != &d_entity_nil && event == 0; thread = thread->next)
+          prev = n;
+          continue;
+        }
+
+        // rjf: the user trap of this run which the held hit belongs to
+        DMN_Trap *hit_trap = 0;
+        U64 rip = 0;
+        if(process != &d_entity_nil)
+        {
+          rip = d_ip_from_thread(thread->handle);
+          for(DMN_TrapChunkNode *t_n = user_traps.first; t_n != 0 && hit_trap == 0; t_n = t_n->next)
           {
-            if(thread->kind != D_EntityKind_Thread || !thread->has_unreported_bp_hit || thread->is_frozen) { continue; }
-            DMN_Handle thread_dmn = d_dmn_from_handle(thread->handle);
-            U64 rip = d_ip_from_thread(thread->handle);
-            DMN_Trap *hit_trap = 0;
-            if(rip == thread->unreported_bp_hit_vaddr)
+            for(DMN_Trap *trap = t_n->v, *opl = t_n->v + t_n->count; trap < opl; trap += 1)
             {
-              for(DMN_TrapChunkNode *n = user_traps.first; n != 0 && hit_trap == 0; n = n->next)
+              if(!dmn_handle_match(trap->process, held->process)) { continue; }
+              B32 match = (is_watchpoint_hit
+                           ? (trap->flags != 0 && trap->vaddr <= held->address && held->address < trap->vaddr + Max(1, trap->size))
+                           : (trap->flags == 0 && trap->vaddr == rip && rip == held->instruction_pointer));
+              if(match)
               {
-                for(DMN_Trap *trap = n->v, *opl = n->v + n->count; trap < opl; trap += 1)
-                {
-                  if(trap->flags == 0 && dmn_handle_match(trap->process, process_dmn) && trap->vaddr == rip)
-                  {
-                    hit_trap = trap;
-                    break;
-                  }
-                }
+                hit_trap = trap;
+                break;
               }
             }
-            thread->has_unreported_bp_hit = 0;
-            if(hit_trap == 0)
-            {
-              log_infof("held_back_breakpoint_hit: thread [0x%I64x] at 0x%I64x (hit at 0x%I64x): no such trap anymore, dropped\n", thread_dmn.u64[0], rip, thread->unreported_bp_hit_vaddr);
-              continue;
-            }
-            log_infof("held_back_breakpoint_hit: thread [0x%I64x] at 0x%I64x -> reported now\n", thread_dmn.u64[0], rip);
-            event = push_array(scratch.arena, DMN_Event, 1);
-            event->kind                = DMN_EventKind_Breakpoint;
-            event->process             = process_dmn;
-            event->thread              = thread_dmn;
-            event->arch                = thread->arch;
-            event->instruction_pointer = rip;
-            event->user_data           = hit_trap->id;
           }
         }
+
+        // rjf: unlink the held hit
+        if(prev == 0) { ss->first_held_bp_event_node = next; }
+        else          { prev->next = next; }
+        if(ss->last_held_bp_event_node == n) { ss->last_held_bp_event_node = prev; }
+
+        // rjf: report or drop
+        if(hit_trap != 0)
+        {
+          log_infof("held_back_%s_hit: thread [0x%I64x] at 0x%I64x -> reported now\n", is_watchpoint_hit ? "watchpoint" : "breakpoint", held->thread.u64[0], rip);
+          event = push_array(scratch.arena, DMN_Event, 1);
+          MemoryCopyStruct(event, held);
+          event->user_data = hit_trap->id;
+          if(!is_watchpoint_hit)
+          {
+            event->instruction_pointer = rip;
+          }
+        }
+        else
+        {
+          log_infof("held_back_%s_hit: thread [0x%I64x] at 0x%I64x (hit at 0x%I64x): no such trap anymore, dropped\n", is_watchpoint_hit ? "watchpoint" : "breakpoint", held->thread.u64[0], rip, is_watchpoint_hit ? held->address : held->instruction_pointer);
+        }
+        n->next = ss->free_held_bp_event_node;
+        ss->free_held_bp_event_node = n;
       }
-      
+
       //////////////////////////
       //- rjf: get next run-related event
       //
@@ -5881,8 +6091,22 @@ d_ctrl_thread__run(DMN_CtrlCtx *ctrl_ctx, D_Msg *msg)
             DMN_Trap *opl = n->v + n->count;
             for(;trap < opl; trap += 1)
             {
+              // NOTE: a software breakpoint's trap is hit at its address; a watchpoint's trap
+              // lies at the data address, reported as the event's address (and the demon
+              // names the trap in user_data), so its hit is matched there: its condition and
+              // thread filter apply like a breakpoint's
+              B32 hit_this_trap = 0;
+              if(trap->flags == 0)
+              {
+                hit_this_trap = (trap->vaddr == event->instruction_pointer);
+              }
+              else
+              {
+                hit_this_trap = ((event->user_data != 0 && trap->id == event->user_data) ||
+                                 (event->address != 0 && trap->vaddr <= event->address && event->address < trap->vaddr + Max(1, trap->size)));
+              }
               if(dmn_handle_match(trap->process, event->process) &&
-                 trap->vaddr == event->instruction_pointer &&
+                 hit_this_trap &&
                  (!dmn_handle_match(event->thread, d_dmn_from_handle(target_thread)) || !target_thread_is_on_user_bp_and_trap_net_trap))
               {
                 D_Breakpoint *user_bp = (D_Breakpoint *)trap->id;
@@ -5957,19 +6181,24 @@ d_ctrl_thread__run(DMN_CtrlCtx *ctrl_ctx, D_Msg *msg)
         {
           if(!hit_user_bp && dmn_handle_match(event->process, d_dmn_from_handle(target_process)))
           {
-            for(D_TrapNode *node = msg->traps.first;
-                node != 0;
-                node = node->next)
+            D_TrapList *trap_lists[] = {&msg->traps, &extra_traps};
+            for EachElement(list_idx, trap_lists)
             {
-              if(node->v.vaddr == event->instruction_pointer)
+              for(D_TrapNode *node = trap_lists[list_idx]->first;
+                  node != 0;
+                  node = node->next)
               {
-                hit_trap_net_bp = 1;
-                hit_trap_flags |= node->v.flags;
+                if(node->v.vaddr == event->instruction_pointer)
+                {
+                  hit_trap_net_bp = 1;
+                  hit_trap_flags |= node->v.flags;
+                }
               }
             }
           }
         }
-        
+
+
         log_infof("user_breakpoint_hit: %i\n", hit_user_bp);
         log_infof("entry_point_hit: %i\n", hit_entry);
         temp_end(temp);
@@ -6159,32 +6388,92 @@ d_ctrl_thread__run(DMN_CtrlCtx *ctrl_ctx, D_Msg *msg)
           trap_net_stop = 1;
           use_trap_net_logic = 0;
         }
-        else if(hit_trap_flags & D_TrapFlag_EndSteppingUnlessStackChanged) LogInfoNamedBlockF("trap_net__end_step_unless_stack_changed")
+        else if(hit_trap_flags & (D_TrapFlag_EndSteppingUnlessStackChanged|
+                                  D_TrapFlag_EndSteppingIfLineInfo|
+                                  D_TrapFlag_EndSteppingIfSameFunction|
+                                  D_TrapFlag_TrapReturnAddress)) LogInfoNamedBlockF("trap_net__end_step_conditional")
         {
-          // NOTE: an indirect jump whose destination the trap net could not know. a
-          // jump table or tail call keeps the stack: end the step where it landed. a
-          // coroutine's context switch (`mov sp, xN; br xM`) does not: the thread is
-          // now on another stack, far from the one the step began on (the `mov sp`
-          // itself was stepped as a stack pointer change, which also made the saved
-          // stack pointer that of the new stack). keep stepping, with the stack
-          // pointer of the step's start restored as the one to check against, so that
-          // the line's traps stop the thread once it is switched back to.
+          // NOTE: the trap's single step took a call or jump whose destination the trap net
+          // could not know (an indirect one, or a tail call out of the function). the
+          // destination decides:
+          //
+          // - a coroutine's context switch (`mov sp, xN; br xM`) put the thread on another
+          //   stack (the `mov sp` itself was stepped as a stack pointer change, which also
+          //   made the saved stack pointer that of the new stack). keep stepping, with the
+          //   stack pointer of the step's start restored as the one to check against, so
+          //   that the line's traps stop the thread once it is switched back to.
+          // - the stepped line itself (a jump table whose case lies on the line) continues
+          //   the step: its traps catch the thread where it leaves the line.
+          // - code with line info (step into), or code of the function the step began in
+          //   (step over of a jump table) ends the step there.
+          // - otherwise the thread entered code the step does not stop in: a call into
+          //   code without line info returns into the line, whose traps catch it; a jump
+          //   out of the function (tail call) only comes back to the return address, so a
+          //   trap is placed there (D_TrapFlag_TrapReturnAddress). keep stepping.
+          //
+          U64 pc_after = d_ip_from_thread(target_thread);
           U64 sp_after = d_sp_from_thread(target_thread);
-          U64 sp_distance = (sp_after > step_start_sp) ? (sp_after - step_start_sp) : (step_start_sp - sp_after);
-          log_infof("sp at step start: 0x%I64x, after jump: 0x%I64x\n", step_start_sp, sp_after);
-          if(sp_distance < KB(256))
+          B32 stack_switched = 0;
+          if(hit_trap_flags & D_TrapFlag_EndSteppingUnlessStackChanged)
           {
-            trap_net_stop = 1;
-            use_trap_net_logic = 0;
+            stack_switched = d_ctrl_thread__stack_switched(d_entity_from_handle(target_thread), step_start_sp, sp_after);
           }
-          else
+          if(stack_switched)
           {
             sp_check_value = step_start_sp;
             log_infof("stack switched; sp_check_value = 0x%I64x\n", sp_check_value);
           }
+          else
+          {
+            // NOTE: a trap with D_TrapFlag_TrapReturnAddress alone marks a direct jump the
+            // trap net already knew to leave the function (a tail call it steps over)
+            B32 end = 1;
+            B32 same_function = 0;
+            if(hit_trap_flags & (D_TrapFlag_EndSteppingIfLineInfo|D_TrapFlag_EndSteppingIfSameFunction))
+            {
+              Access *access = access_open();
+              U64 endt_us = now_time_us() + 100000;
+              D_CtrlCodeInfo dst = d_ctrl_thread__code_info_from_vaddr(access, target_process_entity, pc_after, endt_us);
+              D_CtrlCodeInfo src = d_ctrl_thread__code_info_from_vaddr(access, target_process_entity, step_start_ip, endt_us);
+              same_function = d_ctrl_thread__code_info_same_function(&dst, &src);
+              B32 same_line = d_ctrl_thread__code_info_same_line(&dst, &src);
+              end = ((same_function || ((hit_trap_flags & D_TrapFlag_EndSteppingIfLineInfo) && dst.has_line_info)) && !same_line);
+              log_infof("pc after: 0x%I64x (line info: %i; same function as 0x%I64x: %i, same line: %i) -> %s\n", pc_after, dst.has_line_info, step_start_ip, same_function, same_line, end ? "end" : "keep stepping");
+              access_close(access);
+            }
+            else if(!(hit_trap_flags & D_TrapFlag_EndSteppingUnlessStackChanged))
+            {
+              end = 0;
+            }
+            if(end)
+            {
+              trap_net_stop = 1;
+              use_trap_net_logic = 0;
+            }
+            else if(hit_trap_flags & D_TrapFlag_TrapReturnAddress && !same_function)
+            {
+              U64 ret_vaddr = 0;
+              U64 ret_sp = 0;
+              if(d_ctrl_thread__return_address_from_thread(target_thread, &ret_vaddr, &ret_sp))
+              {
+                D_Trap trap = {D_TrapFlag_EndStepping, ret_vaddr};
+                d_trap_list_push(scratch.arena, &extra_traps, &trap);
+                DMN_TrapChunkList new_traps = {0};
+                DMN_Trap dmn_trap = {target_process_dmn, ret_vaddr};
+                dmn_trap_chunk_list_push(scratch.arena, &new_traps, 1, &dmn_trap);
+                dmn_trap_chunk_list_concat_shallow_copy(scratch.arena, &joined_traps, &new_traps);
+                sp_check_value = ret_sp;
+                log_infof("trap at the return address 0x%I64x; sp_check_value = 0x%I64x\n", ret_vaddr, sp_check_value);
+              }
+              else
+              {
+                log_infof("return address unknown; keep stepping\n");
+              }
+            }
+          }
         }
       }
-      
+
       //}
       //
       //- rjf: stepping logic
@@ -6276,58 +6565,75 @@ d_ctrl_thread__run(DMN_CtrlCtx *ctrl_ctx, D_Msg *msg)
   }
   
   //////////////////////////////
-  //- rjf: hold back the other threads' unreported breakpoint hits
+  //- rjf: hold back the other threads' unreported hits
   //
   // A demon may report the hits of several threads from one run (threads
   // which hit traps at the same time; the mac demon does, the win32 demon
   // sees one debug event per run and leaves the others queued in the kernel,
   // to be delivered by later runs). We stopped for one of them; the other
   // threads' events are still queued, and those threads still sit on their
-  // trap, which the run's end restored to the original instruction. The
-  // events must not survive into a later run: their trap ids point into this
-  // message's breakpoint list, and the single-step runs which take stuck
-  // threads off their traps would consume them as noise. Instead the threads
-  // are marked: the next runs do not step them off their trap, and report
-  // their hits, one per run, before resuming anything (the run loop above).
+  // trap, which the run's end restored to the original instruction (or were
+  // stepped past the access, for a watchpoint). The events must not survive
+  // in the queue into a later run: their trap ids point into this message's
+  // breakpoint list, and the single-step runs which take stuck threads off
+  // their traps would consume them as noise. Instead, copies of them are held
+  // back, keyed by the thread's demon handle (the thread need not be known
+  // yet: its creation may be queued behind the stop): the next runs do not
+  // step those threads off their trap, and report the hits, one per run,
+  // before resuming anything (the run loop above).
   //
-  if(stop_event != 0)
+  if(stop_event != 0 && ss != 0)
   {
-    D_ServerState *ss = d_ctrl_thread__server_state_from_id(D_ServerID_LocalHost);
-    if(ss != 0)
+    DMN_EventNode *kept_first = 0;
+    DMN_EventNode *kept_last = 0;
+    for(DMN_EventNode *n = ss->first_dmn_event_node, *next = 0; n != 0; n = next)
     {
-      DMN_EventNode *kept_first = 0;
-      DMN_EventNode *kept_last = 0;
-      for(DMN_EventNode *n = ss->first_dmn_event_node, *next = 0; n != 0; n = next)
+      next = n->next;
+      n->next = 0;
+      DMN_Event *ev = &n->v;
+      if(ev->kind == DMN_EventKind_Breakpoint)
       {
-        next = n->next;
-        n->next = 0;
-        DMN_Event *ev = &n->v;
-        if(ev->kind == DMN_EventKind_Breakpoint)
+        if(!dmn_handle_match(ev->thread, stop_event->thread))
         {
-          D_Entity *thread = d_entity_from_handle(d_handle_from_dmn(D_ServerID_LocalHost, ev->thread));
-          if(thread != &d_entity_nil && ev->address == 0 && !dmn_handle_match(ev->thread, stop_event->thread))
+          if(ss->held_bp_event_arena == 0)
           {
-            thread->has_unreported_bp_hit = 1;
-            thread->unreported_bp_hit_vaddr = ev->instruction_pointer;
-            log_infof("unreported breakpoint hit of thread [0x%I64x] at 0x%I64x: held back for a later run\n", ev->thread.u64[0], ev->instruction_pointer);
+            ss->held_bp_event_arena = arena_alloc();
           }
-          SLLStackPush(ss->free_dmn_event_node, n);
+          DMN_EventNode *held = ss->free_held_bp_event_node;
+          if(held != 0)
+          {
+            ss->free_held_bp_event_node = held->next;
+          }
+          else
+          {
+            held = push_array(ss->held_bp_event_arena, DMN_EventNode, 1);
+          }
+          MemoryZeroStruct(held);
+          MemoryCopyStruct(&held->v, ev);
+          MemoryZeroStruct(&held->v.string);
+          SLLQueuePush(ss->first_held_bp_event_node, ss->last_held_bp_event_node, held);
+          log_infof("unreported %s hit of thread [0x%I64x] at 0x%I64x: held back for a later run\n", ev->address != 0 ? "watchpoint" : "breakpoint", ev->thread.u64[0], ev->address != 0 ? ev->address : ev->instruction_pointer);
         }
         else
         {
-          SLLQueuePush(kept_first, kept_last, n);
+          log_infof("another hit of the stopping thread [0x%I64x] at 0x%I64x: dropped\n", ev->thread.u64[0], ev->instruction_pointer);
         }
+        SLLStackPush(ss->free_dmn_event_node, n);
       }
-      ss->first_dmn_event_node = kept_first;
-      ss->last_dmn_event_node  = kept_last;
-      if(ss->first_dmn_event_node == 0)
+      else
       {
-        ss->free_dmn_event_node = 0;
-        arena_clear(ss->dmn_event_arena);
+        SLLQueuePush(kept_first, kept_last, n);
       }
     }
+    ss->first_dmn_event_node = kept_first;
+    ss->last_dmn_event_node  = kept_last;
+    if(ss->first_dmn_event_node == 0)
+    {
+      ss->free_dmn_event_node = 0;
+      arena_clear(ss->dmn_event_arena);
+    }
   }
-  
+
   //////////////////////////////
   //- rjf: record stop
   //

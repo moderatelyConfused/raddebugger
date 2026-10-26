@@ -132,8 +132,6 @@ struct D_Entity
   Arch arch;
   B32 is_frozen;
   B32 is_soloed;
-  B32 has_unreported_bp_hit; // ctrl thread only: sits on a user trap it hit; the hit is reported by a later run (dbg_engine_ctrl.c, d_ctrl_thread__run)
-  U64 unreported_bp_hit_vaddr;
   U32 rgba;
   D_Handle handle;
   U64 id;
@@ -294,6 +292,13 @@ enum
   D_TrapFlag_BeginSpoofMode          = (1<<4),
   D_TrapFlag_EndStepping             = (1<<5),
   D_TrapFlag_EndSteppingUnlessStackChanged = (1<<6), // after the single step: end, unless the jump switched stacks (coroutine context switch) - then keep stepping, the line's traps stop the thread when it is back
+  //
+  // NOTE: the following apply after the single step of a call or jump whose destination the trap
+  // net could not know (indirect, or a tail call out of the function). see `d_ctrl_thread__run`.
+  //
+  D_TrapFlag_EndSteppingIfLineInfo     = (1<<7), // end if the new pc has line info (or stays in the function the step began in); else the call went into code without line info: keep stepping, the line's traps catch the thread when it returns
+  D_TrapFlag_EndSteppingIfSameFunction = (1<<8), // end if the new pc lies in the function the step began in (jump table); else the jump left the function (tail call)
+  D_TrapFlag_TrapReturnAddress         = (1<<9), // when stepping does not end: trap at the return address (`lr`, or `[sp]` on x64), checked against the stack pointer the return restores, and keep stepping
 };
 
 typedef struct D_Trap D_Trap;
