@@ -16,8 +16,8 @@ EOF
 launch $S/sigsegv_handler.raddbg
 ipc run >/dev/null
 wait_no_threads 50; r=$?
-check "the process ran to its exit" "[[ $r == 0 ]]"
-check "the SIGSEGV handler ran ('recovered' printed)" "grep -q '^recovered\$' $S/sigsegv_handler.stdout.txt"
-check "one Exception event (the first chance), the escalated signal was not re-reported" "[[ $(log_events Exception) == 1 ]]"
-check "one ExitProcess event" "[[ $(log_events ExitProcess) == 1 ]]"
+check "the process ran to its exit" '[[ $r == 0 ]]'
+check "the SIGSEGV handler ran ('recovered' printed)" 'grep -q "^recovered$" $S/sigsegv_handler.stdout.txt'
+check "one Exception event (the first chance), the escalated signal was not re-reported" '[[ $(log_events Exception) == 1 ]]'
+check "one ExitProcess event" '[[ $(log_events ExitProcess) == 1 ]]'
 finish signal_handler

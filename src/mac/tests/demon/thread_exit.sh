@@ -13,11 +13,11 @@ bp $DEMON_TESTS_DIR/src/thread_exit.c:$(line_of thread_exit "// bp_y")
 go
 st1=$(ipc state)
 x_id=$(thread_ids "$st1" | grep -vx "$main_id" | head -1)
-check "two threads at the first stop (main $main_id and thread_x $x_id)" "[[ $(thread_count "$st1") == 2 && -n '$x_id' ]]"
+check "two threads at the first stop (main $main_id and thread_x $x_id)" '[[ $(thread_count "$st1") == 2 && -n $x_id ]]'
 go
 st2=$(ipc state)
-check "the second stop is thread_y's breakpoint" "echo '$st2' | grep -q 'ip_voff_symbol: \"y_func\"'"
-check "thread_x ($x_id) is gone from the thread list" "! thread_ids '$st2' | grep -qx '$x_id'"
-check "two threads at the second stop (main and thread_y): $(thread_ids "$st2" | tr '\n' ' ')" "[[ $(thread_count "$st2") == 2 ]]"
-check "an ExitThread event was reported" "[[ $(log_events ExitThread) -ge 1 ]]"
+check "the second stop is thread_y's breakpoint" '[[ $(stop_symbol "$st2") == y_func ]]'
+check "thread_x ($x_id) is gone from the thread list" '! thread_ids "$st2" | grep -qx "$x_id"'
+check "two threads at the second stop (main and thread_y): $(thread_ids "$st2" | tr '\n' ' ')" '[[ $(thread_count "$st2") == 2 ]]'
+check "an ExitThread event was reported" '[[ $(log_events ExitThread) -ge 1 ]]'
 finish thread_exit

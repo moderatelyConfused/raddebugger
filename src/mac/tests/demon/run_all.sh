@@ -5,7 +5,7 @@ cd "$(dirname ${(%):-%x})"
 export HARNESS_DIR=${HARNESS_DIR:-$(mktemp -d /tmp/raddbg_demon_tests.XXXXXX)}
 echo "artifacts in $HARNESS_DIR"
 failed=0
-for t in detach fork_child signal_handler frozen_thread thread_exit exec watchpoint; do
+for t in detach detach_at_signal fork_child fork_stale_trap signal_handler frozen_thread thread_exit exec watchpoint watch_new_thread bp_stress; do
   echo "#### $t"
   zsh ./$t.sh || failed=$((failed+1))
 done

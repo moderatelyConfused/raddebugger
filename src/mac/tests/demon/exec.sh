@@ -12,14 +12,16 @@ build_c echo_hi
 write_project exec_echo $S/exec_echo "$S/echo_hi" </dev/null
 launch $S/exec_echo.raddbg
 st0=$(ipc state)
-check "exec_echo is the main module before the exec" "module_names '$st0' | grep -q exec_echo"
+check "exec_echo is the main module before the exec" 'module_names "$st0" | grep -q exec_echo'
 ipc run >/dev/null
 wait_no_threads 50; r=$?
-check "the process ran to its exit" "[[ $r == 0 ]]"
-check "'before exec' and 'hi' were printed" "grep -q '^before exec\$' $S/exec_echo.stdout.txt && grep -q '^hi\$' $S/exec_echo.stdout.txt"
-check "no Exception event (the SIGTRAP was swallowed), one ExitProcess" "[[ $(log_events Exception) == 0 && $(log_events ExitProcess) == 1 ]]"
-check "the demon noticed the exec" "grep -q \"exec'd; rediscovering\" $CTRL_LOG"
-check "the old image was unloaded and echo_hi loaded" "grep -B12 'string: *\"'$S'/echo_hi\"' $CTRL_LOG | grep -q 'kind: *LoadModule' && [[ $(log_events UnloadModule) -ge 2 ]]"
+check "the process ran to its exit" '[[ $r == 0 ]]'
+check "'before exec' and 'hi' were printed" 'grep -q "^before exec$" $S/exec_echo.stdout.txt && grep -q "^hi$" $S/exec_echo.stdout.txt'
+check "no Exception event (the SIGTRAP was swallowed), one ExitProcess" '[[ $(log_events Exception) == 0 && $(log_events ExitProcess) == 1 ]]'
+check "the demon noticed the exec" 'grep -q "exec.d; rediscovering" $CTRL_LOG'
+# rjf: the unloads of the exec (the old image, dyld, the system libraries) come before the ExitProcess
+# event; the process exit itself unloads every module too, so the count is bounded to before the exit
+check "the old image was unloaded at the exec and echo_hi loaded" 'grep -B12 "string: *\"$S/echo_hi\"" $CTRL_LOG | grep -q "kind: *LoadModule" && [[ $(log_events_before UnloadModule "kind: *ExitProcess") -ge 2 ]]'
 
 echo "== for information: exec of the platform binary /bin/echo"
 write_project exec_echo $S/exec_echo "" </dev/null

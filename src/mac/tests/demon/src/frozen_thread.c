@@ -1,16 +1,23 @@
 // Three threads raise at once: one faults (its exception is reported and stays pending while it is
 // frozen), one hits a breakpoint (the thread the script steps), one raises a signal the engine passes
-// through (so that the step's run carries "deliver, do not ignore").
+// through (so that the step's run carries "deliver, do not ignore"). The signal's handler writes a
+// line to stdout: the script checks that the passed signal was delivered.
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 
 static _Atomic int go;
 static volatile int sink;
 
-static void on_usr1(int signo) { (void)signo; }
+static void on_usr1(int signo)
+{
+  (void)signo;
+  const char *msg = "usr1 handled\n";
+  write(1, msg, strlen(msg));
+}
 
 static void *fault_thread(void *arg)
 {
