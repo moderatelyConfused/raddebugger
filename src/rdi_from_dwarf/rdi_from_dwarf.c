@@ -422,6 +422,53 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
   }
   
   ////////////////////////////
+  //- rjf: gather the executable's Mach-O TLV descriptor sections
+  //
+  // DWARF locates a Mach-O thread-local by the (unslid) address of its TLV
+  // descriptor {thunk, key, offset} in __DATA,__thread_vars (DW_OP_const8u addr,
+  // DW_OP_form_tls_address), and the linker writes the variable's offset within
+  // the image's TLS block into the descriptor's third word. dyld rewrites the
+  // loaded descriptor (the thunk and the pthread key always; since macOS 14 the
+  // key and the offset are packed as two 32-bit fields and the third word holds
+  // the block's size and alignment), so the file's copy is the stable source of
+  // the offset: the TLS location conversion below folds the descriptor address
+  // into it (a dSYM converted without its executable has no copy; see there).
+  //
+  typedef struct D2R_MachoTLVSection D2R_MachoTLVSection;
+  struct D2R_MachoTLVSection
+  {
+    D2R_MachoTLVSection *next;
+    U64 vaddr;
+    String8 data;
+  };
+  D2R_MachoTLVSection *macho_tlv_sections = 0;
+  if(params->exe_kind == ExecutableImageKind_Macho && params->exe_data.size != 0)
+  {
+    if(lane_idx() == 0)
+    {
+      Temp scratch2 = scratch_begin(&arena, 1);
+      MACHO_Bin exe_bin = macho_bin_from_data(scratch2.arena, params->exe_data);
+      if(exe_bin.is_valid && exe_bin.hdr.filetype != MACHO_MH_DSYM)
+      {
+        for EachIndex(sect_idx, exe_bin.sections.count)
+        {
+          MACHO_Section64 *sect = &exe_bin.sections.v[sect_idx];
+          if((sect->flags & MACHO_SECTION_TYPE) == MACHO_S_THREAD_LOCAL_VARIABLES &&
+             sect->size != 0 && sect->offset < exe_bin.slice.size && sect->size <= exe_bin.slice.size - sect->offset)
+          {
+            D2R_MachoTLVSection *n = push_array(arena, D2R_MachoTLVSection, 1);
+            n->vaddr = sect->addr;
+            n->data  = str8_substr(exe_bin.slice, r1u64(sect->offset, sect->offset + sect->size));
+            SLLStackPush(macho_tlv_sections, n);
+          }
+        }
+      }
+      scratch_end(scratch2);
+    }
+    lane_sync_u64(&macho_tlv_sections, 0);
+  }
+  
+  ////////////////////////////
   //- rjf: gather unit ranges from .debug_info, .debug_aranges
   //
   Rng1U64Array *unit_info_ranges = 0;
@@ -4186,20 +4233,65 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
                         {
                           // NOTE: on Mach-O the pushed operand is the (unslid) address of the
                           // variable's TLV descriptor {thunk, key, offset} in __DATA,__thread_vars,
-                          // not an offset into the TLS block. the variable lives at
-                          // tls_block + descriptor.offset, so: slide the descriptor address,
-                          // read its offset field, and add the thread's TLS block base (TLSOff).
+                          // not an offset into the TLS block: the variable lives at
+                          // tls_block + offset. the offset is the descriptor's third word in the
+                          // executable file (`macho_tlv_sections`; the loaded copy is rewritten by
+                          // dyld), and the descriptor push is folded into a plain TLSOff with it,
+                          // which the matching below turns into a simple TLS location.
                           //
-                          // stack: [desc_file_addr]
-                          rdim_bytecode_push_op(arena, &dst_bytecode, RDI_EvalOp_ModuleOff, 0);   // [desc, module_base]
-                          rdim_bytecode_push_uconst(arena, &dst_bytecode, base_vaddr);              // [desc, module_base, image_base]
-                          rdim_bytecode_push_op(arena, &dst_bytecode, RDI_EvalOp_Sub, RDI_EvalTypeGroup_U); // [desc, slide]
-                          rdim_bytecode_push_op(arena, &dst_bytecode, RDI_EvalOp_Add, RDI_EvalTypeGroup_U); // [desc + slide]
-                          rdim_bytecode_push_uconst(arena, &dst_bytecode, 16);
-                          rdim_bytecode_push_op(arena, &dst_bytecode, RDI_EvalOp_Add, RDI_EvalTypeGroup_U); // [&desc.offset]
-                          rdim_bytecode_push_op(arena, &dst_bytecode, RDI_EvalOp_MemRead, 8);      // [desc.offset]
-                          rdim_bytecode_push_op(arena, &dst_bytecode, RDI_EvalOp_TLSOff, 0);       // [desc.offset, tls_block]
-                          rdim_bytecode_push_op(arena, &dst_bytecode, RDI_EvalOp_Add, RDI_EvalTypeGroup_U); // [tls_block + offset]
+                          // stack: [desc_file_addr] -> [tls_block + offset]
+                          RDIM_EvalBytecodeOp *desc_op = dst_bytecode.last_op;
+                          U64 desc_vaddr = 0;
+                          B32 desc_vaddr_is_known = 0;
+                          if(desc_op != 0) switch(desc_op->op)
+                          {
+                            default:{}break;
+                            case RDI_EvalOp_ModuleOff:{desc_vaddr = base_vaddr + desc_op->p; desc_vaddr_is_known = 1;}break;
+                            case RDI_EvalOp_ConstU8:
+                            case RDI_EvalOp_ConstU16:
+                            case RDI_EvalOp_ConstU32:
+                            case RDI_EvalOp_ConstU64:{desc_vaddr = desc_op->p; desc_vaddr_is_known = 1;}break;
+                          }
+                          U64 tls_off = 0;
+                          B32 tls_off_is_known = 0;
+                          if(desc_vaddr_is_known)
+                          {
+                            for(D2R_MachoTLVSection *s = macho_tlv_sections; s != 0; s = s->next)
+                            {
+                              if(s->vaddr <= desc_vaddr && desc_vaddr - s->vaddr + 24 <= s->data.size)
+                              {
+                                MemoryCopy(&tls_off, s->data.str + (desc_vaddr - s->vaddr) + 16, sizeof(tls_off));
+                                tls_off_is_known = 1;
+                                break;
+                              }
+                            }
+                          }
+                          if(tls_off_is_known)
+                          {
+                            dst_bytecode.encoded_size -= desc_op->p_size;
+                            desc_op->op     = RDI_EvalOp_TLSOff;
+                            desc_op->p      = tls_off;
+                            desc_op->p_size = RDI_DECODEN_FROM_CTRLBITS(rdi_eval_op_ctrlbits_table[RDI_EvalOp_TLSOff]);
+                            dst_bytecode.encoded_size += desc_op->p_size;
+                          }
+                          else
+                          {
+                            // rjf: no file copy of the descriptor (a dSYM converted without its
+                            // executable, or an address the expression computes): read the loaded
+                            // descriptor's third word, the offset in dyld's classic layout (wrong
+                            // on macOS 14+, where dyld packs the offset into the second word)
+                            //
+                            // stack: [desc_file_addr]
+                            rdim_bytecode_push_op(arena, &dst_bytecode, RDI_EvalOp_ModuleOff, 0);   // [desc, module_base]
+                            rdim_bytecode_push_uconst(arena, &dst_bytecode, base_vaddr);              // [desc, module_base, image_base]
+                            rdim_bytecode_push_op(arena, &dst_bytecode, RDI_EvalOp_Sub, RDI_EvalTypeGroup_U); // [desc, slide]
+                            rdim_bytecode_push_op(arena, &dst_bytecode, RDI_EvalOp_Add, RDI_EvalTypeGroup_U); // [desc + slide]
+                            rdim_bytecode_push_uconst(arena, &dst_bytecode, 16);
+                            rdim_bytecode_push_op(arena, &dst_bytecode, RDI_EvalOp_Add, RDI_EvalTypeGroup_U); // [&desc.offset]
+                            rdim_bytecode_push_op(arena, &dst_bytecode, RDI_EvalOp_MemRead, 8);      // [desc.offset]
+                            rdim_bytecode_push_op(arena, &dst_bytecode, RDI_EvalOp_TLSOff, 0);       // [desc.offset, tls_block]
+                            rdim_bytecode_push_op(arena, &dst_bytecode, RDI_EvalOp_Add, RDI_EvalTypeGroup_U); // [tls_block + offset]
+                          }
                         }
                         else
                         {

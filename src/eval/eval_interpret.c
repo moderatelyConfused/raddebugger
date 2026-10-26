@@ -380,7 +380,10 @@ e_interpret(String8 bytecode)
       
       case RDI_EvalOp_TLSOff:
       {
-        if(e_interpret_ctx->tls_base != 0)
+        // NOTE: a thread's TLS block is never at 0: that is the debugger not
+        // knowing the block (no thread, or an image without thread-locals),
+        // reported as such rather than read as an address near 0
+        if(e_interpret_ctx->tls_base != 0 && *e_interpret_ctx->tls_base != 0)
         {
           nval.u64 = *e_interpret_ctx->tls_base + imm.u64;
         }

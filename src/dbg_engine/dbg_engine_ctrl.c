@@ -7280,7 +7280,14 @@ d_tls_vaddr_artifact_create(String8 key, B32 *cancel_signal, AC_Status *status_o
   DMN_Handle module_dmn = d_dmn_from_handle(module);
   
   // rjf: compute vaddr
-  U64 pre_run_gen = d_run_gen();
+  //
+  // NOTE: the block's address is the target's memory (on macOS the thread's TSD
+  // slot for the image's key, which dyld fills on the thread's first access to
+  // one of the image's thread-locals), so the artifact carries the memory
+  // generation it was read under, like a memory read: a lookup from an earlier
+  // stop (no block yet, or the image's initial-value template) must not answer
+  // for a later one.
+  U64 pre_mem_gen = d_mem_gen();
   U64 tls_vaddr = 0;
   B32 success = 1;
   if(!dmn_handle_match(thread_dmn, dmn_handle_zero()) &&
@@ -7288,16 +7295,20 @@ d_tls_vaddr_artifact_create(String8 key, B32 *cancel_signal, AC_Status *status_o
   {
     success = dmn_thread_get_module_tls_vaddr(thread_dmn, module_dmn, &tls_vaddr);
   }
-  U64 post_run_gen = d_run_gen();
+  U64 post_mem_gen = d_mem_gen();
   
-  // rjf: if not successful due to run -> retry
-  if(!success && (pre_run_gen != post_run_gen || d_ctrl_state->ctrl_thread_run_state))
+  // rjf: read across a run, or not successful due to run -> retry
+  if(pre_mem_gen != post_mem_gen || (!success && d_ctrl_state->ctrl_thread_run_state))
   {
     status_out[0] = AC_Status_NeedRetry;
   }
   else if(!success)
   {
     status_out[0] = AC_Status_Failed;
+  }
+  else
+  {
+    gen_out[0] = pre_mem_gen;
   }
   
   // rjf: package as artifact
@@ -7313,7 +7324,10 @@ d_cached_tls_vaddr_from_thread_module(D_Handle thread_handle, D_Handle module_ha
   Access *access = access_open();
   D_Handle key_data[] = {thread_handle, module_handle};
   String8 key = str8((U8 *)&key_data[0], sizeof(key_data));
-  AC_Artifact artifact = ac_artifact_from_key(access, key, d_tls_vaddr_artifact_create, 0, endt_us, .stale_out = stale_out);
+  AC_Artifact artifact = ac_artifact_from_key(access, key, d_tls_vaddr_artifact_create, 0, endt_us,
+                                              .gen = d_mem_gen(),
+                                              .flags = AC_Flag_HighPriority|AC_Flag_WaitForFresh,
+                                              .stale_out = stale_out);
   result = artifact.u64[0];
   access_close(access);
   return result;

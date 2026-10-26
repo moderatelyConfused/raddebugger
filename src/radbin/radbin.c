@@ -611,6 +611,61 @@ rb_thread_entry_point(void *p)
             }
           }
         }
+
+        //- rjf: a dSYM's DWARF file given on its own (the debugger converts the
+        // bundle next to the image): find the executable it was linked from, so
+        // that the conversion has the image's file as well. the dSYM carries the
+        // image's section headers, but not their contents: the thread-local
+        // variables' offsets are read from the executable's __thread_vars (see
+        // `d2r_convert`). the bundle `<name>.dSYM` sits next to `<name>`, or, for
+        // an application bundle, `Foo.app.dSYM` next to `Foo.app/Contents/MacOS/Foo`
+        // (where Xcode puts it); the executable must carry the dSYM's UUID.
+        if(bin.is_valid && bin.hdr.filetype == MACHO_MH_DSYM)
+        {
+          String8 dwarf_name   = str8_skip_last_slash(input_file_path);
+          String8 dwarf_dir    = str8_chop_last_slash(input_file_path);
+          String8 resources    = str8_chop_last_slash(dwarf_dir);
+          String8 contents     = str8_chop_last_slash(resources);
+          String8 bundle       = str8_chop_last_slash(contents);
+          if(str8_match(str8_skip_last_slash(dwarf_dir), str8_lit("DWARF"), 0) &&
+             str8_match(str8_skip_last_slash(resources), str8_lit("Resources"), 0) &&
+             str8_match(str8_skip_last_slash(contents), str8_lit("Contents"), 0) &&
+             str8_match(str8_postfix(bundle, 5), str8_lit(".dSYM"), 0))
+          {
+            String8 stem = str8_chop_last_dot(bundle);
+            String8List candidates = {0};
+            str8_list_push(scratch.arena, &candidates, stem);
+            str8_list_pushf(scratch.arena, &candidates, "%S/Contents/MacOS/%S", stem, dwarf_name);
+            String8 exe_path = {0};
+            for(String8Node *c = candidates.first; c != 0 && exe_path.size == 0; c = c->next)
+            {
+              Guid exe_uuid = {0};
+              if(file_path_exists(c->string) && !folder_path_exists(c->string) &&
+                 macho_uuid_from_file_path(c->string, &exe_uuid) &&
+                 (!bin.has_uuid || MemoryMatch(&exe_uuid, &bin.uuid, sizeof(exe_uuid))))
+              {
+                exe_path = c->string;
+              }
+            }
+            if(exe_path.size != 0)
+            {
+              B32 is_already_a_task = 0;
+              for(String8Node *task_n = input_file_path_tasks.first; task_n != 0; task_n = task_n->next)
+              {
+                if(str8_match(task_n->string, exe_path, 0))
+                {
+                  is_already_a_task = 1;
+                  break;
+                }
+              }
+              if(!is_already_a_task)
+              {
+                log_infof("Found the executable %S for the dSYM's DWARF file %S\n", exe_path, n->string);
+                str8_list_push(arena, &input_file_path_tasks, push_str8_copy(arena, exe_path));
+              }
+            }
+          }
+        }
         scratch_end(scratch);
       }
 

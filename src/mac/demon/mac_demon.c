@@ -218,6 +218,7 @@ mac_dmn_image_info_from_header_vaddr(mach_port_t task, U64 header_vaddr)
     Rng1U64 unwind_range = {0};
     Rng1U64 eh_frame_range = {0};
     U64 thread_vars_vaddr = 0;
+    U64 thread_data_vaddr = 0;
     for(U64 off = 0, cmd_idx = 0; cmd_idx < hdr.ncmds && off + sizeof(struct load_command) <= cmds_size; cmd_idx += 1)
     {
       struct load_command lc = {0};
@@ -272,6 +273,13 @@ mac_dmn_image_info_from_header_vaddr(mach_port_t task, U64 header_vaddr)
             if((sect.flags & SECTION_TYPE) == S_THREAD_LOCAL_VARIABLES && thread_vars_vaddr == 0)
             {
               thread_vars_vaddr = sect.addr;
+            }
+            // rjf: the TLV template (a thread's block is a copy of it) starts at the
+            // lowest thread-local data section: __thread_data, then __thread_bss
+            if(((sect.flags & SECTION_TYPE) == S_THREAD_LOCAL_REGULAR || (sect.flags & SECTION_TYPE) == S_THREAD_LOCAL_ZEROFILL) &&
+               (thread_data_vaddr == 0 || sect.addr < thread_data_vaddr))
+            {
+              thread_data_vaddr = sect.addr;
             }
           }
         }break;
@@ -329,6 +337,7 @@ mac_dmn_image_info_from_header_vaddr(mach_port_t task, U64 header_vaddr)
     if(dim_1u64(unwind_range) != 0)   { info.unwind_info_vaddr_range = shift_1u64(unwind_range, slide); }
     if(dim_1u64(eh_frame_range) != 0) { info.eh_frame_vaddr_range = shift_1u64(eh_frame_range, slide); }
     if(thread_vars_vaddr != 0)        { info.thread_vars_vaddr = thread_vars_vaddr + slide; }
+    if(thread_data_vaddr != 0)        { info.thread_data_vaddr = thread_data_vaddr + slide; }
     
     //- rjf: compute virtual size. images inside the dyld shared cache have
     // their segments scattered across the cache, in which case we only
@@ -1231,7 +1240,7 @@ mac_dmn_module_from_base_vaddr(MAC_DMN_ProcessCtx *ctx, U64 base_vaddr)
 }
 
 internal MAC_DMN_Module *
-mac_dmn_module_alloc(MAC_DMN_ProcessCtx *ctx, U64 base_vaddr, U64 size, String8 path, U64 thread_vars_vaddr, B32 is_main, B32 is_dyld)
+mac_dmn_module_alloc(MAC_DMN_ProcessCtx *ctx, U64 base_vaddr, U64 size, String8 path, U64 thread_vars_vaddr, U64 thread_data_vaddr, B32 is_main, B32 is_dyld)
 {
   MAC_DMN_Module *module = mac_dmn_module_from_base_vaddr(ctx, base_vaddr);
   if(module == 0)
@@ -1241,6 +1250,7 @@ mac_dmn_module_alloc(MAC_DMN_ProcessCtx *ctx, U64 base_vaddr, U64 size, String8 
     module->size              = size;
     module->path              = push_str8_copy(ctx->arena, path);
     module->thread_vars_vaddr = thread_vars_vaddr;
+    module->thread_data_vaddr = thread_data_vaddr;
     module->is_main           = is_main;
     module->is_dyld           = is_dyld;
     module->is_live           = 1;
@@ -1424,9 +1434,14 @@ mac_dmn_thread_from_port(mach_port_t port)
 internal void
 mac_dmn_thread_refresh_identifier_info(MAC_DMN_Thread *thread)
 {
-  // NOTE: the TSD base (TPIDRRO_EL0) is still 0 when a launched process is
-  // stopped at dyld's first instruction, so this is re-queried lazily until
-  // it becomes known.
+  // NOTE: the TSD base (TPIDRRO_EL0; `thread_handle` is the kernel's copy of
+  // it) is still 0 when a launched process is stopped at dyld's first
+  // instruction, and the first non-zero value is not the final one: dyld
+  // installs a bootstrap TSD of its own (in its __DATA) for the process' first
+  // thread, which libpthread's initializer replaces with the thread's pthread
+  // TSD (pthread_self() + 224). So this is re-queried on every register read
+  // after a stop and on every TLS lookup (one thread_info call), never cached
+  // for good.
   thread_identifier_info_data_t id_info = {0};
   mach_msg_type_number_t count = THREAD_IDENTIFIER_INFO_COUNT;
   if(thread_info(thread->port, THREAD_IDENTIFIER_INFO, (thread_info_t)&id_info, &count) == KERN_SUCCESS)
@@ -1495,11 +1510,8 @@ mac_dmn_thread_read_reg_block(MAC_DMN_Thread *thread)
       }
     }
     
-    // rjf: thread pointer registers
-    if(thread->tsd_base_vaddr == 0)
-    {
-      mac_dmn_thread_refresh_identifier_info(thread);
-    }
+    // rjf: thread pointer registers (re-queried: see mac_dmn_thread_refresh_identifier_info)
+    mac_dmn_thread_refresh_identifier_info(thread);
     dst->tpidrro_el0 = thread->tsd_base_vaddr;
     dst->tpidr_el0   = 0;
   }
@@ -2041,7 +2053,7 @@ mac_dmn_push_event_load_module(Arena *arena, DMN_EventList *events, MAC_DMN_Proc
   {
     return;
   }
-  MAC_DMN_Module *module = mac_dmn_module_alloc(ctx, header_vaddr, image.vsize, path, image.thread_vars_vaddr, is_main, is_dyld);
+  MAC_DMN_Module *module = mac_dmn_module_alloc(ctx, header_vaddr, image.vsize, path, image.thread_vars_vaddr, image.thread_data_vaddr, is_main, is_dyld);
   DMN_ModuleInfo *module_info = mac_dmn_module_info_from_image(arena, process, &image, module->path);
   {
     // rjf: images without a file of their own on disk (the dyld shared cache's)
@@ -4794,9 +4806,19 @@ dmn_thread_get_module_tls_vaddr(DMN_Handle thread_handle, DMN_Handle module_hand
 {
   // NOTE: on macOS every image with thread-local variables owns a pthread
   // key, stored in each of its TLV descriptors (__DATA,__thread_vars:
-  // {thunk, key, offset}). A thread's TLS block for the image is found via
-  // its TSD base (TPIDRRO_EL0): block = *(tsd_base + key*8). We return that
-  // block base; variable offsets within the block come from the descriptors.
+  // {thunk, key, offset}; since macOS 14 dyld packs the key and the offset
+  // into the second word as two 32-bit fields, so the key is the low 32 bits
+  // of that word in either layout). A thread's TLS block for the image is
+  // found via its TSD base (TPIDRRO_EL0): block = *(tsd_base + key*8). We
+  // return that block base; variable offsets within the block come from the
+  // debug info (the converter takes them from the file's descriptors).
+  //
+  // dyld allocates the block on the thread's first access to one of the
+  // image's thread-locals, so the slot is still 0 before that. Then the image's
+  // TLV template (__thread_data followed by __thread_bss: the block's initial
+  // contents) stands in, as lldb does, and a variable reads the value the
+  // thread will see on its first access (a write there would change that
+  // initial value for every thread's first access).
   B32 result = 0;
   DMN_AccessScope
   {
@@ -4807,24 +4829,29 @@ dmn_thread_get_module_tls_vaddr(DMN_Handle thread_handle, DMN_Handle module_hand
       MAC_DMN_Process *process = thread->process;
       if(module->tls_key == 0 && module->thread_vars_vaddr != 0)
       {
-        U64 key = 0;
+        U32 key = 0;
         if(mac_dmn_read_struct(process->task, module->thread_vars_vaddr + 8, &key) == sizeof(key))
         {
           module->tls_key = key;
         }
       }
-      if(thread->tsd_base_vaddr == 0)
-      {
-        mac_dmn_thread_refresh_identifier_info(thread);
-      }
+      mac_dmn_thread_refresh_identifier_info(thread);
       if(module->tls_key != 0 && thread->tsd_base_vaddr != 0)
       {
         U64 block_vaddr = 0;
         U64 slot_vaddr = thread->tsd_base_vaddr + module->tls_key*8;
-        if(mac_dmn_read_struct(process->task, slot_vaddr, &block_vaddr) == sizeof(block_vaddr) && block_vaddr != 0)
+        if(mac_dmn_read_struct(process->task, slot_vaddr, &block_vaddr) == sizeof(block_vaddr))
         {
-          vaddr_out[0] = block_vaddr;
-          result = 1;
+          if(block_vaddr != 0)
+          {
+            vaddr_out[0] = block_vaddr;
+            result = 1;
+          }
+          else if(module->thread_data_vaddr != 0)
+          {
+            vaddr_out[0] = module->thread_data_vaddr;
+            result = 1;
+          }
         }
       }
     }
