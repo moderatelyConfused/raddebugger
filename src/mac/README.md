@@ -218,8 +218,29 @@ bundled with Zig: `zig cc -target aarch64-macos -fsyntax-only ...`).
   `0x10000 + EXC_*` for Mach exception types (see `mac/mac.mdesk`); soft
   `SIGSEGV` / `SIGBUS` and `EXC_BAD_ACCESS` report the fault address.
 * TLS: `dmn_thread_get_module_tls_vaddr` returns the thread's TLS block for
-  an image (`*(TPIDRRO_EL0 + 8*key)`, key from the image's first TLV
-  descriptor).
+  an image (`*(tsd_base + 8*key)`, key from the image's first TLV
+  descriptor in `__DATA,__thread_vars`, read as the low 32 bits of the
+  descriptor's second word: dyld's classic layout is `{thunk, u64 key, u64
+  offset}`, macOS 14+ packs `{thunk, u32 key, u32 offset}` and reuses the
+  third word, and the key is in the same place in both). The TSD base is
+  `thread_identifier_info.thread_handle` (the kernel's copy of TPIDRRO_EL0,
+  `pthread_self() + 224`), re-queried on every register read after a stop and
+  on every TLS lookup: dyld installs a bootstrap TSD of its own for the first
+  thread, which libpthread's initializer replaces, so the first non-zero value
+  is not the final one (caching it read dyld's slots: every `__thread` variable
+  read 0, `U5/tls_counter_after_access`). dyld allocates the block on the
+  thread's first access to one of the image's thread-locals; before that the
+  slot is 0 and the image's TLV template (`__thread_data` then `__thread_bss`,
+  the block's initial contents) stands in, as lldb does, so a `__thread int
+  x = 7` reads 7 before the first access and the thread's value after it (a
+  write before the first access changes the initial value of every thread's
+  future block). The engine's TLS-address artifact carries the memory
+  generation it was read under, like a memory read (`d_tls_vaddr_artifact_create`,
+  `AC_Flag_WaitForFresh`): before, a lookup made at one stop (no block yet)
+  answered at every later one while the frontend kept touching it. The
+  variables' offsets within the block are static: the converter takes them
+  from the executable file's descriptors (see Debug info), so no descriptor is
+  read from the process at evaluation time.
 
 ## Unwinding
 
@@ -849,7 +870,9 @@ hand-maintained findings section at the end). 74 of 74 pass.
   declaration (`geom::Rect::area`, `rustprog::{impl#0}::area`, from the
   declaration's namespace / class parents; modules are transparent); inline
   sites and procedures have function types; source line maps agree with the
-  tables; file-scope globals and thread-locals exist with their addresses;
+  tables; file-scope globals and thread-locals exist with their addresses
+  (a thread-local's location is the offset in the image's TLS block that the
+  file's TLV descriptor holds, `tls`);
   named struct / class / union / enum definitions have UDTs with the DWARF's
   member offsets (bitfields included), enumerator values and array counts
   (`types`); the stripped copies' procedures are the `nm -n` code symbols
@@ -889,6 +912,25 @@ Found by the corpus and fixed (`dwarf_parse.c`, `rdi_from_dwarf.c`,
   and Rust methods were nameless procedures, inline sites of libc++ and LTO
   builds were named `???`, static data member definitions were dropped. The
   origin chain now follows both, across units, with the owning unit's context.
+* Mach-O thread-locals: DWARF locates one by its TLV descriptor's address
+  (`DW_OP_const8u desc, DW_OP_form_tls_address`); the bytecode slid that
+  address and read the descriptor's third word from the process as the
+  variable's offset in the block. dyld rewrites the loaded descriptor (macOS
+  14+ packs the key and the offset into the second word as two 32-bit fields
+  and keeps the block's size and alignment in the third), so the read gave
+  `0x400000008` and every `__thread` variable an unmapped address. The linker
+  writes the offset into the file's copy of the descriptor, and the converter
+  now folds the descriptor push into a plain `TLSOff <offset>` from the
+  executable's `__thread_vars` bytes: a simple TLS location (`kind: TLSOff,
+  toff`), layout-independent. The debugger converts the dSYM's DWARF file, so
+  radbin given one alone now finds the executable it was linked from
+  (`<name>` next to `<name>.dSYM`, or `Foo.app/Contents/MacOS/Foo` next to
+  `Foo.app.dSYM`, UUID-checked) and adds it as an input; without one (a dSYM
+  converted by hand, elsewhere) the old process read remains, right only for
+  dyld's classic layout. `check_corpus.py`'s `tls` column compares the
+  folded offset with the file's descriptor word (44 of the 74 rows have
+  thread-locals: C, C++, the dylibs, Zig, Rust). The eval interpreter reports
+  a TLS block address of 0 (`BadTLSBase`) instead of reading near address 0.
 * Variables under namespaces, classes and modules (Rust statics and
   `thread_local!`, Swift globals, C++ class statics) had no location: the
   frame-base iteration ran zero times for a parent without frame-base cases.
@@ -1318,13 +1360,21 @@ Policy, not bugs (the suite expects these):
   process, when the exception's "Break on ..." setting is off.
 * A step into a function stops at its opening brace (the prologue's line), as
   upstream does; the first statement is one step over away.
-* A `__thread` variable reads 0 until the thread has touched one of the
-  image's thread-locals (dyld allocates the block lazily, so
-  `dmn_thread_get_module_tls_vaddr` finds none before). Open: `t_tls_counter`
-  also reads 0 at `main_static`, right after `t_tls_counter += 1` executed
-  (`U5/tls_counter_after_access`, four `eval`s over 1.2 s, with the tree
-  before the stepping work too: the check was never reached then, since the
-  step did not get there); the TLS lookup, not the stop, is wrong.
+* `__thread` variables: fixed (2026-10-26). `t_tls_counter` read 0 both before
+  and after `t_tls_counter += 1` (`U5/tls_counter_after_access`, expected 8;
+  `eval_O0`'s NOTE before the access); the chain was broken in three places,
+  each enough for a 0: the converter's bytecode read the variable's offset
+  from the loaded descriptor's third word, which dyld (macOS 14+) overwrites
+  (see "Debug info"); the demon cached the first non-zero TSD base, dyld's
+  bootstrap one, and read its slots instead of the pthread's (see "Demon");
+  and the engine's TLS-address artifact never went stale across runs. It now
+  reads 7 at the `t_tls_counter += 1` line (the initial value, from the
+  image's TLV template: dyld has not allocated the thread's block yet; lldb
+  reads 7 there as well) and 8 at `main_static` (`U5_tls_step_into`,
+  `eval_O0`, `zig_generator`: 53 checks passed, 0 failed; 52 / 1 before, the
+  one failure this; corpus 74 of 74 with the `tls` column checking the folded
+  offsets). The flow debuggees have no `__thread` variable in a dylib; the
+  corpus' `libshape.dylib` rows check the converter's side of it.
 
 Open, recorded with evidence by the suite (detach, fork, exec into a binary
 of our own, watchpoint attribution and other threads' call stacks have been

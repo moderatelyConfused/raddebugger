@@ -60,6 +60,8 @@ Checks (one column each in the results table):
   globals        every file-scope DW_TAG_variable with a DW_OP_addr location
                  is a global variable with the matching voff
   tls            every DW_TAG_variable with a DW_OP_form_tls_address location
+                 is a thread variable whose location is the offset the file's
+                 TLV descriptor (__DATA,__thread_vars, third word) holds
                  is a thread variable whose bytecode mentions its address
   types          every named struct / class / union / enum definition outside
                  functions has a UDT of its qualified name whose data members
@@ -128,6 +130,7 @@ class Image:
         self.text = None          # (addr, size) of __TEXT,__text
         self.uuid = None
         self.is_fat = False
+        self.tlv_descriptors = {}  # TLV descriptor addr -> (key, offset): the file's __thread_vars words
 
 
 def image_info(exe, arch):
@@ -167,6 +170,23 @@ def image_info(exe, arch):
             if sect.get("seg") == "__TEXT" and sect.get("sect") == "__text":
                 img.text = (sect["addr"], sect["size"])
             in_section = False
+    # the TLV descriptors as the file holds them: {thunk, key, offset}, 3 x 8 bytes each; otool -s
+    # prints 32-bit words in file order
+    for (seg, sect, addr, size) in img.sections:
+        if sect != "__thread_vars" or size == 0:
+            continue
+        rc, out, _, _ = run(["otool"] + arch_args + ["-s", seg, sect, exe])
+        if rc != 0:
+            continue
+        words = []
+        for line in out.splitlines():
+            m = re.match(r"^([0-9a-f]+)\t((?:[0-9a-f]{8} ?)+)$", line.strip("\n"))
+            if m:
+                words.extend(int(w, 16) for w in m.group(2).split())
+        raw = b"".join(w.to_bytes(4, "little") for w in words)
+        for i in range(len(raw) // 24):
+            desc = raw[24 * i:24 * i + 24]
+            img.tlv_descriptors[addr + 24 * i] = (int.from_bytes(desc[8:16], "little"), int.from_bytes(desc[16:24], "little"))
     rc, out, _, _ = run(["dwarfdump"] + arch_args + ["--uuid", exe])
     m = re.search(r"UUID: ([0-9A-Fa-f-]+)", out)
     if m:
@@ -1325,7 +1345,17 @@ def check_binary(row, args, res):
                 t_reasons.add("thread variable %s (%s) missing" % (name, loc.replace("\n", " ")[:60]))
             elif addr is not None:
                 bc = rdi.thread_vars[hits[0]]
-                if ("(%d)" % addr) not in bc and ("(%d)" % (addr - base)) not in bc and ("%#x" % addr) not in bc:
+                m_toff = re.search(r"toff: (0x[0-9a-f]+)", bc) or re.search(r"bytecode: \{ RDI_EvalOp_TLSOff\((\d+)\) \}", bc)
+                if m_toff is not None:
+                    # the converter folded the descriptor address into the static TLS offset, which must
+                    # be the one the file's descriptor holds (dyld rewrites the loaded descriptor)
+                    toff = int(m_toff.group(1), 0)
+                    desc = img.tlv_descriptors.get(addr)
+                    if desc is None:
+                        t_reasons.add("thread variable %s: no descriptor at %#x in the file's __thread_vars" % (name, addr))
+                    elif desc[1] != toff:
+                        t_reasons.add("thread variable %s: TLS offset %#x, but the descriptor at %#x holds %#x" % (name, toff, addr, desc[1]))
+                elif ("(%d)" % addr) not in bc and ("(%d)" % (addr - base)) not in bc and ("%#x" % addr) not in bc:
                     t_reasons.add("thread variable %s: bytecode does not mention %#x: %s" % (name, addr, bc.strip().replace("\n", " ")[:120]))
             continue
         m = re.match(r"\(DW_OP_addr (0x[0-9a-f]+)\)$", loc.strip())

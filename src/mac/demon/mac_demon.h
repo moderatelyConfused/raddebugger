@@ -236,6 +236,7 @@ struct MAC_DMN_Module
   U64 size;
   String8 path;
   U64 thread_vars_vaddr;        // __DATA,__thread_vars section (0 if none)
+  U64 thread_data_vaddr;        // the image's TLV template: __thread_data, then __thread_bss (0 if none)
   U64 tls_key;                  // pthread key used by this image's TLVs (0 = unknown yet)
   B8 is_live;
   B8 is_main;
@@ -377,6 +378,7 @@ struct MAC_DMN_ImageInfo
   Rng1U64 unwind_info_vaddr_range;
   Rng1U64 eh_frame_vaddr_range;
   U64 thread_vars_vaddr;
+  U64 thread_data_vaddr;
   // rjf: symbol table (in-memory addresses)
   U64 symtab_vaddr;
   U64 symtab_count;
@@ -483,7 +485,7 @@ internal void mac_dmn_process_release(MAC_DMN_Process *process);
 internal MAC_DMN_Thread *mac_dmn_thread_alloc(MAC_DMN_Process *process, mach_port_t port);
 internal void mac_dmn_thread_release(MAC_DMN_Thread *thread);
 internal MAC_DMN_Module *mac_dmn_module_from_base_vaddr(MAC_DMN_ProcessCtx *ctx, U64 base_vaddr);
-internal MAC_DMN_Module *mac_dmn_module_alloc(MAC_DMN_ProcessCtx *ctx, U64 base_vaddr, U64 size, String8 path, U64 thread_vars_vaddr, B32 is_main, B32 is_dyld);
+internal MAC_DMN_Module *mac_dmn_module_alloc(MAC_DMN_ProcessCtx *ctx, U64 base_vaddr, U64 size, String8 path, U64 thread_vars_vaddr, U64 thread_data_vaddr, B32 is_main, B32 is_dyld);
 internal void mac_dmn_module_release(MAC_DMN_ProcessCtx *ctx, MAC_DMN_Module *module);
 internal void mac_dmn_ctx_trap_history_record(MAC_DMN_ProcessCtx *ctx, U64 vaddr, U64 size, U8 *bytes);
 internal MAC_DMN_TrapHistoryNode *mac_dmn_ctx_trap_history_lookup(MAC_DMN_ProcessCtx *ctx, U64 vaddr);
