@@ -11246,7 +11246,27 @@ rd_regs_fill_slot_from_string(RD_RegSlot slot, String8 query_expr, String8 strin
     case RD_RegSlot_Thread:
     case RD_RegSlot_CtrlEntity:
     {
-      
+      // NOTE: scripted commands (`--ipc kill --process:<pid>`, `freeze_thread --thread:<tid>`)
+      // name processes and threads by the ids which `state` reports
+      U64 id = 0;
+      D_EntityKind kind = (slot == RD_RegSlot_Process ? D_EntityKind_Process :
+                           slot == RD_RegSlot_Thread  ? D_EntityKind_Thread  :
+                           D_EntityKind_Null);
+      if(kind != D_EntityKind_Null && try_u64_from_str8_c_rules(string, &id))
+      {
+        D_EntityArray entities = d_entity_array_from_kind(kind);
+        for EachIndex(idx, entities.count)
+        {
+          D_Entity *entity = entities.v[idx];
+          if(entity->id == id)
+          {
+            if(kind == D_EntityKind_Process) { rd_regs()->process = entity->handle; }
+            else                             { rd_regs()->thread  = entity->handle; }
+            rd_regs()->ctrl_entity = entity->handle;
+            break;
+          }
+        }
+      }
     }break;
     
     //- rjf: cfgs
@@ -11307,6 +11327,16 @@ rd_regs_fill_slot_from_string(RD_RegSlot slot, String8 query_expr, String8 strin
       }
     }break;
     
+    //- rjf: booleans (scripted commands: `step_into --prefer_disasm:1`, `exit --force_confirm:1`)
+    case RD_RegSlot_PreferDisasm:
+    case RD_RegSlot_ForceConfirm:
+    {
+      U64 value = 0;
+      try_u64_from_str8_c_rules(string, &value);
+      if(slot == RD_RegSlot_PreferDisasm) { rd_regs()->prefer_disasm = !!value; }
+      else                                { rd_regs()->force_confirm = !!value; }
+    }break;
+
     //- rjf: line numbers
     case RD_RegSlot_LineNum:
     {
@@ -14116,6 +14146,7 @@ rd_frame(void)
               str8_list_pushf(scratch.arena, &state_parts, "  timestamp: 0x%I64x\n", evt.timestamp);
               str8_list_pushf(scratch.arena, &state_parts, "  exception_code: 0x%I64x\n", (U64)evt.exception_code);
               str8_list_pushf(scratch.arena, &state_parts, "  bp_flags: 0x%I64x\n", (U64)evt.bp_flags);
+              str8_list_pushf(scratch.arena, &state_parts, "  bp_id: \"$%I64x\"\n", (evt.cause == D_EventCause_UserBreakpoint) ? evt.u64_code : 0);
               str8_list_pushf(scratch.arena, &state_parts, "  string: \"%S\"\n", escaped_from_raw_str8(scratch.arena, evt.string));
               str8_list_pushf(scratch.arena, &state_parts, "  explanation: \"%S\"\n", escaped_from_raw_str8(scratch.arena, explanation_string));
               str8_list_pushf(scratch.arena, &state_parts, " }\n");
@@ -14174,6 +14205,7 @@ rd_frame(void)
                 str8_list_pushf(scratch.arena, &state_parts, "   name: \"%S\"\n", escaped_from_raw_str8(scratch.arena, thread->string));
                 str8_list_pushf(scratch.arena, &state_parts, "   id:   %I64u\n", thread->id);
                 str8_list_pushf(scratch.arena, &state_parts, "   ip:   0x%I64x\n", d_query_cached_rip_from_thread(thread));
+                str8_list_pushf(scratch.arena, &state_parts, "   frozen: %i\n", (int)thread->is_frozen);
                 str8_list_pushf(scratch.arena, &state_parts, "  }\n");
               }
               str8_list_pushf(scratch.arena, &state_parts, " }\n");
@@ -14187,6 +14219,135 @@ rd_frame(void)
                 str8_list_pushf(scratch.arena, &state_parts, "  {\n");
                 str8_list_pushf(scratch.arena, &state_parts, "   name:        \"%S\"\n", escaped_from_raw_str8(scratch.arena, module->string));
                 str8_list_pushf(scratch.arena, &state_parts, "   vaddr_range: [0x%I64x, 0x%I64x)\n",  module->vaddr_range.min, module->vaddr_range.max);
+                str8_list_pushf(scratch.arena, &state_parts, "  }\n");
+              }
+              str8_list_pushf(scratch.arena, &state_parts, " }\n");
+            }
+            {
+              D_Entity *selected_thread = d_entity_from_handle(rd_base_regs()->thread);
+              str8_list_pushf(scratch.arena, &state_parts, " selected_thread: %I64u\n", selected_thread->id);
+              str8_list_pushf(scratch.arena, &state_parts, " exited_process_count: %I64u\n", rd_state->exited_process_count);
+              str8_list_pushf(scratch.arena, &state_parts, " last_exit_code: %I64u\n", rd_state->last_exit_code);
+              str8_list_pushf(scratch.arena, &state_parts, " processes:\n {\n");
+              D_EntityArray processes = d_entity_array_from_kind(D_EntityKind_Process);
+              for EachIndex(idx, processes.count)
+              {
+                D_Entity *process = processes.v[idx];
+                str8_list_pushf(scratch.arena, &state_parts, "  {\n");
+                str8_list_pushf(scratch.arena, &state_parts, "   name: \"%S\"\n", escaped_from_raw_str8(scratch.arena, process->string));
+                str8_list_pushf(scratch.arena, &state_parts, "   id:   %I64u\n", process->id);
+                str8_list_pushf(scratch.arena, &state_parts, "  }\n");
+              }
+              str8_list_pushf(scratch.arena, &state_parts, " }\n");
+            }
+            {
+              // rjf: the selected thread's call stack: one entry per frame, inline frames included
+              // (`unwind_count`/`inline_depth` are what `select_unwind` takes)
+              Access *access = access_open();
+              D_Entity *thread = d_entity_from_handle(rd_base_regs()->thread);
+              D_Entity *process = d_entity_ancestor_from_kind(thread, D_EntityKind_Process);
+              ARCH_Info *arch_info = arch_info_from_arch(thread->arch);
+              D_CallStack call_stack = d_call_stack_from_thread(access, thread->handle, 1, now_time_us()+1000000);
+              str8_list_pushf(scratch.arena, &state_parts, " call_stack:\n {\n");
+              U64 unwind_count = 0;
+              for EachIndex(idx, call_stack.frames_count)
+              {
+                D_CallStackFrame *frame = &call_stack.frames[idx];
+                U64 vaddr = arch_ip_from_reg_block(arch_info, frame->regs);
+                // rjf: callers' pcs are return addresses; look them up at the call instruction
+                U64 lookup_vaddr = (unwind_count > 0 && vaddr != 0) ? vaddr-1 : vaddr;
+                D_Entity *module = d_module_from_process_vaddr(process, lookup_vaddr);
+                U64 voff = d_voff_from_vaddr(module, lookup_vaddr);
+                D_Entity *dbg_path = d_entity_child_from_kind(module, D_EntityKind_DebugInfoPath);
+                DI_Key dbgi_key = d_dbgi_key_from_debug_info_path(dbg_path);
+                RDI_Parsed *rdi = di_rdi_from_key(access, dbgi_key, 0, 0);
+                String8 name = {0};
+                if(frame->inline_depth == 0)
+                {
+                  RDI_Symbol *procedure = rdi_procedure_from_voff(rdi, voff);
+                  name = fully_qualified_str8_from_rdi_symbol(scratch.arena, rdi, procedure);
+                }
+                else
+                {
+                  // rjf: the inline sites enclosing voff, innermost first; depth d is the d-th from the outside
+                  RDI_Scope *nil_scope = rdi_element_from_name_idx(rdi, Scopes, 0);
+                  RDI_Scope *inline_scopes[64] = {0};
+                  U64 inline_scope_count = 0;
+                  for(RDI_Scope *s = rdi_scope_from_voff(rdi, voff); s != nil_scope; s = rdi_element_from_name_idx(rdi, Scopes, s->parent_scope_idx))
+                  {
+                    if(s->inline_site_idx != 0 && inline_scope_count < ArrayCount(inline_scopes))
+                    {
+                      inline_scopes[inline_scope_count] = s;
+                      inline_scope_count += 1;
+                    }
+                  }
+                  if(frame->inline_depth <= inline_scope_count)
+                  {
+                    RDI_InlineSite *inline_site = rdi_element_from_name_idx(rdi, InlineSites, inline_scopes[inline_scope_count - frame->inline_depth]->inline_site_idx);
+                    name.str = rdi_string_from_idx(rdi, inline_site->name_string_idx, &name.size);
+                  }
+                }
+                D_LineList lines = d_lines_from_dbgi_key_path_voff(scratch.arena, dbgi_key, dbg_path->string, voff);
+                D_Line line = {0};
+                {
+                  U64 line_idx = 0;
+                  for EachNode(n, D_LineNode, lines.first)
+                  {
+                    line = n->v;
+                    if(line_idx == frame->inline_depth) { break; }
+                    line_idx += 1;
+                  }
+                }
+                str8_list_pushf(scratch.arena, &state_parts, "  {\n");
+                str8_list_pushf(scratch.arena, &state_parts, "   unwind_count: %I64u\n", unwind_count);
+                str8_list_pushf(scratch.arena, &state_parts, "   inline_depth: %I64u\n", frame->inline_depth);
+                str8_list_pushf(scratch.arena, &state_parts, "   ip:           0x%I64x\n", vaddr);
+                str8_list_pushf(scratch.arena, &state_parts, "   module:       \"%S\"\n", escaped_from_raw_str8(scratch.arena, str8_skip_last_slash(module->string)));
+                str8_list_pushf(scratch.arena, &state_parts, "   symbol:       \"%S\"\n", escaped_from_raw_str8(scratch.arena, name));
+                {
+                  // rjf: the procedure at the frame's pc itself (a return address after a
+                  // call to a noreturn function belongs to the next procedure)
+                  D_Entity *ip_module = d_module_from_process_vaddr(process, vaddr);
+                  RDI_Parsed *ip_rdi = di_rdi_from_key(access, d_dbgi_key_from_module(ip_module), 0, 0);
+                  RDI_Symbol *ip_procedure = rdi_procedure_from_voff(ip_rdi, d_voff_from_vaddr(ip_module, vaddr));
+                  String8 ip_name = fully_qualified_str8_from_rdi_symbol(scratch.arena, ip_rdi, ip_procedure);
+                  str8_list_pushf(scratch.arena, &state_parts, "   ip_symbol:    \"%S\"\n", escaped_from_raw_str8(scratch.arena, ip_name));
+                }
+                str8_list_pushf(scratch.arena, &state_parts, "   file_name:    \"%S\"\n", escaped_from_raw_str8(scratch.arena, str8_skip_last_slash(line.file_path)));
+                str8_list_pushf(scratch.arena, &state_parts, "   line_num:     %I64d\n", line.pt.line);
+                str8_list_pushf(scratch.arena, &state_parts, "  }\n");
+                if(frame->inline_depth == 0)
+                {
+                  unwind_count += 1;
+                }
+              }
+              str8_list_pushf(scratch.arena, &state_parts, " }\n");
+              access_close(access);
+            }
+            {
+              str8_list_pushf(scratch.arena, &state_parts, " breakpoints:\n {\n");
+              CFG_NodePtrList bps = cfg_node_top_level_list_from_string(scratch.arena, str8_lit("breakpoint"));
+              for(CFG_NodePtrNode *n = bps.first; n != 0; n = n->next)
+              {
+                if(rd_cfg_is_project_filtered(n->v)) { continue; }
+                CFG_Node *bp = n->v;
+                RD_Location loc = rd_location_from_cfg(bp);
+                String8 condition = cfg_node_child_from_string(bp, str8_lit("condition"))->first->string;
+                U64 hit_count = 0;
+                try_u64_from_str8_c_rules(cfg_node_child_from_string(bp, str8_lit("hit_count"))->first->string, &hit_count);
+                str8_list_pushf(scratch.arena, &state_parts, "  {\n");
+                str8_list_pushf(scratch.arena, &state_parts, "   id:        \"$%I64x\"\n", bp->id);
+                if(loc.file_path.size != 0)
+                {
+                  str8_list_pushf(scratch.arena, &state_parts, "   location:  \"%S:%I64d\"\n", escaped_from_raw_str8(scratch.arena, str8_skip_last_slash(loc.file_path)), loc.pt.line);
+                }
+                else
+                {
+                  str8_list_pushf(scratch.arena, &state_parts, "   location:  \"%S\"\n", escaped_from_raw_str8(scratch.arena, loc.expr));
+                }
+                str8_list_pushf(scratch.arena, &state_parts, "   condition: \"%S\"\n", escaped_from_raw_str8(scratch.arena, condition));
+                str8_list_pushf(scratch.arena, &state_parts, "   hit_count: %I64u\n", hit_count);
+                str8_list_pushf(scratch.arena, &state_parts, "   enabled:   %i\n", (int)!rd_disabled_from_cfg(bp));
                 str8_list_pushf(scratch.arena, &state_parts, "  }\n");
               }
               str8_list_pushf(scratch.arena, &state_parts, " }\n");
@@ -18575,6 +18736,8 @@ rd_frame(void)
           }
         }break;
         case D_EventKind_EndProc:
+        rd_state->exited_process_count += 1;
+        rd_state->last_exit_code = evt->u64_code;
         if(rd_state->quit_after_success)
         {
           D_EntityArray processes = d_entity_array_from_kind(D_EntityKind_Process);
