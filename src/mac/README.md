@@ -424,9 +424,9 @@ breakpoint runs to completion, the debugger reports no process within a
 second; with a second process attached by pid the other stays known and
 runnable), `fork_child.sh`, `signal_handler.sh` (`recovered` printed, one
 first-chance event, clean exit), `frozen_thread.sh` (`select_thread` cannot be
-driven over IPC, so the frozen-thread situation is produced by the engine's
-own step-past-trap run of a second thread while the faulting thread is frozen;
-continuing stops on the fault again instead of a dead process),
+driven over IPC, so the frozen-thread situation is produced by the run which
+reports a second thread's held-back breakpoint hit while the faulting thread
+is frozen; continuing stops on the fault again instead of a dead process),
 `thread_exit.sh`, `exec.sh` (into a binary of our own; `/bin/echo` is run for
 information: see Exec above), `watchpoint.sh` (hit count 1 in a saved copy
 of the project).
