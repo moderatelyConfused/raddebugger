@@ -377,6 +377,7 @@ d_trap_net_from_thread__step_over_line(Arena *arena, D_Entity *thread, U64 inlin
       Rng1U64 voff_range = n->v.voff_range;
       Rng1U64 vaddr_range = d_vaddr_range_from_voff_range(module, voff_range);
       rng1u64_list_push(scratch.arena, &all_vaddr_ranges_on_same_line, vaddr_range);
+      log_infof("same_line_range: {%S:%I64i, 0x%I64x, 0x%I64x}\n", n->v.file_path, n->v.pt.line, vaddr_range.min, vaddr_range.max);
     }
   }
   
@@ -500,6 +501,16 @@ d_trap_net_from_thread__step_over_line(Arena *arena, D_Entity *thread, U64 inlin
         flags &= ~D_TrapFlag_SingleStepAfterHit;
       }
       
+      // rjf: indirect jump (not a call or return)? -> end after the single step
+      // only if it kept the stack (jump table, tail call); a coroutine's context
+      // switch jumps to another stack, and the line continues when it is switched
+      // back to (see D_TrapFlag_EndSteppingUnlessStackChanged)
+      else if(!(point->inst_flags & (DASM_InstFlag_Call|DASM_InstFlag_Return)))
+      {
+        flags &= ~D_TrapFlag_EndStepping;
+        flags |= D_TrapFlag_EndSteppingUnlessStackChanged;
+      }
+      
     }
     
     // rjf: call => save stack pointer before, single-step to go into call; trap on return
@@ -546,7 +557,9 @@ d_trap_net_from_thread__step_over_line(Arena *arena, D_Entity *thread, U64 inlin
           break;
         }
       }
-      if(!opl_in_line)
+      // NOTE: never at the instruction being stepped from (another range of the
+      // same textual line may end exactly there): the step would end at once
+      if(!opl_in_line && opl != ip_vaddr)
       {
         D_Trap trap = {D_TrapFlag_EndStepping, opl};
         d_trap_list_push(arena, &result.traps, &trap);
@@ -575,6 +588,7 @@ internal D_TrapNet
 d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread, U64 inline_depth)
 {
   Temp scratch = scratch_begin(&arena, 1);
+  log_infof("step_into_line:\n{\n");
   D_TrapNet result = {0};
   
   // rjf: thread => info
@@ -626,6 +640,7 @@ d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread, U64 inlin
       Rng1U64 voff_range = n->v.voff_range;
       Rng1U64 vaddr_range = d_vaddr_range_from_voff_range(module, voff_range);
       rng1u64_list_push(scratch.arena, &all_vaddr_ranges_on_same_line, vaddr_range);
+      log_infof("same_line_range: {%S:%I64i, 0x%I64x, 0x%I64x}\n", n->v.file_path, n->v.pt.line, vaddr_range.min, vaddr_range.max);
     }
   }
   
@@ -738,6 +753,16 @@ d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread, U64 inlin
         trap_addr = point->jump_dest_vaddr;
         flags &= ~D_TrapFlag_SingleStepAfterHit;
       }
+      
+      // rjf: indirect jump (not a call or return)? -> end after the single step
+      // only if it kept the stack (jump table, tail call); a coroutine's context
+      // switch jumps to another stack, and the line continues when it is switched
+      // back to (see D_TrapFlag_EndSteppingUnlessStackChanged)
+      else if(!(point->inst_flags & (DASM_InstFlag_Call|DASM_InstFlag_Return)))
+      {
+        flags &= ~D_TrapFlag_EndStepping;
+        flags |= D_TrapFlag_EndSteppingUnlessStackChanged;
+      }
     }
     
     // rjf: instruction changes stack pointer => save off the stack pointer, single-step over, keep stepping
@@ -849,7 +874,9 @@ d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread, U64 inlin
           break;
         }
       }
-      if(!opl_in_line)
+      // NOTE: never at the instruction being stepped from (another range of the
+      // same textual line may end exactly there): the step would end at once
+      if(!opl_in_line && opl != ip_vaddr)
       {
         D_Trap trap = {D_TrapFlag_EndStepping, opl};
         d_trap_list_push(arena, &result.traps, &trap);
@@ -863,7 +890,14 @@ d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread, U64 inlin
     result.good_read = good_machine_code;
   }
   
+  // rjf: log
+  LogInfoNamedBlockF("traps") for(D_TrapNode *n = result.traps.first; n != 0; n = n->next)
+  {
+    log_infof("{flags:0x%x, vaddr:0x%I64x}\n", n->v.flags, n->v.vaddr);
+  }
+  
   scratch_end(scratch);
+  log_infof("}\n\n");
   return result;
 }
 
@@ -1205,6 +1239,74 @@ d_lines_from_dbgi_key_path_voff(Arena *arena, DI_Key dbgi_key, String8 dbgi_path
 
 // TODO(rjf): this depends on file path maps, needs to move
 
+// the line table whose row at voff is the given line: the unit's, else the
+// tables of the inline sites at voff, outermost first. a source line map maps
+// a line to the addresses of its code wherever it was inlined, and the unit's
+// table attributes inlined code to the call site's line, so the range of an
+// inlined line's code must be read from its site's table. (the shallowest
+// match wins: the call site's own line also appears in the site's table, for
+// the call's setup code, with a shorter range.)
+internal RDI_ParsedLineTable
+d_parsed_line_table_from_voff_line_num(RDI_Parsed *rdi, U64 voff, U32 line_num)
+{
+  RDI_ParsedLineTable result = {0};
+  B32 found = 0;
+  
+  // rjf: the unit's table
+  RDI_ParsedLineTable unit_parsed = {0};
+  {
+    U64 unit_idx = rdi_vmap_idx_from_section_kind_voff(rdi, RDI_SectionKind_UnitVMap, voff);
+    RDI_Unit *unit = rdi_element_from_name_idx(rdi, Units, unit_idx);
+    RDI_LineTable *line_table = rdi_element_from_name_idx(rdi, LineTables, unit->line_table_idx);
+    rdi_parsed_from_line_table(rdi, line_table, &unit_parsed);
+    U64 idx = rdi_line_info_idx_from_voff(&unit_parsed, voff);
+    if(idx < unit_parsed.count && unit_parsed.voffs[idx] <= voff && voff < unit_parsed.voffs[idx+1] && unit_parsed.lines[idx].line_num == line_num)
+    {
+      result = unit_parsed;
+      found = 1;
+    }
+  }
+  
+  // rjf: the inline sites' tables, outermost first
+  if(!found)
+  {
+    RDI_Scope *nil_scope = rdi_element_from_name_idx(rdi, Scopes, 0);
+    RDI_Scope *inline_scopes[64] = {0};
+    U64 inline_scope_count = 0;
+    for(RDI_Scope *s = rdi_scope_from_voff(rdi, voff); s != nil_scope; s = rdi_element_from_name_idx(rdi, Scopes, s->parent_scope_idx))
+    {
+      if(s->inline_site_idx != 0 && inline_scope_count < ArrayCount(inline_scopes))
+      {
+        inline_scopes[inline_scope_count] = s;
+        inline_scope_count += 1;
+      }
+    }
+    for(U64 i = inline_scope_count; i > 0 && !found; i -= 1)
+    {
+      RDI_InlineSite *inline_site = rdi_element_from_name_idx(rdi, InlineSites, inline_scopes[i-1]->inline_site_idx);
+      if(inline_site->line_table_idx == 0)
+      {
+        continue;
+      }
+      RDI_LineTable *line_table = rdi_element_from_name_idx(rdi, LineTables, inline_site->line_table_idx);
+      RDI_ParsedLineTable parsed = {0};
+      rdi_parsed_from_line_table(rdi, line_table, &parsed);
+      U64 idx = rdi_line_info_idx_from_voff(&parsed, voff);
+      if(idx < parsed.count && parsed.voffs[idx] <= voff && voff < parsed.voffs[idx+1] && parsed.lines[idx].line_num == line_num)
+      {
+        result = parsed;
+        found = 1;
+      }
+    }
+  }
+  
+  if(!found)
+  {
+    result = unit_parsed;
+  }
+  return result;
+}
+
 internal D_LineListArray
 d_lines_array_from_dbgi_key_file_path_line_range(Arena *arena, DI_Key dbgi_key, String8 file_path, Rng1S64 line_num_range, U64 max_voffs_per_line)
 {
@@ -1268,11 +1370,7 @@ d_lines_array_from_dbgi_key_file_path_line_range(Arena *arena, DI_Key dbgi_key, 
         if(lines_num_voffs[line_idx] < max_voffs_per_line) ProfScope("iterate voffs (%i)", voff_count) for(U64 idx = 0; idx < voff_count; idx += 1)
         {
           U64 base_voff = voffs[idx];
-          U64 unit_idx = rdi_vmap_idx_from_section_kind_voff(rdi, RDI_SectionKind_UnitVMap, base_voff);
-          RDI_Unit *unit = rdi_element_from_name_idx(rdi, Units, unit_idx);
-          RDI_LineTable *line_table = rdi_element_from_name_idx(rdi, LineTables, unit->line_table_idx);
-          RDI_ParsedLineTable unit_line_info = {0};
-          rdi_parsed_from_line_table(rdi, line_table, &unit_line_info);
+          RDI_ParsedLineTable unit_line_info = d_parsed_line_table_from_voff_line_num(rdi, base_voff, u32_from_u64_saturate((U64)line_num));
           U64 line_info_idx = rdi_line_info_idx_from_voff(&unit_line_info, base_voff);
           if(unit_line_info.voffs != 0)
           {

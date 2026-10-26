@@ -15894,10 +15894,16 @@ rd_frame(void)
                   D_LineList lines = d_lines_from_dbgi_key_path_voff(scratch.arena, dbgi_key, dbgi_path, ip_voff);
                   if(lines.count != 0)
                   {
-                    rip_vaddr = ip_vaddr;
-                    unwind_index = frame_idx;
-                    inline_depth = lines.count-1; // innermost inline frame
-                    need_unwind_selection = 1;
+                    // NOTE: the frame the thread stopped in has source: keep the inline
+                    // frame selected for the stop (see the Stopped event). only an unwind
+                    // to an outer frame selects anew (its innermost inline frame).
+                    if(frame_idx > 0)
+                    {
+                      rip_vaddr = ip_vaddr;
+                      unwind_index = frame_idx;
+                      inline_depth = lines.count-1;
+                      need_unwind_selection = 1;
+                    }
                     break;
                   }
                 }
@@ -18605,9 +18611,36 @@ rd_frame(void)
             // first instruction of a call inlined into that frame is shown at the call site,
             // not inside the inlined callee; a step into enters it.
             U64 line_count = rd_line_count_from_thread_vaddr(thread, vaddr);
+            rd_state->stop_inline_depth_selected = (line_count > 0);
             if(line_count > 0)
             {
               U64 inline_depth = line_count-1;
+              
+              // rjf: a breakpoint on a source line stops at the first instruction of that
+              // line's code, which, when the line is a call that was inlined, is also the
+              // first instruction of the inlined callee: show the frame of the line the
+              // breakpoint was set on (the outermost frame whose line it is)
+              if(evt->cause == D_EventCause_UserBreakpoint)
+              {
+                CFG_Node *bp = cfg_node_from_id(evt->u64_code);
+                RD_Location loc = rd_location_from_cfg(bp);
+                if(loc.file_path.size != 0 && loc.pt.line != 0)
+                {
+                  D_Entity *dbg_path = d_entity_child_from_kind(module, D_EntityKind_DebugInfoPath);
+                  DI_Key dbgi_key = d_dbgi_key_from_debug_info_path(dbg_path);
+                  D_LineList lines = d_lines_from_dbgi_key_path_voff(scratch.arena, dbgi_key, dbg_path->string, voff);
+                  U64 idx = 0;
+                  for(D_LineNode *n = lines.first; n != 0; n = n->next, idx += 1)
+                  {
+                    if(n->v.pt.line == loc.pt.line && path_match_normalized(n->v.file_path, loc.file_path))
+                    {
+                      inline_depth = idx;
+                      break;
+                    }
+                  }
+                }
+              }
+              
               if(evt->cause == D_EventCause_Finished &&
                  d_ctrl_last_run_kind() != D_RunKind_Run &&
                  rd_state->last_step_kind != RD_CmdKind_StepInto &&
@@ -18799,12 +18832,17 @@ rd_frame(void)
   //
   if(!d_handle_match(d_handle_zero(), find_thread_retry))
   {
-    // NOTE: the debug info may not have been ready when the thread was selected;
-    // pick the innermost inline frame again now
-    U64 inline_depth = rd_innermost_inline_depth_from_thread(d_entity_from_handle(find_thread_retry));
-    if(rd_state->base_regs.v.unwind_count == 0)
+    // NOTE: the debug info may not have been ready when the stop was handled (no frame
+    // selected then); pick the innermost inline frame now. never override a selection.
+    if(!rd_state->stop_inline_depth_selected && rd_state->base_regs.v.unwind_count == 0)
     {
-      rd_state->base_regs.v.inline_depth = inline_depth;
+      D_Entity *thread = d_entity_from_handle(find_thread_retry);
+      U64 line_count = rd_line_count_from_thread_vaddr(thread, d_cached_ip_from_thread(thread->handle));
+      if(line_count > 0)
+      {
+        rd_state->base_regs.v.inline_depth = line_count-1;
+        rd_state->stop_inline_depth_selected = 1;
+      }
     }
     rd_cmd(RD_CmdKind_FindThread, .thread = find_thread_retry, .unwind_count = rd_state->base_regs.v.unwind_count, .inline_depth = rd_state->base_regs.v.inline_depth);
   }

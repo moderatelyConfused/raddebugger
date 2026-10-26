@@ -291,6 +291,7 @@ enum
   D_TrapFlag_SaveStackPointerAfter   = (1<<3),
   D_TrapFlag_BeginSpoofMode          = (1<<4),
   D_TrapFlag_EndStepping             = (1<<5),
+  D_TrapFlag_EndSteppingUnlessStackChanged = (1<<6), // after the single step: end, unless the jump switched stacks (coroutine context switch) - then keep stepping, the line's traps stop the thread when it is back
 };
 
 typedef struct D_Trap D_Trap;

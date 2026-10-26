@@ -424,6 +424,7 @@ struct RD_State
   RD_CmdKind last_step_kind;            // the last step command issued, and ...
   U64 last_step_inline_depth;           // ... the inline frame it stepped at, and ...
   Rng1U64 last_step_proc_vaddr_range;   // ... the procedure the thread was in (for selecting the frame to show when it finishes)
+  B32 stop_inline_depth_selected;       // the last stop had line info, and an inline frame was selected for it
   B32 override_focus_on_stop;
   S32 frame_depth;
   U64 frame_eval_memread_endt_us;

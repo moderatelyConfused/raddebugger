@@ -172,6 +172,44 @@ command runs with the focused tab's registers: once a disassembly tab is
 focused (the UI opens one when a stop has no source), `step_over` steps by
 instruction (`prefer_disasm`).
 
+Follow-up the same evening, after "repeated step-into in the generator misses
+parts of the execution; calls to `next()` after the first jump straight to
+`contextSwitch`" (fixed, verified on both builds):
+
+* `d_lines_from_dbgi_key_file_path_line_num` turned a source line map's
+  addresses into ranges with the *unit's* line table, so for an inlined line
+  the "other ranges of this textual line" were the call site's rows: the
+  stepped range was extended over the whole inlined region and a step ran a
+  whole loop iteration. `d_parsed_line_table_from_voff_line_num` now reads the
+  range from the shallowest table whose row there is the requested line (the
+  unit's, then the inline sites' outermost first), and natural-flow traps are
+  never placed at the instruction being stepped from.
+* A step over a line containing a coroutine context switch (`mov sp, xN; br
+  xM`, inlined into `next()` / `yield`) ended at the jump's destination, in
+  the other coroutine. Indirect jumps that are not calls or returns now get
+  `D_TrapFlag_EndSteppingUnlessStackChanged`: the control thread ends the step
+  after the single step only if `sp` is still near the step's starting stack;
+  otherwise it keeps running, with the starting `sp` restored as the value the
+  line's traps are checked against, so the step completes when the thread is
+  switched back to. Stepping over `rng.next()` now runs the fiber and returns
+  to the next line; stepping over the `for ... yield(i)` line runs the loop.
+  Still imperfect: a step over such a line in a coroutine driven by *another*
+  coroutine of the same type (range2d's `x_rng` and `y_rng`) can end in the
+  parent after the first yield, since the sibling executes the same code
+  while the parent runs.
+* A breakpoint on a call that was inlined stops at the first instruction of
+  the inlined callee; the stop now selects the frame of the breakpoint's own
+  line (so main.zig:57 shows main.zig:57, with `next` as the frame below), and
+  the find-thread retry and auto-unwind no longer override a selected frame.
+* Driving the debugger from a script: `launch_and_step_into` sent over `--ipc`
+  has no target in its registers and launches nothing; send `step_into` with
+  no process instead. `exit` over IPC does not quit an instance with a live
+  process (kill it by pid). A `step_into` at the first instruction of an
+  inlined call only selects the next inline frame, without a run. Each IPC
+  `state` renders a frame, so poll at 100ms or slower. The harness used
+  (`h.sh`: launch, breakpoint, run, step, printing every stop with its inline
+  frames) runs a breakpoint-and-steps scenario in about a second.
+
 Open:
 
 * **Step-into and code without line info.** Every Zig `threadlocal` access

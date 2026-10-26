@@ -5103,6 +5103,7 @@ d_ctrl_thread__run(DMN_CtrlCtx *ctrl_ctx, D_Msg *msg)
   // causes e.g. entrance into a function via a call instruction.
   //
   U64 sp_check_value = d_sp_from_thread(target_thread);
+  U64 step_start_sp = sp_check_value;
   log_infof("sp_check_value := 0x%I64x\n", sp_check_value);
   
   //////////////////////////////
@@ -5920,9 +5921,11 @@ d_ctrl_thread__run(DMN_CtrlCtx *ctrl_ctx, D_Msg *msg)
       
       //- rjf: trap net logic: stack pointer check on target thread
       B32 stack_pointer_check_passes = 0;
+      U64 hit_sp = 0;
       if(!hard_stop && use_stepping_logic && hit_trap_net_bp && dmn_handle_match(event->thread, d_dmn_from_handle(target_thread)))
       {
         U64 sp = d_sp_from_thread(target_thread);
+        hit_sp = sp;
         stack_pointer_check_passes = ((hit_trap_flags & D_TrapFlag_IgnoreStackPointerCheck) || (sp == sp_check_value));
       }
       
@@ -6032,6 +6035,30 @@ d_ctrl_thread__run(DMN_CtrlCtx *ctrl_ctx, D_Msg *msg)
         {
           trap_net_stop = 1;
           use_trap_net_logic = 0;
+        }
+        else if(hit_trap_flags & D_TrapFlag_EndSteppingUnlessStackChanged) LogInfoNamedBlockF("trap_net__end_step_unless_stack_changed")
+        {
+          // NOTE: an indirect jump whose destination the trap net could not know. a
+          // jump table or tail call keeps the stack: end the step where it landed. a
+          // coroutine's context switch (`mov sp, xN; br xM`) does not: the thread is
+          // now on another stack, far from the one the step began on (the `mov sp`
+          // itself was stepped as a stack pointer change, which also made the saved
+          // stack pointer that of the new stack). keep stepping, with the stack
+          // pointer of the step's start restored as the one to check against, so that
+          // the line's traps stop the thread once it is switched back to.
+          U64 sp_after = d_sp_from_thread(target_thread);
+          U64 sp_distance = (sp_after > step_start_sp) ? (sp_after - step_start_sp) : (step_start_sp - sp_after);
+          log_infof("sp at step start: 0x%I64x, after jump: 0x%I64x\n", step_start_sp, sp_after);
+          if(sp_distance < KB(256))
+          {
+            trap_net_stop = 1;
+            use_trap_net_logic = 0;
+          }
+          else
+          {
+            sp_check_value = step_start_sp;
+            log_infof("stack switched; sp_check_value = 0x%I64x\n", sp_check_value);
+          }
         }
       }
       
