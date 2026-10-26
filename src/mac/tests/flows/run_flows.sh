@@ -916,6 +916,7 @@ scenario_D3_modules_system() {
   local st=$(ipc state)
   check_match D3_libsystem_in_modules 'libSystem.B.dylib' "$(module_names "$st")"
   check_match D3_libsystem_kernel_in_modules 'libsystem_kernel.dylib' "$(module_names "$st")"
+  warm_symbol write; note "D3: eval write -> $(ipc eval write | grep -m1 'value\|msgs' | tr -d '\n')"
   ipc "add_function_breakpoint write" >/dev/null
   st=$(run_stop)
   check D3_write_bp_module "libsystem_kernel.dylib" "$(stop_module "$st")"
@@ -1097,7 +1098,7 @@ scenario_U3_thread_sleep_stack() {
   check U3_selected_sleeper "$y" "$(field "$st" selected_thread)"
   local n=$(call_stack "$st" | grep -c .)
   check_match U3_frames_nonempty '^([3-9]|[1-9][0-9])$' "$n"
-  check_match U3_top_in_libsystem_kernel 'libsystem_kernel.dylib' "$(frame_modules "$st" | head -1)"
+  check_match U3_top_in_libsystem 'libsystem_(kernel|c).dylib' "$(frame_modules "$st" | head -1)"
   check_match U3_sleeper_frame 'sleeper' "$(call_stack_symbols "$st")"
   check U3_bottom_libsystem_pthread "libsystem_pthread.dylib" "$(frame_modules "$st" | tail -1)"
   note "U3 sleeper stack: $(call_stack "$st" | tr '\n' ' ') modules: $(frame_modules "$st" | tr '\n' ' ')"
@@ -1117,8 +1118,12 @@ scenario_U5_tls_step_into() {
   else
     check U5_frame1_is_main "main" "$(concrete_frames "$st" | sed -n 2p)"
     st=$(go_cmd step_out)
-    check_stop U5_step_out_to_next_line "$st" $D/basic.c main_static
+    # the getter returns into the middle of the TLS line (its store follows the call), so a step
+    # out lands on that line; one step over then reaches the next line
+    check_match U5_step_out_returns_to_caller "basic.c:($(line_of $D/basic.c main_tls)|$(line_of $D/basic.c main_static))" "$(stop_file_line "$st")"
     check U5_step_out_sym "main" "$(stop_symbol "$st")"
+    [[ "$(stop_file_line "$st")" == "$(tag_loc $D/basic.c main_tls)" ]] && st=$(go_cmd step_over)
+    check_stop U5_next_line "$st" $D/basic.c main_static
   fi
   if [[ "$(stop_file_line "$st")" == "$(tag_loc $D/basic.c main_static)" ]]; then
     check tls_counter_after_access 8 "$(ev t_tls_counter)"

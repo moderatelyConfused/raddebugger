@@ -467,6 +467,7 @@ skip, 1 fail.
   `pipe2` and pidfds (now kqueue on macOS), looked for `cl.exe`, and had no mac
   tables; `lnk_file_rename` used `/proc/self/fd` (now `F_GETPATH`); the first run of
   an exemplar test compared against a missing exemplar instead of creating it.
+
 ## Scripted feature-flow suite (src/mac/tests/flows)
 
 `src/mac/tests/flows/run_flows.sh` drives a private debugger instance (its own
@@ -513,6 +514,14 @@ codes), plus `NOTE` lines for observations without a verdict.
   to: `ptrace` reparents it to the debugger.
 
 ### Results and findings (2026-10-25, this branch)
+
+Last full run (after merging `macos-arm64-port`): 310 checks passed, 74
+failed, 45 scenario runs in 338 s. Every failure below is a recorded bug or
+observation; scenarios fully passing include launch/kill/restart/exit, the
+breakpoint flows (line, inline line, dylib before load, address, condition,
+hit counts, toggle/remove), halt, eval, the frame-pointer-less call stack,
+freeze/thaw, modules (load/unload/reload), the Zig generator stepping and
+fiber stack, D7, D9, F3, F4a, F5a, F5b, U1, U2, U3.
 
 Fixed here (the suite found them; the first and third were fixed independently
 on `macos-arm64-port` at the same time, and the merge kept that branch's
@@ -578,11 +587,20 @@ stepping agents):
   the other hits are lost (1 of 4 worker hits in the first launch).
 * Call stacks of threads other than the stopping one are empty (`U3` sleeping
   thread, the spinner in `threads_freeze`, `D5`).
-* Modules: only the executable and dyld are ever listed (`D3`, `modules`,
-  `breakpoint_dylib`): the dyld notification hook is not found and the
-  per-stop image sync adds nothing, so dylib breakpoints never resolve,
-  `write` is not found and the TLS getter (`U5`) stops in code without a
-  module (empty call stack).
+* Fixed by the merged dyld-notification work (recorded before the merge):
+  only the executable and dyld were listed, dylib breakpoints never resolved
+  and the TLS getter stopped in code without a module; after the merge
+  `breakpoint_dylib`, `modules` (load, unload, reload) and `D3`'s module list
+  pass, `U5` lands in `libdyld.dylib` with `main` as frame 1 and steps out to
+  the TLS line. Likewise fixed by the merged frame-selection and unwinder
+  work: `F7` (the step into executes an instruction), `D7` (the stop in the
+  new thread selects it), the call stacks of other threads (`U3`,
+  `threads_freeze`, `D5` finds the spinner) and the fiber stack
+  (`range -> entryPoint -> next`).
+* A function breakpoint on a libSystem symbol (`write`, `D3`) does not hit,
+  not even after a warm-up evaluation (`eval write` resolves nothing: the
+  system libraries' RDIs come from their symbol tables and `write` is not
+  found by name).
 * Detach (`D1`, `attach_detach`): `dmn_ctrl_detach` releases the process
   without reporting it, while `d_ctrl_thread__detach` waits for a
   `DMN_EventKind_ExitProcess` of that process (win32 queues detached processes
@@ -625,6 +643,21 @@ stepping agents):
   produces nothing and the stale artifact stays.
 * `eval` of locals held in registers at -O2 (`F4a` `r`, `F6` `node`) gives 0
   or "could not be found".
+* In a caller's frame (`select_unwind --unwind_count:1`), `rec->name` reads
+  `""` while `(*rec).name` reads `"rec"` and `rec->pt.y` is right (`eval_O0`
+  NOTE): the `->` path reads the pointer from the wrong frame.
+* `dylib_host_O0` ends with exit code 0 and without its final `printf` output
+  under the debugger (natively: "host done 8", exit 8) after the second
+  `dlclose` (`modules/exit_code`).
+* After stepping out of the TLS getter onto the middle of the `t_tls_counter
+  += 1` line, a step over stops on that same line again (`U5_next_line`): the
+  line's remaining rows after the call count as a new line, so two steps are
+  needed to reach the next line.
+* Flaky: `eval signo` at the first line of a signal handler reads 0 in some
+  runs and 30 in others (`signal_handler/handler_signo`); the registers or
+  frame base used right after the stop differ between runs.
+* `fork`: a forked child was observed at >50 % CPU after the parent's stop
+  (`D2_no_spinning_child` lists its pid): the inherited `brk` re-executes.
 * `F7`: with a disassembly tab focused, a step into at the first instruction
   of an inlined call only selects the next inline frame (pc unchanged).
 * `F1`/`F2`: a step over at inline depth 1 from `next`'s last line stops at the
