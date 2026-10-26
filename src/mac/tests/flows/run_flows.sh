@@ -714,6 +714,8 @@ scenario_modules() {
   check unloaded_after_dlclose 0 "$(module_names "$st" | grep -c libplugin)"
   st=$(run_stop); check_stop second_round "$st" $D/dylib_host.c call_plugin
   check_match reloaded 'libplugin_O0.dylib' "$(module_names "$st")"
+  # rjf: the after_dlclose breakpoint is still set: it hits in the second round too, before the exit
+  st=$(run_stop); check_stop at_after_dlclose_2 "$st" $D/dylib_host.c after_dlclose
   ipc run >/dev/null; st=$(wait_exit); check exit_code 8 "$(field "$st" last_exit_code)"
   note "module events: NewModule=$(event_count NewModule) EndModule=$(event_count EndModule); dyld notification: $(grep -c 'could not find _dyld_debugger_notification' $S/logs/ctrl_thread.raddbg_log 2>/dev/null) 'not found' log lines"
   finish

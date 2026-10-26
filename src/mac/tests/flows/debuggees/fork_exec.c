@@ -32,7 +32,8 @@ int main(int argc, char **argv)
       _exit(code);
     }
     int status = 0;
-    waitpid(pid, &status, 0);                     // @parent_wait
+    // (retried on EINTR: a traced process is woken for every signal, SIGCHLD included, see the README)
+    while(waitpid(pid, &status, 0) < 0 && errno == EINTR) {} // @parent_wait
     g_fork_marker = 2;                            // @parent_after
     return WIFEXITED(status) ? WEXITSTATUS(status) : 1; // @fork_exit
   }

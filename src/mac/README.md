@@ -36,54 +36,117 @@ bundled with Zig: `zig cc -target aarch64-macos -fsyntax-only ...`).
   signal is the initial stop. Launch and attach fail when the exception ports
   cannot be installed.
 * Detach: `PT_DETACH` needs the BSD process in `SSTOP`, which under
-  `PT_ATTACHEXC` only holds while a thread is inside a soft-signal exception,
-  and the signal of that exception is delivered once the tracer is gone. So
-  `dmn_ctrl_detach` answers the pending exceptions (hardware ones escalated to
-  their signal), lets the process run, sends it `SIGCONT` (a traced process
+  `PT_ATTACHEXC` only holds while a thread is inside a soft-signal exception.
+  So `dmn_ctrl_detach` answers the pending exceptions (hardware ones escalated
+  to their signal), lets the process run, sends it `SIGCONT` (a traced process
   reports every signal), restores the exception ports and `PT_DETACH`es at
-  that exception, then replies with plain continues and resumes; the `SIGCONT`
-  the process takes afterwards does nothing. The process is marked detached and
-  the next `dmn_ctrl_run` synthesizes `ExitThread` / `UnloadModule` /
-  `ExitProcess` and frees it (Win32's queued-detach path). If `PT_DETACH`
-  fails the process stays attached and the detach reports failure.
+  that exception, then replies with plain continues and resumes. `PT_DETACH`
+  resumes like `PT_CONTINUE`: its data (0) becomes the signal the blocked
+  thread takes when its exception is answered, so the signal the process was
+  stopped at would be lost; our own `SIGCONT` may be, but a user's detach at
+  a `SIGTERM` / `SIGUSR1` stop must leave the signal with the process, so the
+  demon first marks it pending on its thread with `PT_THUPDATE` (what a
+  delivering reply does), and the thread, untraced by then, takes it when it
+  re-scans its pending signals (`tests/demon/detach_at_signal.sh`: the handler
+  runs, a default-disposition `SIGTERM` terminates). The process is marked
+  detached and the next `dmn_ctrl_run` synthesizes `ExitThread` /
+  `UnloadModule` / `ExitProcess` and frees it (Win32's queued-detach path). A
+  detached process we launched stays our child: a thread `waitpid`s for it so
+  that it does not linger as a zombie (`D1_debuggee_ran_to_completion`). If
+  `PT_DETACH` fails the process stays attached and the detach reports failure.
 * Waiting: a kqueue with `EVFILT_MACHPORT` (exception port set),
   `EVFILT_PROC` (`NOTE_EXIT`, `NOTE_EXEC`; `NOTE_EXITSTATUS` only for our own
   children, the kernel refuses it otherwise) and `EVFILT_USER` (halt requests).
+  Exit statuses: an attached process is waitable too, since `PT_ATTACHEXC`
+  reparents it to the tracer (the kernel hands the zombie back to the original
+  parent once the tracer has reaped it, `reap_child_locked`), so every exit
+  is `waitpid`ed for its status (`kill -9` of an attached process reports exit
+  code 9, `D9_exit_code_is_signal`); the liveness fallback polls `waitpid`
+  before `kill(pid, 0)`, which succeeds on a zombie. The demon logs every
+  exit (`pid N exited (launched|attached; waitpid -> ...); exit code N`).
 * Stops: on the first exception message the whole task is suspended with
   `task_suspend`, stragglers are drained, `task_threads` is diffed against the
   known thread list (thread create/exit events), and registers are read with
-  `thread_get_state` (`ARM_THREAD_STATE64`, `ARM_NEON_STATE64`).
-* Resume: pending exception messages are replied to (`PT_THUPDATE` chooses
-  the signal to deliver for soft signals; `KERN_FAILURE` escalates a hardware
-  exception to its BSD signal when the engine did not ask to ignore it),
-  frozen threads are `thread_suspend`ed, then `task_resume`. A frozen thread
-  keeps its pending exception (and its reported mark) until it runs again: the
-  run which resumes it decides what to do with it, as on Linux. A soft signal
-  which is the kernel's escalation of a hardware exception the engine passed
-  (same pc, the exception's signal) is not re-reported as a repeated exception;
-  it is delivered whatever the next run's ignore flag says, so signal handlers
-  run.
+  `thread_get_state` (`ARM_THREAD_STATE64`, `ARM_NEON_STATE64`). A stop which
+  arrives outside a round (while an internal step waits for its completion,
+  or during the detach handshake) is never answered silently: the next run
+  reports it before resuming anything (`tests/demon/bp_stress.sh` asserts the
+  "unreported pending exception at a resume" log line never appears over 200
+  continues with 32 threads hitting one breakpoint).
+* One exception event per run. The engine answers an exception through the
+  `ignore_previous_exception` flag of the run which follows its report (1
+  after it stopped on the event: the exception is dropped, a hardware
+  exception re-executes; 0 after it filtered it: passed to the debuggee), one
+  flag per run, so a run hands the engine one exception event: when several
+  threads raise in one round the others are classified at once but held back
+  (`MAC_DMN_Thread.held_event`), and each following *full* run (not a single
+  step, see below) hands out the next one without resuming anything, as the
+  win32 kernel delivers its queued debug events one `WaitForDebugEvent` at a
+  time. Breakpoint, step and watchpoint stops are all reported (their replies
+  do not depend on the flag; the engine holds back the other threads' hits
+  itself, `has_unreported_bp_hit`).
+* Resume: the exception reported last is answered when its flag arrives: at
+  the next full run, or at a single step of its own thread (the engine builds
+  the run controls of the single steps it takes stuck threads off their traps
+  with, and of the user's instruction steps, from zero, so their flag speaks
+  only for the stepped thread, as on Linux where a thread the run does not
+  resume keeps its signal in its ptrace stop). The reply (`PT_THUPDATE`
+  chooses the signal to deliver for soft signals; `KERN_FAILURE` escalates a
+  hardware exception to its BSD signal when the engine did not ask to ignore
+  it) is sent whether the thread runs in that run or stays frozen: the
+  disposition is committed and a frozen thread acts on it when thawed. So a
+  signal the engine passed reaches its thread whatever the flags of the runs
+  which happen to resume it later (`tests/demon/frozen_thread.sh`: the
+  `SIGUSR1` thread's handler runs while the faulting thread's re-executed
+  fault keeps stopping the process). The other pending stops are answered
+  `KERN_SUCCESS`, frozen threads are `thread_suspend`ed, then `task_resume`. A
+  soft signal which is the kernel's escalation of a hardware exception the
+  engine passed (same pc, the exception's signal) is not re-reported as a
+  repeated exception; it is delivered whatever the next run's ignore flag
+  says, so signal handlers run. The stop signals of our own making are
+  swallowed (the `SIGSTOP` `PT_ATTACHEXC` posts, the `SIGCONT` we send for the
+  first resume of a launch or the detach handshake); any other `SIGSTOP` /
+  `SIGCONT` is reported, gated by its "Break on" setting like on Linux.
 * Breakpoints: `brk #0`; the PC points at the trap instruction when reported
   (no rollback). Single stepping: `MDSCR_EL1.SS` via `ARM_DEBUG_STATE64`.
-  Watchpoints: `DBGWCR/DBGWVR` via `ARM_DEBUG_STATE64`; since arm64 reports
-  them before the access, the demon steps past the access internally; the
-  event carries the trap id (`user_data`), which attributes the stop to its
-  data breakpoint.
+  Watchpoints: `DBGWCR/DBGWVR` via `ARM_DEBUG_STATE64`, per thread: a thread
+  created during the run gets the run's watchpoints when the demon first sees
+  it, at a round's thread sync (`tests/demon/watch_new_thread.sh`: the writer
+  is created after the watchpoint was armed and met at a passed signal's
+  round). Mach has no thread-creation notification, so a thread created and
+  writing within one uninterrupted run is not caught (a trap on
+  libsystem_pthread's `thread_start` would be the hook); since arm64 reports
+  watchpoints before the access, the demon steps past the access internally;
+  the event carries the trap id (`user_data`), which attributes the stop to
+  its data breakpoint. An internal step which consumed the single step the
+  engine asked for reports the step completion itself.
 * Forked children inherit the exception ports and the trap instructions in
   their copy-on-write image. An exception from a task the demon does not debug
   is failed (`KERN_FAILURE`: the child takes the signal's default action, or
   its handler), unless it is an `EXC_BREAKPOINT` at one of our traps (the dyld
-  trap, or a trap of the run in progress, found through the child's
-  ancestry), in which case the original instruction is written back into the
-  child and it continues. Children are not debugged (`debug_subprocesses` is
-  recorded, not acted on).
+  trap, or any trap ever written into the parent: the demon keeps the original
+  bytes of every trap it writes per process, `MAC_DMN_ProcessCtx` trap
+  history, cleared at an exec, since a child forked while a breakpoint was in
+  place keeps the `brk` in its page after the run restored the parent's copy
+  and may hit it after the breakpoint is gone, `tests/demon/fork_stale_trap.sh`),
+  found through the child's ancestry, in which case the original instruction
+  is written back into the child and it continues. Children are not debugged
+  (`debug_subprocesses` is recorded, not acted on). Mind that a traced process
+  is woken for every signal, the ones it ignores included: a parent blocked in
+  `waitpid` gets `EINTR` when its child's `SIGCHLD` is reported (whether the
+  engine passes or drops it: the trace stop itself interrupts the sleep, an
+  untraced process never wakes for an ignored signal), so a debuggee which does
+  not retry on `EINTR` behaves differently under the debugger (lldb has the
+  same effect; the flows' `fork_exec.c` retries).
 * Exec: the kernel replaces the task's kernel port but keeps the exception
   ports, so the post-exec `SIGTRAP` soft signal arrives under a new task port
-  name; it is matched to the process by pid and the new port adopted. A
-  `SIGTRAP` at a fresh image (`dyld_all_image_infos` with an empty image list)
-  unloads every module, reports the vanished threads, re-runs the launch-style
-  discovery (main header at `[sp]`, dyld by scan from `pc`) and is swallowed;
-  traps written before the exec are not restored into the new image. Exec of
+  name; it is matched to the process by pid and the new port adopted when the
+  port we hold has become a dead name (`mach_port_type`), which marks the
+  process as exec'd (`exec_pending`: no image sync until the new image is
+  reached). The `SIGTRAP` then unloads every module, reports the vanished
+  threads, re-runs the launch-style discovery (main header at `[sp]`, dyld by
+  scan from `pc`) and is swallowed; traps written before the exec are not
+  restored into the new image. Exec of
   a platform binary (e.g. `/bin/echo`) kills the process with `SIGTRAP`: the
   exec drops the exception ports for a debugger without Apple's private
   task-port entitlement (lldb dies the same way).
@@ -514,10 +577,10 @@ Two more consequences of the Linux-like defaults: `raise(SIGUSR1)` stops
 before its handler runs (the `signal_handler` flow turns `mac_sigusr1` off),
 and a `kill -9` of the debuggee is reported first as a SIGKILL stop (0x9;
 `PT_ATTACHEXC` reports it as a soft signal and `mac_sigkill` breaks, as
-`linux_sigkill` does), the exit following the continue (`D9`; a launched
-process then reports exit code 9, an attached one 0 on this machine with or
-without the stop, since the demon learns a non-child's exit status only from
-`NOTE_EXITSTATUS`: `D9_exit_code_is_signal` stays open).
+`linux_sigkill` does), the exit following the continue (`D9`; the exit code
+is 9 for a launched and an attached process alike: the demon `waitpid`s
+attached processes too, `PT_ATTACHEXC` having reparented them to it, see
+"Waiting" under Demon).
 
 ### Open
 
@@ -599,11 +662,14 @@ impact:
   a chained command are often lost (double-buffered command queue), so check
   effects via `state` or the logs.
 * Demon: exec of a platform binary (`/bin/echo`) kills the traced process with
-  `SIGTRAP` (the OS drops the exception ports; lldb behaves the same); a
-  forked child which hits a trap written by an earlier run (a breakpoint since
-  removed) takes `SIGTRAP`; the run's single `ignore_previous_exception` flag
-  applies to every thread it resumes (a passed signal of a thread resumed by a
-  later run is dropped).
+  `SIGTRAP` (the OS drops the exception ports; lldb behaves the same). A
+  traced process' blocking syscalls return `EINTR` for signals it ignores
+  (`SIGCHLD` in a parent's `waitpid`): OS behavior under `PT_ATTACHEXC`, see
+  "Forked children" under Demon. Not done from the demon review: the
+  simplifications (`MAC_DMN_ThreadState`, the two `force_*_on_reply` flags,
+  the dead state fields, `is_seen`'s double use, `sync_threads`' optional
+  list, `last_image_info_count` in the notifier, `MH_DYLIB_IN_CACHE` for
+  `vsize`).
 * Stepping over a coroutine context switch in a coroutine driven by *another*
   coroutine of the same type (`range2d`'s `x_rng` and `y_rng`) can end in the
   parent after the first yield, since the sibling executes the same code
@@ -622,9 +688,12 @@ impact:
   from the symbol table alone is marked (`[symbol table only]` in its
   producer string) but `dbg_info.c` does not yet treat it as stale once a dSYM
   or the debug map's objects turn up.
-* `dylib_host_O0` exits 0 without its final `printf` under the debugger
-  (natively "host done 8", exit 8) after the second `dlclose`. `eval signo` at
-  the first line of a signal handler is flaky (0 or 30).
+* `eval signo` at the first line of a signal handler is flaky (0 or 30).
+  (`dylib_host_O0` "exiting 0 without its final `printf`" was the `modules`
+  scenario itself: its `after_dlclose` breakpoint hits in the second round
+  too, and the scenario never continued past that stop; continued, the
+  process prints "host done 8" and exits 8. The scenario expects the second
+  hit now.)
 * A headless driver (the demon from a console program, the way `torture`
   does) would still be useful; the `--ipc` loop is the next best thing.
 
@@ -768,12 +837,21 @@ Converter bullet of "Open" above.
 
 Demon checks: `zsh src/mac/tests/demon/run_all.sh` (settings in `common.sh`:
 `IPC_PORT`, default 7950, `HARNESS_DIR`, `RADDBG`; `detach.sh` needs the Zig
-generator project and `zig`, see its header). Each script builds its debuggee
-with the host clang (two steps, so that the object file the debug map points at
-survives; the debugger's converter then reads the dSYM), writes a project file
-(the `// raddbg ... project file` header line is required, or the file is taken
-for a new, empty project) and asserts on `--ipc state`, the debuggee's
-`stdout_path` file and `ctrl_thread.raddbg_log`.
+generator project and `zig`, see its header, and skips without them). Each
+script builds its debuggee with the host clang (two steps, so that the object
+file the debug map points at survives; the debugger's converter then reads the
+dSYM), writes a project file (the `// raddbg ... project file` header line is
+required, or the file is taken for a new, empty project) and asserts on
+`--ipc state` through section-bounded readers (`stop_symbol`, `stop_line`,
+`thread_count`, ...; a whole-dump grep also matches thread names, breakpoint
+locations and call stack entries), the debuggee's `stdout_path` file and
+`ctrl_thread.raddbg_log`. `check` evaluates a single-quoted zsh expression in
+the script's shell (never a dump embedded in the expression). `finish` kills
+the debuggees the instance holds (`kill_all`), the instance, and the
+processes the script registered with `track_pid`. Scripts: `detach`,
+`detach_at_signal`, `fork_child`, `fork_stale_trap`, `signal_handler`,
+`frozen_thread`, `thread_exit`, `exec`, `watchpoint`, `watch_new_thread`,
+`bp_stress` (200 continues, `BP_STRESS_ROUNDS` to change).
 
 `./run_tests.sh clang debug` (or `release`) builds `raddbg`, `raddbg_non_graphical`,
 `radlink`, `radbin` and `torture` with `./build.sh meta ...` and runs `build/torture`
@@ -936,10 +1014,18 @@ implementation):
   `signal_handler` flow turns `mac_sigusr1` off so that `raise(SIGUSR1)` reaches
   its handler (SIGUSR1 breaks by default, as `linux_sigusr1` does), and `D9`
   continues once past the SIGKILL stop a `kill -9` now produces (`mac_sigkill`
-  breaks by default) before expecting the exit; its exit code check (9) fails
-  for the attached process with or without that stop (exit code 0: see "Status
-  and open issues"), as do `fork/D2_exit_code_from_child` (0 instead of 7) and
-  `D1_debuggee_ran_to_completion` on the pre-change binary too.
+  breaks by default) before expecting the exit. Its exit code check (9) used
+  to fail for the attached process (exit code 0), as did
+  `fork/D2_exit_code_from_child` (0 instead of 7) and
+  `D1_debuggee_ran_to_completion`: three causes, all in the demon work (see
+  "Waiting", "Detach" and "Forked children" under Demon): an attached
+  process' status was never read (`waitpid` works, the tracer is its parent),
+  a detached launched process was never reaped (a zombie answers `kill -0`),
+  and the fork parent's `waitpid` returned `EINTR` for the child's `SIGCHLD`
+  (OS behavior for a traced process; `fork_exec.c` retries now). The
+  `modules` scenario's exit code check failed on its own account: the
+  `after_dlclose` breakpoint hits in the second round too and the scenario
+  did not continue past it (fixed in the scenario).
 * Function-name (expression) breakpoints added while a process was live never
   got a trap when nothing had evaluated the name before
   (`breakpoints_O0/func_bp_cold_symbol`, `F5b big_frame`, the Zig `range`):

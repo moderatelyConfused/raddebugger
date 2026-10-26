@@ -22,13 +22,13 @@ launch $S/watch_global.raddbg
 bp $DEMON_TESTS_DIR/src/watch_global.c:$(line_of watch_global "// bp_setup")
 go
 st=$(ipc state)
-check "stopped where the pointer is set" "echo '$st' | grep -q 'line_num: *$(line_of watch_global '// bp_setup')\$'"
+check "stopped where the pointer is set" '[[ $(stop_line "$st") == $(line_of watch_global "// bp_setup") ]]'
 go
 st=$(ipc state)
 # rjf: the demon steps past the access before reporting, so the thread may already be on the next line
 wl=$(line_of watch_global '// write')
-check "stopped at the write (line $wl) or right after it (reported: $(echo "$st" | grep -m1 'line_num:' | awk '{print $2}'))" "echo '$st' | grep -q -E 'line_num: *($wl|$((wl+1)))\$'"
-check "the stop is a breakpoint hit at the written address" "echo '$st' | grep -q 'hit a breakpoint (Address: 0x'"
+check "stopped at the write (line $wl) or right after it (reported: $(stop_line "$st"))" '[[ $(stop_line "$st") == $wl || $(stop_line "$st") == $((wl+1)) ]]'
+check "the stop is a breakpoint hit at the written address" '[[ $(stop_explanation "$st") == *"hit a breakpoint (Address: 0x"* ]]'
 # rjf: save the project (to a new path: saving over an existing file asks for a confirmation the
 # script cannot give) to read the hit count. NOTE: the path option must be given, with a `:line`
 # suffix (a FilePath register is only filled from a path:line string): without it `save_project`
@@ -37,5 +37,5 @@ SAVED=$S/watch_global.saved.raddbg
 rm -f $SAVED
 ipc "save_project --file_path:$SAVED:1" >/dev/null
 for i in $(seq 1 30); do grep -q "hit_count: *1" $SAVED 2>/dev/null && break; sleep 0.1; done
-check "the data breakpoint's hit count became 1 (the hit was attributed to it)" "grep -q 'hit_count: *1' $SAVED"
+check "the data breakpoint's hit count became 1 (the hit was attributed to it)" 'grep -q "hit_count: *1" $SAVED'
 finish watchpoint

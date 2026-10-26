@@ -199,7 +199,13 @@ struct MAC_DMN_Thread
   MAC_DMN_StopKind stop_kind;
   U64 stop_signo;               // for soft signals
   U64 stop_hw_trap_vaddr;       // for watchpoints
-  
+
+  // rjf: an exception event classified at its stop but not handed to the engine yet (a run hands out
+  // one exception event; the others wait for the following runs, like the win32 kernel's debug event
+  // queue, so that each run's ignore_previous_exception flag refers to exactly one exception)
+  B32 has_held_event;
+  DMN_Event held_event;
+
   // rjf: exception repeat tracking
   U64 last_exception_ip;
   U64 last_exception_code;
@@ -268,6 +274,9 @@ struct MAC_DMN_Process
   B32 has_exited;
   B32 is_detached;              // detached; its exit events are synthesized (and it is released) by the next run
   B32 did_exec;                 // exec'd during the run in progress; traps written before must not be restored into the new image
+  B32 exec_pending;             // exec'd (its exception arrived under a new task port); the SIGTRAP at the new image's first instruction is still to come
+  B32 expect_sigstop;           // the SIGSTOP posted by PT_ATTACHEXC has not been seen yet (swallowed when it arrives; any other SIGSTOP is reported)
+  B32 expect_sigcont;           // we sent the process SIGCONT (initial continue, detach) and have not seen it yet (swallowed when it arrives)
   B32 needs_initial_continue;   // spawned start-suspended; first resume must also continue the BSD process
   U64 exit_code;
   U64 task_suspend_count;       // number of task_suspend() calls we must balance
@@ -298,6 +307,24 @@ struct MAC_DMN_ProcessSlot
   MAC_DMN_Process *last;
 };
 
+// rjf: the original instruction under a trap the demon wrote into the process at some point (forked
+// children inherit the trap instructions of the copy-on-write image; one which hits a trap of a run
+// since ended needs this to continue)
+typedef struct MAC_DMN_TrapHistoryNode MAC_DMN_TrapHistoryNode;
+struct MAC_DMN_TrapHistoryNode
+{
+  MAC_DMN_TrapHistoryNode *next;
+  U64 vaddr;
+  U64 size;
+  U8 bytes[8];
+};
+
+typedef struct MAC_DMN_TrapHistorySlot MAC_DMN_TrapHistorySlot;
+struct MAC_DMN_TrapHistorySlot
+{
+  MAC_DMN_TrapHistoryNode *first;
+};
+
 typedef struct MAC_DMN_ProcessCtx MAC_DMN_ProcessCtx;
 struct MAC_DMN_ProcessCtx
 {
@@ -311,6 +338,9 @@ struct MAC_DMN_ProcessCtx
   U64 ref_count;
   String8List free_reg_blocks;
   String8List free_reg_block_nodes;
+  U64 trap_history_slots_count;
+  MAC_DMN_TrapHistorySlot *trap_history_slots;
+  MAC_DMN_TrapHistoryNode *free_trap_history_node;
 };
 
 typedef struct MAC_DMN_Entity MAC_DMN_Entity;
@@ -399,11 +429,13 @@ struct MAC_DMN_State
   // rjf: symbol-only image files: their cache is swept once per session (see mac_dmn_debug_info_path_from_image)
   B32 images_cache_swept;
 
-  // rjf: traps of the run in progress (to restore inherited trap instructions in forked children)
-  DMN_TrapChunkList *run_traps;
-  U8 *run_trap_swap_bytes;
-  B8 *run_trap_is_written;
-  
+  // rjf: the hardware traps (watchpoints) of the run in progress, programmed into threads created during it
+  DMN_TrapChunkList *run_hw_traps;
+
+  // rjf: the thread whose exception event was handed to the engine last and is not answered yet: the
+  // ignore flag of the next full run (or of a single step of that thread) is about this exception
+  MAC_DMN_Thread *last_reported_exception_thread;
+
   // rjf: mach exception port / kqueue
   mach_port_t exception_port;
   mach_port_t port_set;
@@ -453,6 +485,9 @@ internal void mac_dmn_thread_release(MAC_DMN_Thread *thread);
 internal MAC_DMN_Module *mac_dmn_module_from_base_vaddr(MAC_DMN_ProcessCtx *ctx, U64 base_vaddr);
 internal MAC_DMN_Module *mac_dmn_module_alloc(MAC_DMN_ProcessCtx *ctx, U64 base_vaddr, U64 size, String8 path, U64 thread_vars_vaddr, B32 is_main, B32 is_dyld);
 internal void mac_dmn_module_release(MAC_DMN_ProcessCtx *ctx, MAC_DMN_Module *module);
+internal void mac_dmn_ctx_trap_history_record(MAC_DMN_ProcessCtx *ctx, U64 vaddr, U64 size, U8 *bytes);
+internal MAC_DMN_TrapHistoryNode *mac_dmn_ctx_trap_history_lookup(MAC_DMN_ProcessCtx *ctx, U64 vaddr);
+internal void mac_dmn_ctx_trap_history_clear(MAC_DMN_ProcessCtx *ctx);
 internal DMN_Handle mac_dmn_handle_from_entity(MAC_DMN_Entity *entity);
 internal DMN_Handle mac_dmn_handle_from_process(MAC_DMN_Process *process);
 internal DMN_Handle mac_dmn_handle_from_thread(MAC_DMN_Thread *thread);
@@ -475,10 +510,15 @@ internal B32  mac_dmn_thread_read_reg_block(MAC_DMN_Thread *thread);
 internal B32  mac_dmn_thread_write_reg_block(MAC_DMN_Thread *thread);
 internal B32  mac_dmn_thread_set_single_step(MAC_DMN_Thread *thread, B32 is_on);
 internal void mac_dmn_thread_reply_pending_exception(MAC_DMN_Thread *thread, B32 ignore_exception);
+internal void mac_dmn_answer_last_reported_exception(DMN_RunCtrls *ctrls);
+internal void mac_dmn_process_reply_for_run(MAC_DMN_Process *process);
 internal void mac_dmn_process_sync_threads(Arena *arena, DMN_EventList *events, MAC_DMN_Process *process, B32 report);
 internal void mac_dmn_process_suspend(MAC_DMN_Process *process);
 internal void mac_dmn_process_resume(MAC_DMN_Process *process);
-internal B32  mac_dmn_process_receive_exceptions(MAC_DMN_Process *process, U64 timeout_ms);
+internal B32  mac_dmn_process_receive_exceptions(U64 timeout_ms);
+internal B32  mac_dmn_any_unreported_stop(void);
+internal B32  mac_dmn_traps_have_hw_traps(DMN_TrapChunkList *traps, DMN_Handle process_handle);
+internal void mac_dmn_thread_set_hw_traps(MAC_DMN_Thread *thread, DMN_TrapChunkList *traps, B32 enable);
 
 ////////////////////////////////
 //~ rjf: Module / dyld Helpers
@@ -498,9 +538,9 @@ internal B32  mac_dmn_process_init_ctx(Arena *arena, DMN_EventList *events, MAC_
 
 internal B32  mac_dmn_unknown_task_restore_trap(MAC_DMN_ExceptionRaiseRequest *req);
 internal B32  mac_dmn_signo_is_escalation_of_exception(U64 signo, U64 exception_type);
-internal B32  mac_dmn_process_detect_exec(MAC_DMN_Process *process);
 internal void mac_dmn_process_handle_exec(Arena *arena, DMN_EventList *events, MAC_DMN_Process *process, MAC_DMN_Thread *thread);
 internal B32  mac_dmn_process_is_sstop(MAC_DMN_Process *process);
 internal void mac_dmn_process_continue_initial(MAC_DMN_Process *process);
+internal void mac_dmn_reap_detached_child_thread_entry(void *p);
 
 #endif // MAC_DEMON_H
