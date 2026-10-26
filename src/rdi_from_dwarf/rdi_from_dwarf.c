@@ -1346,6 +1346,11 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
                                tag.kind == DW_TagKind_ImmutableType ||
                                tag.kind == DW_TagKind_Member ||
                                tag.kind == DW_TagKind_FormalParameter ||
+                               // NOTE: array dimensions & enumerators live in child tags; without
+                               // their hashes every `int[N]` (and every anonymous enum) deduplicated
+                               // into the first one seen (all arrays of a type got the same count)
+                               tag.kind == DW_TagKind_SubrangeType ||
+                               tag.kind == DW_TagKind_Enumerator ||
                                tag.kind == DW_TagKind_Namespace);
           
           // rjf: get top hash seed
