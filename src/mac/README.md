@@ -286,7 +286,7 @@ Two rounds on an Apple Silicon Mac: first the "erratic stepping" of the Zig
 below; then, since the first real target hit this many issues, a sweep over
 everything that routes through platform code, done as six parallel efforts
 with their own sections and scripted checks: the converter conformance corpus
-(70 Mach-O binaries, "Converter conformance corpus"), the torture driver
+(74 Mach-O binaries, "Converter conformance corpus"), the torture driver
 ported to macOS ("Tests"), the scripted feature-flow suite (42 scenarios,
 "Scripted feature-flow suite"), IPC / dyld notification / `--pid` routing
 (this section), the arm64 unwinder ("Unwinding"), and the demon's process
@@ -611,28 +611,35 @@ impact:
   the function's declaration line (`start.zig:641` fragments between other
   lines); stepping visits them, as other debuggers do. After a step out onto
   the middle of a line, the line's remaining rows count as a new line (`U5`).
-* Converter: Swift functions directly under `DW_TAG_module` get no function
-  type (their inline sites neither); C++ member functions are named without
-  their class (`area`, not `Rect::area`); code the line program attributes to
-  an inlinee's line outside the site's ranges keeps that line in the enclosing
-  table.
+* Converter: inline sites keep the inlinee's bare name (`area`; procedures are
+  qualified through their containers, `geom::Rect::area`); an anonymous
+  namespace or class contributes an empty part to a qualified name
+  (`main::::operator()` for a lambda); `RDI_Member` has no bit fields, so a
+  bitfield reads as the byte holding its first bit with its storage unit's
+  width; code the line program attributes to an inlinee's line before its site
+  begins, or in a row of its own after it ended, keeps that line in the
+  enclosing table (the DWARF's attribution; see `RESULTS.md`); an RDI made
+  from the symbol table alone is marked (`[symbol table only]` in its
+  producer string) but `dbg_info.c` does not yet treat it as stale once a dSYM
+  or the debug map's objects turn up.
 * `dylib_host_O0` exits 0 without its final `printf` under the debugger
   (natively "host done 8", exit 8) after the second `dlclose`. `eval signo` at
   the first line of a signal handler is flaky (0 or 30).
 * A headless driver (the demon from a console program, the way `torture`
   does) would still be useful; the `--ipc` loop is the next best thing.
 
-## Converter conformance corpus (2026-10-25, night)
+## Converter conformance corpus (2026-10-25, night; 2026-10-26)
 
 `src/mac/tests/macho_corpus/` holds a Mach-O test corpus and a checker for the
 DWARF → RDI converter; `RESULTS.md` there is the table of the last run (with a
-hand-maintained findings section at the end).
+hand-maintained findings section at the end). 74 of 74 pass.
 
 * `build_corpus.sh [-o <dir>]` builds the matrix into a directory outside the
   repository (default `$TMPDIR/raddbg_macho_corpus`): C at `-O0`, `-O2`,
-  `-O3 -fomit-frame-pointer`, `-flto`, `-gdwarf-3`, `-gdwarf-4`, with relative
-  source paths, and with `DW_AT_call_file`/`DW_AT_call_line` stripped from the
-  inline sites (assembly rewrite); C++ (templates, virtual calls, exceptions,
+  `-O3 -fomit-frame-pointer`, `-flto`, `-gdwarf-2`, `-gdwarf-3`, `-gdwarf-4`,
+  with relative source paths, and with `DW_AT_call_file`/`DW_AT_call_line`
+  stripped from the inline sites (assembly rewrite); C++ (templates, virtual
+  calls, exceptions,
   lambdas) at `-O0`, `-O2`, `-flto`; a dylib with an executable linking it and
   one `dlopen()`ing it; a static library (`N_OSO` into the archive); threads
   with `_Thread_local`; large frames / VLAs / `alloca`; deep recursion; signal
@@ -640,7 +647,9 @@ hand-maintained findings section at the end).
   ReleaseSafe and ReleaseFast (`zig build --prefix ... --cache-dir ...`, the
   project is not touched); Rust (`split-debuginfo=unpacked`) and Swift. Every
   entry comes twice: with a `.dSYM` next to it, and as the bare executable with
-  only its debug map, so that `radbin` runs `dsymutil` itself.
+  only its debug map, so that `radbin` runs `dsymutil` itself. Two `symtab-*`
+  entries are `strip -S` copies (of `cprog-O2` and `libshape.dylib`): no debug
+  map, no DWARF, converted from `LC_SYMTAB` alone.
 * `python3 -I check_corpus.py [--build-dir <dir>] [--results RESULTS.md]`
   converts every binary with `build/radbin --rdi` and validates `radbin --dump`
   against `dwarfdump --debug-line` / `--debug-info` / `--uuid` of the dSYM (its
@@ -651,10 +660,31 @@ hand-maintained findings section at the end).
   while the enclosing tables carry `DW_AT_call_line`; tables are sorted,
   non-empty, inside the image and inside a DWARF sequence; procedures, lexical
   blocks and inline sites match the DIE tree structurally (ranges as voffs,
-  names, nesting); inline sites have function types; source line maps agree
-  with the tables; file-scope globals and thread-locals exist with their
-  addresses. 70 binaries take about 25 s; the largest (the Zig Debug
-  generator, 2.7 MB of DWARF) converts in 0.1 s.
+  names, nesting); procedures carry the fully qualified name of their
+  declaration (`geom::Rect::area`, `rustprog::{impl#0}::area`, from the
+  declaration's namespace / class parents; modules are transparent); inline
+  sites and procedures have function types; source line maps agree with the
+  tables; file-scope globals and thread-locals exist with their addresses;
+  named struct / class / union / enum definitions have UDTs with the DWARF's
+  member offsets (bitfields included), enumerator values and array counts
+  (`types`); the stripped copies' procedures are the `nm -n` code symbols
+  with the ranges up to the next symbol (`symtab`); on the C debug-map
+  entries a second `radbin` run reuses the generated dSYM and an empty file
+  planted at the cached DWARF path is removed and regenerated (`dsym_cache`).
+  74 binaries take about 30 s; the largest (the Zig Debug generator, 2.7 MB
+  of DWARF) converts in 0.1 s.
+
+  `is_stmt`: rows keep the flag; a row which is not a statement continues the
+  line before it in each table it lands in, a statement row begins a new entry
+  when its line or file differs. The checker verifies against
+  `dwarfdump --debug-line` (Apple's llvm-dwarfdump) that every statement row is
+  covered with its line and file by the right table, that the first entry of a
+  site's table is the line of the DWARF row at the site's start (statement or
+  not), that a statement row changing the line begins an entry at exactly its
+  address and a non-statement row begins none (except at a site's or a
+  sequence's start). On the Zig Debug generator this covers 42740 statement
+  rows, 8700 of them inside the 2358 inline sites; no statement row's line is
+  lost at a site start.
 
 Found by the corpus and fixed (`dwarf_parse.c`, `rdi_from_dwarf.c`,
 `macho_parse.c`, `radbin.c`):
@@ -693,12 +723,47 @@ Found by the corpus and fixed (`dwarf_parse.c`, `rdi_from_dwarf.c`,
   source paths, a comment added) shared an entry. The key now includes a hash
   of the debug map's object paths and modification times (`MACHO_Bin.debug_map_hash`).
 
-Open: Swift functions directly under `DW_TAG_module` get no function type (56
-of 84 procedures in `swiftprog-O`; struct methods do), so their inline sites
-have none either; the checker does not look at locals' locations or types;
-code that the line program attributes to an inlinee's line outside the site's
-ranges keeps that line in the enclosing table (the row-merging heuristic; a
-Rust `dealloc` example is in `RESULTS.md`).
+Second round (2026-10-26; `RESULTS.md` has the table of bugs 7-12):
+
+* Swift functions directly under `DW_TAG_module` had no function type (56 of
+  84 procedures of `swiftprog-O`, and 60 of their 268 inline sites): the type
+  pass gathered the children of namespaces, UDTs and functions only, and a
+  module's subtree was skipped through its sibling link. Zig's nested types
+  (`Io.Clock.Duration` under the enum `Io.Clock`, `Target.Cpu.Feature.Set`
+  under a zero-sized base type) were missing for the same reason, their
+  members' types nil. The children of every tag are visited now.
+* UDTs took every `DW_TAG_member` below their DIE, the members of nested types
+  included (Zig's `Target.Cpu` had `Target.Cpu.Model`'s `name`, `llvm_name`,
+  `features` as members of its own); only the direct children are members.
+* C++ member functions defined out of line were named without their class
+  (`area`): a symbol's container came from its DIE's parent, never from the
+  declaration's. The declaration's parents (recorded with each tag's hash,
+  which also fixes the one-level namespace chain: `std::__1`, not `__1`, and
+  nested UDTs' containers) qualify definitions reached through
+  `DW_AT_specification` / `DW_AT_abstract_origin`: `geom::Rect::area`,
+  `geom::Shape::s_live_count`, `rustprog::{impl#0}::area`, Swift `Rect::area`,
+  as `fully_qualified_str8_from_rdi_symbol` prints them. The in-class
+  declaration of a static data member no longer becomes a second,
+  location-less global.
+* Rows are no longer merged when decoded: a statement row repeating the line
+  of the row before it, beginning at an inline site's start, began outside the
+  site, so the code it covered past the site's end kept the inlinee's line in
+  the enclosing table (Rust `dealloc`). Contiguous pieces of one line merge
+  per table when the tables are built, which gives the same tables everywhere
+  else.
+* From the second review: `D2R_InlineRange` parent linking under partially
+  overlapping ranges, no inline sites inside abstract instances, bitfield and
+  `DW_OP_plus_uconst` member offsets, `DW_FORM_ref_addr` address-sized in
+  DWARF 2, no column data in line sequences (the baker expected pairs), dead
+  counters removed; `radbin`: dsymutil links into `<bundle>.tmp.<pid>` and
+  the bundle is published by a rename, a cached bundle is reused only when its
+  DWARF file is a Mach-O with the executable's UUID (else removed and
+  regenerated), `Foo.app.dSYM` next to an application bundle is found, RDIs
+  made from `LC_SYMTAB` alone carry `[symbol table only]` in their producer
+  string.
+
+Open: locals (locations, types) and type byte sizes are not checked; see the
+Converter bullet of "Open" above.
 ## Tests
 
 Demon checks: `zsh src/mac/tests/demon/run_all.sh` (settings in `common.sh`:
@@ -854,8 +919,8 @@ implementation):
   `DW_FORM_ref_addr`, which `dw2_reference_info_off_from_form_val` did not
   decode at all (`dwarf_parse.c`). The origin walk now starts at the
   specification and follows `ref_addr` references into other units (the
-  converter-corpus work above). The names are still unqualified (`area`, not
-  `Rect::area`): the container is not derived from the declaration's parent.
+  converter-corpus work above), and the declaration's class qualifies the name
+  (`geom::Rect::area`; "Converter conformance corpus", second round).
 * Soft signals neither stopped nor got delivered (`abort()` and `raise(SIGINT)`
   were filtered with `stop_cause: 0` and continued with
   `ignore_previous_exception`, so `raise(SIGINT)` returned and the process

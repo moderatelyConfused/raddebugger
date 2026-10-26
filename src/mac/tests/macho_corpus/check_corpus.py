@@ -21,7 +21,10 @@ Checks (one column each in the results table):
   line_rows      every is_stmt row (line != 0) of every DWARF line program is
                  covered by an entry with that line and file in the expected
                  table: the unit's, or, inside a DW_TAG_inlined_subroutine,
-                 the innermost site's
+                 the innermost site's; a statement row changing the line or
+                 file begins an entry at exactly its address, and a row which
+                 is not a statement begins none (its code continues the line
+                 before it), except at the start of a site or a sequence
   inline_lines   at addresses inside an inline site, each enclosing table
                  (the parent site's, finally the unit's) carries the call
                  site's DW_AT_call_line / DW_AT_call_file; where a row runs
@@ -34,7 +37,13 @@ Checks (one column each in the results table):
                  image's text and inside some DWARF sequence of their unit
   procedures     every concrete DW_TAG_subprogram has a procedure with its
                  name and exactly its ranges (as voffs), and vice versa; no
-                 procedure without ranges (abstract instances)
+                 procedure without ranges (abstract instances); the dump's
+                 fully qualified procedure name is the DW_AT_name of the
+                 subprogram (of its declaration, through DW_AT_specification /
+                 DW_AT_abstract_origin) under the names of the declaration's
+                 namespace / class / struct / union parents (`geom::Rect::area`,
+                 `rustprog::{impl#0}::area`; modules are transparent), unless a
+                 function encloses the declaration (a local type's members)
   scopes         every DW_TAG_lexical_block has a scope with its ranges at the
                  same place in the tree, under the right procedure
   inline_sites   every DW_TAG_inlined_subroutine has a scope marked as an
@@ -42,6 +51,9 @@ Checks (one column each in the results table):
                  nested under the scope of its parent site / block / procedure
   inline_types   every inline site's type is a function type (not the return
                  type)
+  proc_types     every procedure matched to a DW_TAG_subprogram has a function
+                 type (so that a type pass dropping a producer's function
+                 types fails here, not as an exemption)
   src_line_maps  every (line -> address) of every source line map is the
                  start of an entry with that line in a table of that file,
                  and every table entry appears in its file's map
@@ -49,6 +61,23 @@ Checks (one column each in the results table):
                  is a global variable with the matching voff
   tls            every DW_TAG_variable with a DW_OP_form_tls_address location
                  is a thread variable whose bytecode mentions its address
+  types          every named struct / class / union / enum definition outside
+                 functions has a UDT of its qualified name whose data members
+                 lie at DW_AT_data_member_location (a constant or a
+                 DW_OP_plus_uconst block; bitfields: the byte holding the
+                 DW_AT_data_bit_offset, or DW_AT_bit_offset from the storage
+                 unit's high end), whose enumerators have DW_AT_const_value,
+                 and whose array members (and global arrays) have the
+                 DW_TAG_subrange_type counts, dimension by dimension
+  symtab         (`stripped` rows: `strip -S` copies without debug map or
+                 DWARF) the RDI's procedures are the `nm -n` T/t symbols
+                 inside __TEXT,__text, each ending where the next symbol
+                 begins (or the section ends), and the guid is the LC_UUID;
+                 the DWARF-based columns are n/a
+  dsym_cache     (`debugmap` rows of the C programs) a second `radbin --rdi`
+                 run reuses the dSYM the first run generated into radbin's
+                 cache; an empty file planted at the cached DWARF path is not
+                 reused but removed and regenerated, to the same .rdi size
 
 Run with `python3 -I check_corpus.py [--build-dir D] [--radbin PATH]
 [--only GLOB] [--variant dsym|debugmap] [--results RESULTS.md] [--work DIR] [-v]`.
@@ -70,7 +99,7 @@ REPO = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
 MAX_REASONS = 6
 MAX_COLLECT = 60
 
-RDI_DUMP_OMIT = "data_sections,user_defined_types,name_maps,strings,constants,namespaces,local_variables,global_variables_vmap,unit_vmap,scope_vmap"
+RDI_DUMP_OMIT = "data_sections,name_maps,strings,constants,namespaces,local_variables,global_variables_vmap,unit_vmap,scope_vmap"
 
 
 def run(cmd, timeout=900, cwd=None):
@@ -284,7 +313,7 @@ def parse_debug_info(text):
 
 RE_PAREN_STR = re.compile(r'^\("(.*)"\)$', re.S)
 RE_PAREN_HEX = re.compile(r"^\((0x[0-9a-f]+)\)$")
-RE_PAREN_INT = re.compile(r"^\((\d+)\)$")
+RE_PAREN_INT = re.compile(r"^\((-?\d+)\)$")
 RE_REF = re.compile(r'^\((0x[0-9a-f]+)(?: "(.*)")?\)$', re.S)
 RE_RANGE = re.compile(r"\[0x([0-9a-f]+), 0x([0-9a-f]+)\)")
 
@@ -356,6 +385,55 @@ def die_linkage_name(die, by_off, seen=None):
             if r is not None:
                 return r
     return None
+
+
+def die_declaration(die, by_off):
+    """The last DIE of the DW_AT_abstract_origin / DW_AT_specification chain (the converter
+    follows the abstract origin first, then the specification, up to 8 hops): a definition's
+    declaration, whose parents qualify the name."""
+    seen = set()
+    d = die
+    while d.off not in seen and len(seen) < 9:
+        seen.add(d.off)
+        nxt = None
+        for ref in ("DW_AT_abstract_origin", "DW_AT_specification"):
+            off, _ = attr_ref(d, ref)
+            if off is not None and off in by_off:
+                nxt = by_off[off]
+                break
+        if nxt is None:
+            break
+        d = nxt
+    return d
+
+
+CONTAINER_TAGS = ("DW_TAG_namespace", "DW_TAG_structure_type", "DW_TAG_class_type", "DW_TAG_union_type")
+SCOPE_TAGS = ("DW_TAG_subprogram", "DW_TAG_lexical_block", "DW_TAG_inlined_subroutine")
+
+
+def qualified_name(die, by_off):
+    """(name, strict): DW_AT_name (of the declaration) under the names of the declaration's
+    namespace / class / struct / union parents, joined with `::` the way
+    fully_qualified_str8_from_rdi_symbol prints RDI containers (DW_TAG_module and the unit are
+    transparent; an anonymous namespace contributes an empty part). strict is False when a
+    function or block encloses the declaration: the converter then qualifies through the
+    function's scope and the (often anonymous) local type, which this does not model."""
+    name = die_name(die, by_off)
+    if name is None:
+        return None, False
+    parts = []
+    strict = True
+    p = die_declaration(die, by_off).parent
+    while p is not None and p.tag != "DW_TAG_compile_unit":
+        if p.tag in CONTAINER_TAGS:
+            parts.append(attr_str(p, "DW_AT_name") or "")
+        elif p.tag in SCOPE_TAGS:
+            strict = False
+            break
+        p = p.parent
+    parts.reverse()
+    parts.append(name)
+    return "::".join(parts), strict
 
 
 def die_ranges(die, base):
@@ -467,7 +545,11 @@ class RDI:
         self.scopes = {}             # idx -> Scope
         self.inline_sites = {}       # idx -> (name, line_table_idx, type_idx)
         self.type_kinds = {}         # idx -> kind string
+        self.type_nodes = {}         # idx -> {kind, byte_size, direct_type, array_count, udt, name}
+        self.udts = {}               # idx -> {name, self_type, members: {name: (kind, type_idx, off)}, enum_members: {name: value}}
+        self.udts_by_name = collections.defaultdict(list)   # qualified name -> [udt idx]
         self.globals = collections.defaultdict(list)   # name -> [voff or None]
+        self.global_types = collections.defaultdict(list)   # name -> [type_idx]
         self.thread_vars = {}        # name -> bytecode text
 
     def is_proc_root(self, sc):
@@ -551,6 +633,9 @@ def parse_rdi_dump(text):
     for m in re.finditer(r"^  '([^\n]*)': // global_variables\[(\d+)\]\n\s*\{(.*?)\n  \}", sec.get("GLOBAL VARIABLES", ""), re.S | re.M):
         voffs = [int(mm.group(1), 16) for mm in re.finditer(r"voff: (0x[0-9a-f]+)", m.group(3))]
         r.globals[m.group(1)].extend(voffs or [None])
+        mt = re.search(r"type_idx: (\d+)", m.group(3))
+        if mt:
+            r.global_types[m.group(1)].append(int(mt.group(1)))
 
     for m in re.finditer(r"^  '([^\n]*)': // thread_variables\[(\d+)\]\n\s*\{(.*?)\n  \}", sec.get("THREAD VARIABLES", ""), re.S | re.M):
         r.thread_vars[m.group(1)] = m.group(3)
@@ -558,8 +643,35 @@ def parse_rdi_dump(text):
     for m in re.finditer(r"\{ type_idx:\s*(\d+),\s*owner_type_idx:\s*(\d+),\s*line_table_idx:\s*(\d+),\s*name: '(.*)'\s*\} // inline_site\[(\d+)\]", sec.get("INLINE SITES", "")):
         r.inline_sites[int(m.group(5))] = (m.group(4), int(m.group(3)), int(m.group(1)))
 
-    for m in re.finditer(r"// type\[(\d+)\]\n\s*\{\n\s*kind: (\w*)", sec.get("TYPE NODES", "")):
-        r.type_kinds[int(m.group(1))] = m.group(2)
+    for m in re.finditer(r"// type\[(\d+)\]\n  \{\n(.*?)\n  \}", sec.get("TYPE NODES", ""), re.S):
+        fields = {}
+        for line in m.group(2).splitlines():
+            k, _, v = line.strip().partition(": ")
+            if k:
+                fields[k] = v.strip()
+
+        def num(key, default=0):
+            v = fields.get(key)
+            return int(v) if v is not None and v.isdigit() else default
+        tn = {"kind": fields.get("kind", ""), "byte_size": num("byte_size"),
+              "direct_type": num("constructed__direct_type", num("user_defined__direct_type")),
+              "array_count": num("constructed__array_count"), "udt": num("user_defined__udt"),
+              "name": fields.get("name", "").strip("'")}
+        r.type_nodes[int(m.group(1))] = tn
+        r.type_kinds[int(m.group(1))] = tn["kind"]
+
+    for m in re.finditer(r"// udt\[(\d+)\]\n  '(.*?)':\n  \{\n(.*?)\n  \}", sec.get("USER DEFINED TYPES", ""), re.S):
+        idx, name, body = int(m.group(1)), m.group(2), m.group(3)
+        u = {"name": name, "self_type": 0, "members": {}, "enum_members": {}}
+        mm = re.search(r"self_type: (\d+)", body)
+        if mm:
+            u["self_type"] = int(mm.group(1))
+        for mm in re.finditer(r"^      '(.*?)': \{ kind: (\w+), type: (\d+), off: (\d+) \}$", body, re.M):
+            u["members"].setdefault(mm.group(1), (mm.group(2), int(mm.group(3)), int(mm.group(4))))
+        for mm in re.finditer(r"^      '(.*?)': (\d+)$", body, re.M):
+            u["enum_members"].setdefault(mm.group(1), int(mm.group(2)))
+        r.udts[idx] = u
+        r.udts_by_name[name].append(idx)
 
     stack = []
     for line in sec.get("SCOPES", "").splitlines():
@@ -684,7 +796,9 @@ class Result:
 
 
 CHECKS = ["convert", "guid", "voff_max", "units", "line_rows", "inline_lines", "line_ranges",
-          "procedures", "scopes", "inline_sites", "inline_types", "src_line_maps", "globals", "tls"]
+          "procedures", "scopes", "inline_sites", "inline_types", "proc_types", "src_line_maps", "globals", "tls",
+          "types", "symtab", "dsym_cache"]
+DWARF_CHECKS = [c for c in CHECKS if c not in ("convert", "guid", "voff_max", "symtab", "dsym_cache")]
 
 
 class Reasons(list):
@@ -693,9 +807,13 @@ class Reasons(list):
             self.append(msg)
 
 
+NAMELESS_MATCHES = [0]   # DIEs without a name matched by position only (any RDI name accepted); per binary
+
+
 def names_match(rdi_name, name, linkage):
     """The RDI name against DW_AT_name (possibly qualified on either side) or the linkage name."""
     if name is None:
+        NAMELESS_MATCHES[0] += 1
         return True  # nameless DIE (Swift thunks, closures): any name, including none
     if not rdi_name:
         return False
@@ -734,6 +852,14 @@ def check_binary(row, args, res):
         return
     res.rdi_size = os.path.getsize(rdi_path)
     res.set("convert", [])
+    convert_log = out + err
+    NAMELESS_MATCHES[0] = 0
+
+    #- a stripped copy: symbol table only, nothing to compare DWARF against
+    if row["variant"] == "stripped":
+        check_symtab_only(row, args, res, img, exe, rdi_path, work, text_lo, text_hi)
+        return
+    res.set("symtab", [], na=True)
 
     #- reference dSYM
     dwarf = row["dsym_dwarf"]
@@ -782,36 +908,8 @@ def check_binary(row, args, res):
     def describe(entries):
         return ", ".join("line %d file %s" % (e[3], rdi_file_base(e[2])) for e in entries) or "nothing"
 
-    #- guid
-    reasons = Reasons()
-    if rdi.guid is None:
-        reasons.add("no guid in top_level_info")
-    elif rdi.guid != img.uuid:
-        reasons.add("guid %s != image LC_UUID %s" % (rdi.guid, img.uuid))
-    if dsym_uuid and img.uuid and dsym_uuid != img.uuid:
-        reasons.add("dSYM uuid %s != image uuid %s" % (dsym_uuid, img.uuid))
-    res.set("guid", reasons)
-
-    #- voff_max and the text section
-    reasons = Reasons()
-    if rdi.voff_max is None:
-        reasons.add("no voff_max")
-    else:
-        if rdi.voff_max < text_hi:
-            reasons.add("voff_max %#x < end of __TEXT,__text %#x" % (rdi.voff_max, text_hi))
-        hi_line = max([e[1] for t in rdi.line_tables.values() for e in t] or [0])
-        if hi_line > rdi.voff_max:
-            reasons.add("line table reaches %#x > voff_max %#x" % (hi_line, rdi.voff_max))
-        hi_scope = max([rg[1] for s in rdi.scopes.values() for rg in s.ranges] or [0])
-        if hi_scope > rdi.voff_max:
-            reasons.add("scope reaches %#x > voff_max %#x" % (hi_scope, rdi.voff_max))
-    text_secs = [s for s in rdi.sections if s[0] == "__TEXT,__text"]
-    if img.text is not None:
-        if not text_secs:
-            reasons.add("no __TEXT,__text binary section")
-        elif (text_secs[0][2], text_secs[0][3]) != (text_lo, text_hi):
-            reasons.add("__TEXT,__text section [%#x, %#x) != image [%#x, %#x)" % (text_secs[0][2], text_secs[0][3], text_lo, text_hi))
-    res.set("voff_max", reasons)
+    #- guid, voff_max and the text section
+    check_image_facts(res, rdi, img, text_lo, text_hi, dsym_uuid)
 
     #- units
     cus = [d for d in roots if d.tag == "DW_TAG_compile_unit"]
@@ -969,25 +1067,30 @@ def check_binary(row, args, res):
         all_row_addrs = [a for a, _ in all_rows]
 
         for sr in seq_rows:
-            merged_start = None   # start of the run of rows the converter merges into one (same file & line)
-            prev = None
+            seq_start = sr[0][0] - base
+            row_start = None     # start of the converter's current row
+            prev_row = None      # the previous row with a line (line, file): the line change at a row start
+            prev_was_zero = False
             for i in range(len(sr) - 1):
                 addr, line, col, fidx, flags = sr[i]
                 is_stmt = "is_stmt" in flags
-                # rows with line 0 are not rows to the converter: the previous row runs on across
-                # them; a row with the line and file of the row which began the current run does
-                # not begin a new one (unless it is a statement following a non-statement)
-                if line != 0 and (prev is None or prev[1] != line or prev[3] != fidx or (is_stmt and "is_stmt" not in prev[4])):
-                    merged_start = addr - base
-                    prev = sr[i]
-                if merged_start is None:
-                    merged_start = addr - base
+                # every row with a line is a row to the converter (contiguous pieces of one
+                # line merge per table, when it builds the tables); rows with line 0 are not:
+                # the previous row runs on across them
+                line_changed = False
+                if line != 0:
+                    line_changed = prev_row is not None and (prev_row[0] != line or prev_row[1] != fidx)
+                    row_start = addr - base
+                    prev_row = (line, fidx)
+                if row_start is None:
+                    row_start = addr - base
                 voff0, voff1 = addr - base, sr[i + 1][0] - base
                 if addr < base or voff1 <= voff0 or not (text_lo <= voff0 < text_hi):
+                    prev_was_zero = (line == 0)
                     continue
                 fpath = line_cu_file_path(lcu, fidx, comp_dir)
-                # the converter's "row" for the run-past rule begins where the merged run begins
-                row_inner = sweep.at(merged_start)
+                # the converter's row for the run-past rule begins at the DWARF row
+                row_inner = sweep.at(row_start)
                 p = voff0
                 while p < voff1:
                     nxt = sweep.next_point(p)
@@ -1006,6 +1109,22 @@ def check_binary(row, args, res):
                             row_reasons.add("row %#x line %d (%s) not in %s table; there: %s" % (
                                 p, line, os.path.basename(fpath or "?"),
                                 ("inlined %s's" % die_name(inner, by_off)) if inner is not None else "unit", describe(tbl.covering(p))))
+                        elif line_changed and not prev_was_zero and p != seq_start and sweep.at(p - 1) is inner \
+                                and not [e for e in tbl.covering(p - 1) if e[3] == line and file_matches(e[2], fpath)] \
+                                and not [e for e in tbl.covering(p) if e[0] == p]:
+                            # the line changed here, within one table: an entry begins exactly here
+                            row_reasons.add("row %#x line %d (%s): no entry of the %s table begins there; the one covering it begins at %#x" % (
+                                p, line, os.path.basename(fpath or "?"),
+                                ("inlined %s's" % die_name(inner, by_off)) if inner is not None else "unit", tbl.covering(p)[0][0]))
+                    if first and not is_stmt and line != 0 and not prev_was_zero and p != seq_start and prev_row is not None:
+                        # a row which is not a statement continues the line before it (per table):
+                        # no entry begins at it, unless it begins a site (the first piece of a table)
+                        tbl = site_table(inner) if inner is not None else unit_table
+                        site_start = inner is not None and any(lo == p for lo, hi in die_ranges_cached(inner))
+                        if tbl is not None and not site_start and sweep.at(p - 1) is inner and [e for e in tbl.covering(p) if e[0] == p]:
+                            row_reasons.add("non-statement row %#x line %d (%s) begins an entry of the %s table; it should continue the line before it (%s)" % (
+                                p, line, os.path.basename(fpath or "?"),
+                                ("inlined %s's" % die_name(inner, by_off)) if inner is not None else "unit", describe(tbl.covering(p - 1))))
                     # call lines in the enclosing tables
                     if row_inner is not None and inner is not row_inner and is_site_ancestor(inner, row_inner):
                         # the row began in a deeper site which has ended: `inner`'s table (or the unit's)
@@ -1020,6 +1139,7 @@ def check_binary(row, args, res):
                             parent = chain[k + 1] if k + 1 < len(chain) else None
                             expect_call(site_table(parent) if parent is not None else unit_table, p, child, parent)
                     p = q
+                prev_was_zero = (line == 0)
 
         # the first entry of a site's table: the line of the DWARF row at the site's start
         # (only where the site is the innermost one there; a deeper site beginning at the
@@ -1087,6 +1207,10 @@ def check_binary(row, args, res):
         name, linkage = die_name(d, by_off), die_linkage_name(d, by_off)
         if not names_match(sc.proc_name, name, linkage):
             reasons.add("subprogram %s %s: procedure there is named %r" % (name, fmt_ranges(die_ranges_cached(d)), sc.proc_name))
+        qname, strict = qualified_name(d, by_off)
+        pname = rdi.procedures.get(sc.proc_idx, ("", 0))[0]
+        if qname is not None and strict and pname != qname and pname != linkage:
+            reasons.add("subprogram %s %s: fully qualified name should be %r; the RDI has %r" % (name, fmt_ranges(die_ranges_cached(d)), qname, pname))
     for pidx, (pname, root) in rdi.procedures.items():
         sc = rdi.scopes.get(root)
         if pidx == 0 or sc is None:
@@ -1141,15 +1265,20 @@ def check_binary(row, args, res):
         if site[2] == 0 or kind not in ("Function", "Method"):
             type_reasons.add("inlined %s: type_idx %d is %s, not a function type" % (name, site[2], kind or "nil"))
     res.set("inline_sites", reasons, na=(n_sites == 0))
-    typed_procs = sum(1 for pidx, t in rdi.procedure_types.items() if pidx != 0 and t != 0)
-    if n_sites and typed_procs == 0 and len(rdi.procedures) > 1:
-        # the producer's function types are not converted at all (Swift): not a matter of the inline sites
-        res.notes.append("no procedure has a type either: function types of this producer are not converted; inline_types not judged")
-        type_reasons = Reasons()
-        n_sites_for_types = 0
-    else:
-        n_sites_for_types = n_sites
-    res.set("inline_types", type_reasons, na=(n_sites_for_types == 0))
+    res.set("inline_types", type_reasons, na=(n_sites == 0))
+
+    #- procedure types
+    reasons = Reasons()
+    for d in concrete:
+        sc = scope_of.get(id(d))
+        if sc is None:
+            continue
+        t = rdi.procedure_types.get(sc.proc_idx, 0)
+        kind = rdi.type_kinds.get(t)
+        if t == 0 or kind not in ("Function", "Method"):
+            reasons.add("subprogram %s %s: procedure type_idx %d is %s, not a function type" % (
+                die_name(d, by_off), fmt_ranges(die_ranges_cached(d)), t, kind or "nil"))
+    res.set("proc_types", reasons, na=(not concrete))
 
     #- source line maps
     reasons = Reasons()
@@ -1215,7 +1344,119 @@ def check_binary(row, args, res):
                 g_reasons.add("global %s: voff %#x not among %s" % (name, addr - base, ", ".join("%#x" % v if v is not None else "none" for v in voffs)))
     res.set("globals", g_reasons, na=(n_g == 0))
     res.set("tls", t_reasons, na=(n_t == 0))
-    res.notes.append("%d is_stmt rows (%d in inline sites), %d subprograms, %d inline sites, %d blocks" % (n_rows, n_inl_rows, len(concrete), n_sites, n_blocks))
+
+    #- types: UDT members, enumerators, array counts
+    reasons = Reasons()
+    n_types = 0
+
+    def type_die_of(d):
+        off, _ = attr_ref(d, "DW_AT_type")
+        return by_off.get(off) if off is not None else None
+
+    def array_dims(t):
+        dims = []
+        for c in t.children:
+            if c.tag == "DW_TAG_subrange_type":
+                cnt = attr_int(c, "DW_AT_count")
+                if cnt is None:
+                    ub = attr_int(c, "DW_AT_upper_bound")
+                    lb = attr_int(c, "DW_AT_lower_bound") or 0
+                    cnt = (ub - lb + 1) if ub is not None else None
+                dims.append(cnt)
+        return dims
+
+    def check_array(label, t, type_idx):
+        idx = type_idx
+        for k, cnt in enumerate(array_dims(t)):
+            tn = rdi.type_nodes.get(idx)
+            if tn is None or tn["kind"] != "Array":
+                reasons.add("%s: dimension %d: RDI type %d is %s, not an array" % (label, k, idx, tn["kind"] if tn else "missing"))
+                return
+            if cnt is not None and tn["array_count"] != cnt:
+                reasons.add("%s: dimension %d has %d elements in the DWARF, %d in the RDI" % (label, k, cnt, tn["array_count"]))
+                return
+            idx = tn["direct_type"]
+
+    def member_offset(c):
+        """The byte offset the converter derives for a data member (None: no offset given)."""
+        off = attr_int(c, "DW_AT_data_member_location")
+        if off is None and c.has("DW_AT_data_member_location"):
+            m = re.search(r"DW_OP_plus_uconst (0x[0-9a-f]+|\d+)", c.attr("DW_AT_data_member_location"))
+            off = int(m.group(1), 0) if m else None
+        dbo = attr_int(c, "DW_AT_data_bit_offset")
+        if dbo is not None:
+            return dbo // 8
+        if off is not None and c.has("DW_AT_bit_offset") and c.has("DW_AT_bit_size"):
+            bits = attr_int(c, "DW_AT_byte_size")
+            if bits is not None:
+                off += (bits * 8 - attr_int(c, "DW_AT_bit_offset") - attr_int(c, "DW_AT_bit_size")) // 8
+        return off
+
+    for d in by_off.values():
+        if d.tag not in ("DW_TAG_structure_type", "DW_TAG_class_type", "DW_TAG_union_type", "DW_TAG_enumeration_type") or d.has("DW_AT_declaration"):
+            continue
+        qname, strict = qualified_name(d, by_off)
+        if qname is None or not strict:
+            continue
+        n_types += 1
+        cands = [rdi.udts[i] for i in rdi.udts_by_name.get(qname, [])]
+        if not cands:
+            reasons.add("%s %s: no UDT of that name in the RDI" % (d.tag[7:], qname))
+            continue
+        if d.tag == "DW_TAG_enumeration_type":
+            vals = {}
+            for c in d.children:
+                nm, v = attr_str(c, "DW_AT_name"), attr_int(c, "DW_AT_const_value")
+                if c.tag == "DW_TAG_enumerator" and nm is not None and v is not None:
+                    vals[nm] = v & 0xffffffffffffffff
+            bad = []
+            for u in cands:
+                bad = [(k, v, u["enum_members"].get(k)) for k, v in vals.items() if u["enum_members"].get(k) != v]
+                if not bad:
+                    break
+            for k, v, got in bad[:3]:
+                reasons.add("enum %s: %s = %d in the DWARF, %s in the RDI" % (qname, k, v, got if got is not None else "missing"))
+            continue
+        expected = collections.OrderedDict()
+        for c in d.children:
+            nm = attr_str(c, "DW_AT_name")
+            if c.tag == "DW_TAG_member" and nm is not None and not c.has("DW_AT_declaration"):
+                expected[nm] = (member_offset(c) or 0, c)
+        # the UDT with the fewest differences stands for the type (the same qualified
+        # name may belong to several definitions); its members are exactly the DWARF
+        # type's own (not those of a type nested in it), at the DWARF offsets
+        chosen, bad, extra = cands[0], [], []
+        for u in cands:
+            u_bad = [(k, e[0], u["members"].get(k)) for k, e in expected.items() if u["members"].get(k) is None or u["members"][k][2] != e[0]]
+            u_extra = [k for k in u["members"] if k not in expected and k != ""]   # anonymous members (unions) have no name on either side
+            if u is cands[0] or len(u_bad) + len(u_extra) < len(bad) + len(extra):
+                chosen, bad, extra = u, u_bad, u_extra
+        for k, off, got in bad[:3]:
+            reasons.add("%s: member %s at offset %d in the DWARF, %s in the RDI" % (qname, k, off, ("offset %d" % got[2]) if got else "missing"))
+        if extra:
+            reasons.add("%s: RDI members %s are not members of the DWARF type (a nested type's?)" % (qname, ", ".join(sorted(extra)[:4])))
+        for nm, (off, c) in expected.items():
+            t = type_die_of(c)
+            if t is not None and t.tag == "DW_TAG_array_type" and nm in chosen["members"]:
+                check_array("%s::%s" % (qname, nm), t, chosen["members"][nm][1])
+    for d in by_off.values():
+        if d.tag != "DW_TAG_variable" or not d.has("DW_AT_location") or die_has_ancestor_tag(d, SCOPE_TAGS):
+            continue
+        t, nm = type_die_of(d), die_name(d, by_off)
+        if t is not None and t.tag == "DW_TAG_array_type" and nm is not None and rdi.global_types.get(nm):
+            n_types += 1
+            check_array("global %s" % nm, t, rdi.global_types[nm][0])
+    res.set("types", reasons, na=(n_types == 0))
+
+    #- the generated-dSYM cache (debugmap rows of the C programs: cheap to regenerate)
+    if row["variant"] == "debugmap" and row.get("lang") == "c":
+        check_dsym_cache(row, args, res, exe, work, rdi_path, convert_log)
+    else:
+        res.set("dsym_cache", [], na=True)
+
+    res.notes.append("%d is_stmt rows (%d in inline sites), %d subprograms, %d inline sites, %d blocks, %d types" % (n_rows, n_inl_rows, len(concrete), n_sites, n_blocks, n_types))
+    if NAMELESS_MATCHES[0]:
+        res.notes.append("%d nameless DIEs (closures, thunks) matched by ranges alone, any RDI name accepted" % NAMELESS_MATCHES[0])
 
 
 def nearest_site(die):
@@ -1223,6 +1464,144 @@ def nearest_site(die):
     while p is not None and p.tag != "DW_TAG_inlined_subroutine":
         p = p.parent
     return p
+
+
+def check_image_facts(res, rdi, img, text_lo, text_hi, dsym_uuid):
+    #- guid
+    reasons = Reasons()
+    if rdi.guid is None:
+        reasons.add("no guid in top_level_info")
+    elif rdi.guid != img.uuid:
+        reasons.add("guid %s != image LC_UUID %s" % (rdi.guid, img.uuid))
+    if dsym_uuid and img.uuid and dsym_uuid != img.uuid:
+        reasons.add("dSYM uuid %s != image uuid %s" % (dsym_uuid, img.uuid))
+    res.set("guid", reasons)
+
+    #- voff_max and the text section
+    reasons = Reasons()
+    if rdi.voff_max is None:
+        reasons.add("no voff_max")
+    else:
+        if rdi.voff_max < text_hi:
+            reasons.add("voff_max %#x < end of __TEXT,__text %#x" % (rdi.voff_max, text_hi))
+        hi_line = max([e[1] for t in rdi.line_tables.values() for e in t] or [0])
+        if hi_line > rdi.voff_max:
+            reasons.add("line table reaches %#x > voff_max %#x" % (hi_line, rdi.voff_max))
+        hi_scope = max([rg[1] for s in rdi.scopes.values() for rg in s.ranges] or [0])
+        if hi_scope > rdi.voff_max:
+            reasons.add("scope reaches %#x > voff_max %#x" % (hi_scope, rdi.voff_max))
+    text_secs = [s for s in rdi.sections if s[0] == "__TEXT,__text"]
+    if img.text is not None:
+        if not text_secs:
+            reasons.add("no __TEXT,__text binary section")
+        elif (text_secs[0][2], text_secs[0][3]) != (text_lo, text_hi):
+            reasons.add("__TEXT,__text section [%#x, %#x) != image [%#x, %#x)" % (text_secs[0][2], text_secs[0][3], text_lo, text_hi))
+    res.set("voff_max", reasons)
+
+
+def check_symtab_only(row, args, res, img, exe, rdi_path, work, text_lo, text_hi):
+    """A `strip -S` copy: the RDI comes from LC_SYMTAB alone; its procedures are the `nm -n` code
+    symbols inside __TEXT,__text, each running to the next symbol (or the section's end)."""
+    for c in DWARF_CHECKS:
+        res.set(c, [], na=True)
+    res.set("dsym_cache", [], na=True)
+    rc, dump, err, _ = run([args.radbin, "--dump", rdi_path, "--omit:" + RDI_DUMP_OMIT])
+    with open(os.path.join(work, "rdi_dump.txt"), "w") as f:
+        f.write(dump)
+    if rc != 0:
+        res.fail_all(["guid", "voff_max", "symtab"], "radbin --dump exit %d" % rc)
+        return
+    rdi = parse_rdi_dump(dump)
+    check_image_facts(res, rdi, img, text_lo, text_hi, None)
+    reasons = Reasons()
+    arch_args = ["-arch", args.arch] if img.is_fat else []
+    rc, nm_out, err, _ = run(["nm", "-n"] + arch_args + [exe])
+    if rc != 0:
+        reasons.add("nm failed: " + err.strip())
+        res.set("symtab", reasons)
+        return
+    by_addr = collections.OrderedDict()   # voff -> [names]
+    for line in nm_out.splitlines():
+        m = re.match(r"^([0-9a-f]+) ([Tt]) (\S+)$", line)
+        if not m:
+            continue
+        voff = int(m.group(1), 16) - img.base
+        if text_lo <= voff < text_hi:
+            by_addr.setdefault(voff, []).append(m.group(3))
+    starts = list(by_addr.keys())
+    procs = {}   # start voff -> (name, ranges)
+    for pidx, (pname, root) in rdi.procedures.items():
+        sc = rdi.scopes.get(root)
+        if pidx == 0 or sc is None or not sc.ranges:
+            continue
+        procs[sc.ranges[0][0]] = (pname, sc.ranges)
+    n = 0
+    for k, voff in enumerate(starts):
+        names = by_addr[voff]
+        end = starts[k + 1] if k + 1 < len(starts) else text_hi
+        n += 1
+        p = procs.get(voff)
+        if p is None:
+            reasons.add("symbol %s at %#x has no procedure beginning there" % ("/".join(names), voff))
+            continue
+        pname, ranges = p
+        if not any(pname == nm or pname == nm.lstrip("_") or nm == "_" + pname for nm in names):
+            reasons.add("procedure at %#x is named %r; the symbol table has %s" % (voff, pname, "/".join(names)))
+        if ranges != [(voff, end)]:
+            reasons.add("procedure %s: ranges %s; expected [%#x, %#x) (up to the next symbol)" % (pname, fmt_ranges(ranges), voff, end))
+    for voff, (pname, ranges) in procs.items():
+        if voff not in by_addr:
+            reasons.add("procedure %s %s begins at no code symbol" % (pname, fmt_ranges(ranges)))
+    res.set("symtab", reasons)
+    res.notes.append("%d code symbols in __TEXT,__text" % n)
+
+
+def check_dsym_cache(row, args, res, exe, work, rdi_path, first_log):
+    """debugmap rows: the second run reuses the dSYM the first one generated into radbin's cache;
+    an empty file planted at the cached DWARF path is removed and regenerated, not reused."""
+    reasons = Reasons()
+
+    def run_radbin(tag):
+        out_path = os.path.join(work, "cache_%s.rdi" % tag)
+        if os.path.exists(out_path):
+            os.remove(out_path)
+        rc, out, err, _ = run([args.radbin, "--rdi", exe, "--out:" + out_path, "--verbose"])
+        log = out + err
+        with open(os.path.join(work, "radbin_cache_%s.log" % tag), "w") as f:
+            f.write(log)
+        return rc, log, out_path
+
+    m = re.search(r"(?:dsymutil generated|Reusing previously generated dSYM at) (\S+)", first_log)
+    if not m:
+        reasons.add("the conversion neither generated nor reused a cached dSYM (no such line in its log)")
+        res.set("dsym_cache", reasons)
+        return
+    cached = m.group(1)
+    rc, log2, out2 = run_radbin("reuse")
+    if rc != 0:
+        reasons.add("second run: radbin exit %d" % rc)
+    elif ("Reusing previously generated dSYM at " + cached) not in log2:
+        reasons.add("second run did not reuse %s" % cached)
+    try:
+        with open(cached, "wb"):
+            pass   # an empty file where the DWARF was: a half-written bundle, or a planted one
+    except OSError as e:
+        reasons.add("could not plant an empty DWARF file at %s: %s" % (cached, e))
+        res.set("dsym_cache", reasons)
+        return
+    rc, log3, out3 = run_radbin("planted")
+    if rc != 0:
+        reasons.add("run with the planted file: radbin exit %d" % rc)
+    if "Reusing previously generated dSYM" in log3:
+        reasons.add("the empty DWARF file at %s was reused" % cached)
+    if "is not usable" not in log3 or "dsymutil generated" not in log3:
+        reasons.add("the empty DWARF file at %s was not removed and regenerated (log: %s)" % (
+            cached, "; ".join(l for l in log3.splitlines() if "dsym" in l.lower())[:300]))
+    if rc == 0 and os.path.exists(out3) and os.path.exists(rdi_path) and os.path.getsize(out3) != os.path.getsize(rdi_path):
+        reasons.add("the .rdi regenerated after the planted file has %d bytes, the first one %d" % (os.path.getsize(out3), os.path.getsize(rdi_path)))
+    if not os.path.exists(cached) or os.path.getsize(cached) == 0:
+        reasons.add("no regenerated DWARF file at %s" % cached)
+    res.set("dsym_cache", reasons)
 
 
 ################################################################################
@@ -1313,7 +1692,7 @@ def write_results(path, rows, results, args, total_time):
         seen.add(row["name"])
         lines.append("| %s | %s | %s | %s | %s | %s |" % (row["name"], row["lang"], row["cfg"], row["kind"], row["arch"], row.get("notes", "")))
     lines.append("")
-    lines.append("Every entry comes in two variants: `dsym` (a `.dSYM` bundle next to the executable) and `debugmap` (no bundle: radbin runs `dsymutil` itself on the executable's `N_OSO` debug map; the checker generates its own reference dSYM).")
+    lines.append("Every entry comes in two variants: `dsym` (a `.dSYM` bundle next to the executable) and `debugmap` (no bundle: radbin runs `dsymutil` itself on the executable's `N_OSO` debug map; the checker generates its own reference dSYM); the `symtab-*` entries are `stripped` copies (`strip -S`: no debug map, no DWARF), converted from the symbol table and checked against `nm -n` only.")
     lines.append("")
     lines.append("## Per-binary notes")
     lines.append("")

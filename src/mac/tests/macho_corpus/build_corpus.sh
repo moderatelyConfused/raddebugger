@@ -9,6 +9,7 @@
 #   <build>/<name>/obj/            object files (the debug map's N_OSO entries point here)
 #   <build>/<name>/dsym/<exe>      + <exe>.dSYM next to it (dsymutil run by this script)
 #   <build>/<name>/debugmap/<exe>  the same executable without a dSYM (radbin runs dsymutil itself)
+#   <build>/symtab-*/stripped/<exe> a `strip -S` copy (no debug map, no DWARF: symbol table only)
 # and <build>/manifest.tsv, one row per (entry, variant):
 #   name  lang  cfg  kind  variant  exe  dsym_dwarf  arch  notes
 # where dsym_dwarf is the DWARF file inside the bundle, or `-` for debug-map rows.
@@ -131,6 +132,10 @@ f_O2dw3=(-g -O2 -gdwarf-3)
 f_O2dw4=(-g -O2 -gdwarf-4)
 build_exe cprog-O2dw3 c O2dw3 "$cc" f_O2dw3 l_none "${cprog_srcs[@]}"
 build_exe cprog-O2dw4 c O2dw4 "$cc" f_O2dw4 l_none "${cprog_srcs[@]}"
+# v2: DW_FORM_ref_addr is address-sized (dsymutil's ODR uniquing emits them), .debug_ranges
+typeset -a f_O2dw2
+f_O2dw2=(-g -O2 -gdwarf-2)
+build_exe cprog-O2dw2 c O2dw2 "$cc" f_O2dw2 l_none "${cprog_srcs[@]}"
 
 # inline sites without DW_AT_call_file / DW_AT_call_line: compile to assembly and
 # rename those two attributes in the abbreviations (same forms, so the DIE data
@@ -205,6 +210,24 @@ for cfg in O0 O2; do
     done
   fi
 done
+
+#-- symbol table only ------------------------------------------------------------
+# `strip -S` removes the debug map (there is no DWARF in the image anyway): radbin
+# converts LC_SYMTAB alone; the checker compares the procedures with `nm -n`
+# (manifest variant `stripped`, no reference dSYM)
+stripped_row() {
+  local name="$1" lang="$2" cfg="$3" kind="$4" src_exe="$5" notes="$6"
+  want "$name" || return 0
+  [[ -f "$src_exe" ]] || { note "[$name] skipped: $src_exe missing"; return 0; }
+  echo "[$name]"
+  local exe="${src_exe:t}"
+  rm -rf "$build/$name"; mkdir -p "$build/$name/stripped"
+  cp "$src_exe" "$build/$name/stripped/$exe"
+  strip -S "$build/$name/stripped/$exe"
+  tsv_row "$name" "$lang" "$cfg" "$kind" stripped "$build/$name/stripped/$exe" - arm64 "$notes"
+}
+stripped_row symtab-cprog c O2 exe "$build/cprog-O2/obj/cprog" "strip -S of cprog-O2: symbol table only"
+stripped_row symtab-libshape c O2 dylib "$build/dylib-O2/obj/libshape.dylib" "strip -S of dylib-O2's libshape.dylib: symbol table only"
 
 #-- static library ----------------------------------------------------------------
 for cfg in O0 O2; do
