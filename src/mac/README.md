@@ -407,7 +407,7 @@ below; then, since the first real target hit this many issues, a sweep over
 everything that routes through platform code, done as six parallel efforts
 with their own sections and scripted checks: the converter conformance corpus
 (74 Mach-O binaries, "Converter conformance corpus"), the torture driver
-ported to macOS ("Tests"), the scripted feature-flow suite (48 scenarios,
+ported to macOS ("Tests"), the scripted feature-flow suite (54 scenario runs,
 "Scripted feature-flow suite"), IPC / dyld notification / `--pid` routing
 (this section), the arm64 unwinder ("Unwinding"), and the demon's process
 control (detach, fork, exec, signals, frozen threads, thread exits; "Demon"
@@ -1089,8 +1089,14 @@ codes), plus `NOTE` lines for observations without a verdict.
 
 ### Results and findings (2026-10-25, this branch)
 
-Last full run: see the merged-tree summary at the end of this section (the
-per-branch numbers of the day's rounds are superseded). Every failure below is a
+Last full run on the merged tree (2026-10-26, after all of the day's rounds):
+446 checks passed, 15 failed, 54 scenario runs in 181 s. The 15 are the open
+items recorded below and in "Status and open issues": step out of a signal
+handler and step over `longjmp` (4), the inline-sequence items `F1`/`F2`/`F4b`
+(6), `D3`'s `write` breakpoint (2: `printf` reaches `write$NOCANCEL`, and the
+unqualified name is ambiguous between dyld's and libsystem_kernel's `write`),
+`D6`'s exec of a platform binary (2, an OS limit), and `U5`'s thread-local
+read after the first access (1). Every failure below is a
 recorded bug or observation; scenarios fully passing include
 launch/kill/restart/exit, the breakpoint flows (line, inline line, dylib
 before load, address, condition, hit counts, toggle/remove, function name
