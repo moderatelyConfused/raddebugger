@@ -18,10 +18,15 @@
 #   - running the dlopen/dlclose loop -> the plugin produces LoadModule and UnloadModule
 #     events (dynamic, via the notification trap).
 #   - the "synthesized at stops" fallback message is no longer emitted.
-# Informational: a breakpoint on `write` (a shared-cache libsystem_kernel function) is
-#   attempted. libsystem_kernel is now discovered, but resolving a function breakpoint
-#   there also needs Mach-O-symbol-table -> RDI conversion for no-DWARF modules, which
-#   the converter (rdi_from_macho.c) does not yet do, so this is reported, not required.
+#   - a breakpoint on `write` (a shared-cache libsystem_kernel function) resolves and
+#     hits, and the frames of the shared-cache libraries on the stack are named. Those
+#     images have no file of their own on disk and no DWARF: the demon writes a
+#     symbol-only copy of each in-memory image into the debugger's cache
+#     (<cache>/raddbg/images/<UUID>/<name>) and reports it as the module's debug info,
+#     and the converter turns its LC_SYMTAB into RDI procedures (rdi_from_macho.c). The
+#     conversion is asynchronous, so the test first waits for `eval write` to resolve
+#     (a function breakpoint added before the name is known is never armed: a separate,
+#     known engine gap).
 #
 # Breakpoints are symbol-based (main): a freshly built binary's DWARF is converted
 # asynchronously on first load, so a source-line breakpoint can be missed before this
@@ -48,6 +53,7 @@ cat > $S/src/dlhost.c <<'EOF'
 #include <unistd.h>
 int main(void)
 {
+  write(1, "dlhost start (write)\n", 21); /* stdio's own output goes through write$NOCANCEL, not write */
   printf("dlhost start\n");
   for(int i = 0; i < 3; i += 1)
   {
@@ -125,22 +131,37 @@ echo "plugin dynamic events: libplugin mentions=$pl  UnloadModule events=$n_unlo
 [[ "$pl" -ge 2 ]]       || { echo "FAIL: dlopen'd plugin not reported repeatedly (mentions=$pl)"; fails=$((fails+1)); }
 [[ "$n_unload" -ge 1 ]] || { echo "FAIL: no UnloadModule (dlclose) event"; fails=$((fails+1)); }
 
-echo "=== informational: breakpoint on a shared-cache function (write) ==="
+echo "=== breakpoint on a shared-cache function (write): symbol table -> RDI ==="
 start_instance
 ipc add_target "$DL/dlhost" >/dev/null 2>&1
 ipc add_function_breakpoint main >/dev/null 2>&1
 sc=$(run_to_stop 0)
+# the symbol-only images are converted asynchronously after the modules load; wait for the name
+resolved=0
+for i in $(seq 1 100); do ipc eval write | grep -q "could not be found" || { resolved=1; break; }; sleep 0.1; done
+echo "eval write -> $(ipc eval write | grep -m1 'value\|msgs\|could not' | tr -d '\n')"
+[[ $resolved -eq 1 ]] || { echo "FAIL: eval write did not resolve within 10s"; fails=$((fails+1)); }
+dbgi=$(ipc state | sed -n '/^ modules:/,/^ selected_thread:/p' | grep -A3 'libsystem_kernel.dylib' | grep -m1 'debug_info\|dbg' | tr -s ' ')
+[[ -n "$dbgi" ]] && echo "libsystem_kernel debug info:$dbgi"
 ipc add_function_breakpoint write >/dev/null 2>&1
 sc=$(run_to_stop $sc)
-sym=$(echo "$(ipc state)" | grep -m1 ip_voff_symbol | cut -d'"' -f2)
-mod=$(echo "$(ipc state)" | grep -m1 ip_module | cut -d'"' -f2)
-if [[ "$sym" == *write* || "$mod" == *libsystem_kernel* ]]; then
-  echo "INFO: write breakpoint hit (module=\"$mod\" symbol=\"$sym\")"
-else
-  echo "INFO: write breakpoint did not resolve (module=\"$mod\" symbol=\"$sym\"): libsystem_kernel is"
-  echo "      discovered as a module, but function-breakpoint resolution in a no-DWARF shared-cache"
-  echo "      module also needs Mach-O-symtab -> RDI conversion (rdi_from_macho.c), a separate change."
-fi
+st=$(ipc state)
+sym=$(echo "$st" | grep -m1 ip_voff_symbol | cut -d'"' -f2)
+mod=$(echo "$st" | grep -m1 ip_module | cut -d'"' -f2)
+stack=$(echo "$st" | sed -n '/^ call_stack:/,/^ breakpoints:/p' | grep '   symbol' | cut -d'"' -f2 | tr '\n' ' ')
+frames_mods=$(echo "$st" | sed -n '/^ call_stack:/,/^ breakpoints:/p' | grep '   module:' | cut -d'"' -f2 | tr '\n' ' ')
+echo "write breakpoint stop: module=\"$mod\" symbol=\"$sym\""
+echo "call stack: $stack"
+echo "frame modules: $frames_mods"
+if [[ "$sym" == write* && "$mod" == *libsystem_kernel* ]]; then echo "OK: write breakpoint hit in libsystem_kernel"
+else echo "FAIL: write breakpoint did not hit in libsystem_kernel (module=\"$mod\" symbol=\"$sym\")"; fails=$((fails+1)); fi
+# NOTE: `write` is a frameless syscall stub without a compact unwind entry; stopped at its entry the
+# unwinder falls back to the frame-pointer chain and skips the caller (stack "write start", no main),
+# where lldb applies its at-function-entry rule (pc = lr). An unwinder follow-up, recorded, not required.
+[[ "$stack" == *main* ]] && echo "OK: main on the call stack at write" || echo "NOTE: main missing from the call stack at write (unwinder: frameless stub at entry)"
+# every frame is named: the shared-cache libraries' procedures come from their symbol tables
+unnamed=$(echo "$st" | sed -n '/^ call_stack:/,/^ breakpoints:/p' | grep '   symbol' | grep -c '???\|""')
+[[ "$unnamed" -eq 0 ]] || { echo "FAIL: $unnamed unnamed frame(s) in the call stack at write"; fails=$((fails+1)); }
 
 pgrep -f "raddbg --ipc_port:$P" | xargs kill -9 2>/dev/null
 pgrep -fl dlhost | awk '{print $1}' | xargs kill -9 2>/dev/null

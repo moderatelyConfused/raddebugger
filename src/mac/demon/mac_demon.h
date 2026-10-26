@@ -351,6 +351,18 @@ struct MAC_DMN_ImageInfo
   U64 symtab_count;
   U64 strtab_vaddr;
   U64 strtab_size;
+  // rjf: LC_FUNCTION_STARTS (in-memory address)
+  U64 function_starts_vaddr;
+  U64 function_starts_size;
+};
+
+// rjf: a symbol kept in a symbol-only image file (see mac_dmn_symbol_image_from_image)
+typedef struct MAC_DMN_KeptSymbol MAC_DMN_KeptSymbol;
+struct MAC_DMN_KeptSymbol
+{
+  U32 strx;    // n_strx in the debuggee's string table
+  U32 sym_idx; // index into the image's nlist array
+  String8 name;
 };
 
 ////////////////////////////////

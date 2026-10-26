@@ -204,6 +204,8 @@ mac_dmn_image_info_from_header_vaddr(mach_port_t task, U64 header_vaddr)
     B32 got_linkedit = 0;
     struct symtab_command symtab = {0};
     B32 got_symtab = 0;
+    struct linkedit_data_command function_starts = {0};
+    B32 got_function_starts = 0;
     U64 entry_voff = 0;
     U64 unixthread_pc = 0;
     B32 got_unixthread = 0;
@@ -277,7 +279,9 @@ mac_dmn_image_info_from_header_vaddr(mach_port_t task, U64 header_vaddr)
         {
           struct uuid_command uuid = {0};
           MemoryCopy(&uuid, cmds + off, sizeof(uuid));
-          MemoryCopy(info.uuid.v, uuid.uuid, sizeof(info.uuid.v));
+          // rjf: same Guid form as the Mach-O parser's (`macho_uuid_from_file_path`, the
+          // converter's RDI guid), so the two compare and print alike
+          info.uuid = macho_guid_from_uuid_bytes(uuid.uuid);
         }break;
         case LC_MAIN:
         if(lc.cmdsize >= sizeof(struct entry_point_command))
@@ -301,6 +305,12 @@ mac_dmn_image_info_from_header_vaddr(mach_port_t task, U64 header_vaddr)
         {
           MemoryCopy(&symtab, cmds + off, sizeof(symtab));
           got_symtab = 1;
+        }break;
+        case LC_FUNCTION_STARTS:
+        if(lc.cmdsize >= sizeof(struct linkedit_data_command))
+        {
+          MemoryCopy(&function_starts, cmds + off, sizeof(function_starts));
+          got_function_starts = 1;
         }break;
       }
       off += lc.cmdsize;
@@ -369,6 +379,11 @@ mac_dmn_image_info_from_header_vaddr(mach_port_t task, U64 header_vaddr)
       info.strtab_vaddr = linkedit_vmaddr + slide + (symtab.stroff - linkedit_fileoff);
       info.strtab_size  = symtab.strsize;
     }
+    if(got_function_starts && got_linkedit && function_starts.dataoff >= linkedit_fileoff && function_starts.datasize != 0)
+    {
+      info.function_starts_vaddr = linkedit_vmaddr + slide + (function_starts.dataoff - linkedit_fileoff);
+      info.function_starts_size  = function_starts.datasize;
+    }
   }
   scratch_end(scratch);
   return info;
@@ -403,6 +418,348 @@ mac_dmn_symbol_vaddr_from_image(mach_port_t task, MAC_DMN_ImageInfo *image, Stri
     }
     scratch_end(scratch);
   }
+  return result;
+}
+
+////////////////////////////////
+//~ rjf: Symbol-Only Image Files (debug info for images without a file of their own)
+//
+// Images in the dyld shared cache have no file on disk on modern macOS
+// (`/usr/lib/libSystem.B.dylib` does not exist; the image and its `__LINKEDIT`
+// live in the cache mapping of the debuggee), and for the few that are still
+// shipped as files the debuggee runs the cache's copy, not the file. Their
+// symbol tables are reachable through the task port, though: `LC_SYMTAB`'s
+// cache-relative offsets map into memory through the `__LINKEDIT` segment the
+// same way `mac_dmn_image_info_from_header_vaddr` computes the symtab
+// addresses. So for an image whose path is not a file with its UUID, the
+// demon writes a symbol-only Mach-O into the debugger's cache (the in-memory
+// header and load commands, with the defined symbols, their names and the
+// function starts appended, and every other `__LINKEDIT` reference dropped),
+// keyed by UUID and written once, and reports it as the module's debug info
+// path. The converter then handles it like any Mach-O without DWARF
+// (`rdi_from_macho.c`). Alternatives considered: the shared cache files under
+// /System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/ hold the same
+// data, but finding an image's symbols there means parsing the cache header,
+// image and mapping tables across the sub-cache files for the exact cache the
+// debuggee maps, a format that changes between releases; the memory route
+// reuses the parsing the demon already does for every image.
+
+internal int
+mac_dmn_kept_symbol_compare(MAC_DMN_KeptSymbol *a, MAC_DMN_KeptSymbol *b)
+{
+  int result = 0;
+  if(0){}
+  else if(a->strx < b->strx) { result = -1; }
+  else if(a->strx > b->strx) { result = +1; }
+  return result;
+}
+
+internal B32
+mac_dmn_symbol_image_keeps_load_command(U32 cmd, B32 has_function_starts)
+{
+  B32 result = 1;
+  switch(cmd)
+  {
+    default:{}break;
+    // rjf: references into __LINKEDIT other than the symbol table & function starts
+    case LC_DYSYMTAB:
+    case LC_DYLD_INFO:
+    case LC_DYLD_INFO_ONLY:
+    case LC_CODE_SIGNATURE:
+    case LC_SEGMENT_SPLIT_INFO:
+    case LC_DATA_IN_CODE:
+    case LC_DYLIB_CODE_SIGN_DRS:
+    case LC_LINKER_OPTIMIZATION_HINT:
+    case LC_ENCRYPTION_INFO_64:
+#if defined(LC_DYLD_EXPORTS_TRIE)
+    case LC_DYLD_EXPORTS_TRIE:
+#endif
+#if defined(LC_DYLD_CHAINED_FIXUPS)
+    case LC_DYLD_CHAINED_FIXUPS:
+#endif
+#if defined(LC_ATOM_INFO)
+    case LC_ATOM_INFO:
+#else
+    case 0x36:
+#endif
+    {
+      result = 0;
+    }break;
+    case LC_FUNCTION_STARTS:
+    {
+      result = has_function_starts;
+    }break;
+  }
+  return result;
+}
+
+internal String8
+mac_dmn_symbol_image_from_image(Arena *arena, mach_port_t task, MAC_DMN_ImageInfo *image)
+{
+  String8 result = {0};
+  if(!image->valid || image->symtab_vaddr == 0 || image->symtab_count == 0 || image->strtab_vaddr == 0 || image->strtab_size == 0)
+  {
+    return result;
+  }
+  Temp scratch = scratch_begin(&arena, 1);
+
+  //- rjf: read header & load commands
+  struct mach_header_64 hdr = {0};
+  U8 *cmds = 0;
+  U64 cmds_size = 0;
+  if(mac_dmn_read_struct(task, image->header_vaddr, &hdr) == sizeof(hdr) && hdr.magic == MH_MAGIC_64 && hdr.sizeofcmds != 0 && hdr.sizeofcmds <= MB(16))
+  {
+    cmds_size = hdr.sizeofcmds;
+    cmds = push_array_no_zero(scratch.arena, U8, cmds_size);
+    if(mac_dmn_read(task, r1u64(image->header_vaddr + sizeof(hdr), image->header_vaddr + sizeof(hdr) + cmds_size), cmds) != cmds_size)
+    {
+      cmds = 0;
+    }
+  }
+
+  //- rjf: read the symbol table; keep the defined section symbols
+  U64 sym_count = Min(image->symtab_count, (U64)(1<<22));
+  struct nlist_64 *syms = push_array_no_zero(scratch.arena, struct nlist_64, sym_count);
+  U64 syms_read = mac_dmn_read(task, r1u64(image->symtab_vaddr, image->symtab_vaddr + sym_count*sizeof(struct nlist_64)), syms);
+  sym_count = syms_read / sizeof(struct nlist_64);
+  MAC_DMN_KeptSymbol *kept = push_array_no_zero(scratch.arena, MAC_DMN_KeptSymbol, sym_count);
+  U64 kept_count = 0;
+  for EachIndex(idx, sym_count)
+  {
+    struct nlist_64 *sym = &syms[idx];
+    if((sym->n_type & N_STAB) != 0)      { continue; }
+    if((sym->n_type & N_TYPE) != N_SECT) { continue; }
+    if(sym->n_un.n_strx == 0 || sym->n_un.n_strx >= image->strtab_size) { continue; }
+    kept[kept_count].strx    = sym->n_un.n_strx;
+    kept[kept_count].sym_idx = (U32)idx;
+    kept[kept_count].name    = str8_zero();
+    kept_count += 1;
+  }
+
+  //- rjf: read the names. in the shared cache the string table is the pool shared
+  // by every image (tens of MB), so read runs around the offsets this image's
+  // symbols use (sorted; a run spans at most 64KB of starts plus a 4KB tail)
+  // rather than the whole table.
+  if(cmds != 0 && kept_count != 0)
+  {
+    quick_sort(kept, kept_count, sizeof(MAC_DMN_KeptSymbol), mac_dmn_kept_symbol_compare);
+    for(U64 idx = 0; idx < kept_count;)
+    {
+      U64 run_first = kept[idx].strx;
+      U64 run_last_idx = idx;
+      while(run_last_idx + 1 < kept_count && kept[run_last_idx + 1].strx - run_first <= KB(64))
+      {
+        run_last_idx += 1;
+      }
+      U64 run_opl = Min(kept[run_last_idx].strx + KB(4), image->strtab_size);
+      U8 *buf = push_array_no_zero(scratch.arena, U8, run_opl - run_first);
+      U64 buf_size = mac_dmn_read(task, r1u64(image->strtab_vaddr + run_first, image->strtab_vaddr + run_opl), buf);
+      for(U64 k = idx; k <= run_last_idx; k += 1)
+      {
+        U64 off = kept[k].strx - run_first;
+        String8 name = {0};
+        if(off < buf_size)
+        {
+          name = str8_cstring_capped(buf + off, buf + buf_size);
+        }
+        if(off + name.size >= buf_size)
+        {
+          // rjf: no terminator inside the run -> read this name on its own
+          name = mac_dmn_read_string_capped(scratch.arena, task, image->strtab_vaddr + kept[k].strx, KB(4));
+        }
+        kept[k].name = name;
+      }
+      idx = run_last_idx + 1;
+    }
+  }
+
+  //- rjf: read function starts
+  String8 function_starts = {0};
+  if(image->function_starts_vaddr != 0 && image->function_starts_size != 0 && image->function_starts_size <= MB(16))
+  {
+    U8 *buf = push_array_no_zero(scratch.arena, U8, image->function_starts_size);
+    U64 read_size = mac_dmn_read(task, r1u64(image->function_starts_vaddr, image->function_starts_vaddr + image->function_starts_size), buf);
+    function_starts = str8(buf, read_size);
+  }
+
+  //- rjf: lay out the file: header, load commands, symbols, strings, function starts
+  if(cmds != 0 && kept_count != 0)
+  {
+    // rjf: pass 1: size of the load commands we keep
+    U64 out_cmds_size = 0;
+    U32 out_ncmds = 0;
+    for(U64 off = 0, cmd_idx = 0; cmd_idx < hdr.ncmds && off + sizeof(struct load_command) <= cmds_size; cmd_idx += 1)
+    {
+      struct load_command lc = {0};
+      MemoryCopy(&lc, cmds + off, sizeof(lc));
+      if(lc.cmdsize < sizeof(lc) || off + lc.cmdsize > cmds_size)
+      {
+        break;
+      }
+      if(mac_dmn_symbol_image_keeps_load_command(lc.cmd, function_starts.size != 0))
+      {
+        out_cmds_size += lc.cmdsize;
+        out_ncmds += 1;
+      }
+      off += lc.cmdsize;
+    }
+    U64 syms_off  = AlignPow2(sizeof(hdr) + out_cmds_size, 8);
+    U64 strs_off  = syms_off + kept_count*sizeof(struct nlist_64);
+    U64 strs_size = 1; // offset 0 is the empty name
+    for EachIndex(idx, kept_count)
+    {
+      strs_size += kept[idx].name.size + 1;
+    }
+    U64 fs_off     = AlignPow2(strs_off + strs_size, 8);
+    U64 total_size = fs_off + function_starts.size;
+    U8 *out = push_array(arena, U8, total_size);
+
+    // rjf: header
+    struct mach_header_64 out_hdr = hdr;
+    out_hdr.ncmds      = out_ncmds;
+    out_hdr.sizeofcmds = (U32)out_cmds_size;
+    MemoryCopy(out, &out_hdr, sizeof(out_hdr));
+
+    // rjf: pass 2: load commands. segments and sections lose their file ranges
+    // (the file carries no image contents, like a dSYM); the symbol table and the
+    // function starts point at the appended data. NOTE: the file is for the
+    // debugger's converter (`macho_bin_from_data` accepts sections without file
+    // data); Apple's nm/otool reject the zero section offsets of a non-dSYM.
+    U64 out_off = sizeof(hdr);
+    for(U64 off = 0, cmd_idx = 0; cmd_idx < hdr.ncmds && off + sizeof(struct load_command) <= cmds_size; cmd_idx += 1)
+    {
+      struct load_command lc = {0};
+      MemoryCopy(&lc, cmds + off, sizeof(lc));
+      if(lc.cmdsize < sizeof(lc) || off + lc.cmdsize > cmds_size)
+      {
+        break;
+      }
+      if(mac_dmn_symbol_image_keeps_load_command(lc.cmd, function_starts.size != 0))
+      {
+        MemoryCopy(out + out_off, cmds + off, lc.cmdsize);
+        switch(lc.cmd)
+        {
+          default:{}break;
+          case LC_SEGMENT_64:
+          if(lc.cmdsize >= sizeof(struct segment_command_64))
+          {
+            struct segment_command_64 *seg = (struct segment_command_64 *)(out + out_off);
+            seg->fileoff  = 0;
+            seg->filesize = 0;
+            U64 sect_off = sizeof(*seg);
+            for(U32 sect_idx = 0; sect_idx < seg->nsects && sect_off + sizeof(struct section_64) <= lc.cmdsize; sect_idx += 1, sect_off += sizeof(struct section_64))
+            {
+              struct section_64 *sect = (struct section_64 *)(out + out_off + sect_off);
+              sect->offset = 0;
+              sect->reloff = 0;
+              sect->nreloc = 0;
+            }
+          }break;
+          case LC_SYMTAB:
+          if(lc.cmdsize >= sizeof(struct symtab_command))
+          {
+            struct symtab_command *st = (struct symtab_command *)(out + out_off);
+            st->symoff  = (U32)syms_off;
+            st->nsyms   = (U32)kept_count;
+            st->stroff  = (U32)strs_off;
+            st->strsize = (U32)strs_size;
+          }break;
+          case LC_FUNCTION_STARTS:
+          if(lc.cmdsize >= sizeof(struct linkedit_data_command))
+          {
+            struct linkedit_data_command *fs = (struct linkedit_data_command *)(out + out_off);
+            fs->dataoff  = (U32)fs_off;
+            fs->datasize = (U32)function_starts.size;
+          }break;
+        }
+        out_off += lc.cmdsize;
+      }
+      off += lc.cmdsize;
+    }
+
+    // rjf: symbols & names (n_value stays the unslid address, n_sect the section index)
+    {
+      struct nlist_64 *out_syms = (struct nlist_64 *)(out + syms_off);
+      U8 *out_strs = out + strs_off;
+      U64 str_cursor = 1;
+      for EachIndex(idx, kept_count)
+      {
+        struct nlist_64 sym = syms[kept[idx].sym_idx];
+        sym.n_un.n_strx = (U32)str_cursor;
+        out_syms[idx] = sym;
+        MemoryCopy(out_strs + str_cursor, kept[idx].name.str, kept[idx].name.size);
+        str_cursor += kept[idx].name.size + 1;
+      }
+    }
+
+    // rjf: function starts
+    MemoryCopy(out + fs_off, function_starts.str, function_starts.size);
+    result = str8(out, total_size);
+  }
+
+  scratch_end(scratch);
+  return result;
+}
+
+internal String8
+mac_dmn_debug_info_path_from_image(Arena *arena, mach_port_t task, MAC_DMN_ImageInfo *image, String8 path)
+{
+  String8 result = {0};
+  if(!image->valid || image->symtab_vaddr == 0 || image->symtab_count == 0 || memory_is_zero(&image->uuid, sizeof(image->uuid)))
+  {
+    return result;
+  }
+
+  //- rjf: the path is a file with this image's UUID -> that file is the debug info
+  {
+    Guid file_uuid = {0};
+    if(macho_uuid_from_file_path(path, &file_uuid) && MemoryMatch(&file_uuid, &image->uuid, sizeof(Guid)))
+    {
+      return result;
+    }
+  }
+
+  //- rjf: otherwise: a symbol-only copy of the in-memory image, cached by UUID
+  Temp scratch = scratch_begin(&arena, 1);
+  String8 cache_root = get_process_info()->user_program_cache_data_path;
+  String8 image_name = str8_skip_last_slash(path);
+  if(cache_root.size != 0 && image_name.size != 0)
+  {
+    String8 raddbg_dir = str8f(scratch.arena, "%S/raddbg", cache_root);
+    String8 images_dir = str8f(scratch.arena, "%S/images", raddbg_dir);
+    String8 image_dir  = str8f(scratch.arena, "%S/%S", images_dir, string_from_guid(scratch.arena, image->uuid));
+    String8 file_path  = str8f(arena, "%S/%S", image_dir, image_name);
+    if(properties_from_file_path(file_path).size != 0)
+    {
+      result = file_path;
+    }
+    else
+    {
+      String8 data = mac_dmn_symbol_image_from_image(scratch.arena, task, image);
+      if(data.size != 0)
+      {
+        make_directory(raddbg_dir);
+        make_directory(images_dir);
+        make_directory(image_dir);
+        // rjf: write under a temporary name, then rename: another debugger instance
+        // may be writing the same image at the same time
+        String8 temp_path = str8f(scratch.arena, "%S.%I64u.tmp", file_path, (U64)get_process_info()->pid);
+        if(write_data_to_file_path(temp_path, data) && move_file_path(file_path, temp_path))
+        {
+          result = file_path;
+        }
+        else
+        {
+          delete_file_at_path(temp_path);
+          if(properties_from_file_path(file_path).size != 0)
+          {
+            result = file_path;
+          }
+        }
+      }
+    }
+  }
+  scratch_end(scratch);
   return result;
 }
 
@@ -1387,6 +1744,15 @@ mac_dmn_push_event_load_module(Arena *arena, DMN_EventList *events, MAC_DMN_Proc
   }
   MAC_DMN_Module *module = mac_dmn_module_alloc(ctx, header_vaddr, image.vsize, path, image.thread_vars_vaddr, is_main, is_dyld);
   DMN_ModuleInfo *module_info = mac_dmn_module_info_from_image(arena, process, &image, module->path);
+  {
+    // rjf: images without a file of their own on disk (the dyld shared cache's)
+    // get a symbol-only copy of the in-memory image as their debug info
+    String8 symbol_image_path = mac_dmn_debug_info_path_from_image(arena, process->task, &image, module->path);
+    if(symbol_image_path.size != 0)
+    {
+      module_info->debug_info_path = symbol_image_path;
+    }
+  }
   DMN_Event *e = dmn_event_list_push(arena, events);
   e->kind        = DMN_EventKind_LoadModule;
   e->process     = mac_dmn_handle_from_process(process);
