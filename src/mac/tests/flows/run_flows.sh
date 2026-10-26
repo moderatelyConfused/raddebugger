@@ -1081,14 +1081,23 @@ scenario_D9_attach_kill9() {
   local st=$(go_cmd "attach --pid:$tpid")
   check D9_attached "$tpid" "$(process_ids "$st" | awk '{print $1}')"
   ipc run >/dev/null; wait_running
+  local before=$(field "$st" stop_count)
   local t0=$(date +%s%N)
   kill -9 $tpid
+  # PT_ATTACHEXC reports the SIGKILL as a soft signal and mac_sigkill breaks by default (as
+  # linux_sigkill does): the first report is a stop; the exit follows the continue
+  st=$(wait_stop ${before:-0})
+  local stop_ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+  check D9_sigkill_stop 0x9 "$(exception_code "$st")"
+  check D9_sigkill_stop_process_known 1 "$(process_count "$st")"
+  t0=$(date +%s%N)
+  ipc run >/dev/null
   for i in $(seq 1 100); do st=$(ipc state); [[ "$(process_count "$st")" == "0" ]] && break; done
   local ms=$(( ($(date +%s%N) - t0) / 1000000 ))
   check D9_exit_reported 0 "$(process_count "$st")"
   check D9_exit_code_is_signal 9 "$(field "$st" last_exit_code)"
   check_match D9_exit_within_500ms '^([0-9]|[1-9][0-9]|[1-4][0-9][0-9])$' "$ms"
-  note "D9 exit reported after ${ms} ms (one ipc state round trip is ~50 ms)"
+  note "D9 SIGKILL stop after ${stop_ms} ms (100 ms polls), exit reported ${ms} ms after the continue (one ipc state round trip is ~50 ms)"
   wait_gone $tpid
   finish
 }

@@ -427,6 +427,14 @@ terminates) when its setting is off. So `tests/demon/signal_handler.sh` turns
 the three fault settings off on purpose, `frozen_thread.sh` turns `mac_sigusr1`
 off for its pass-through thread (SIGUSR1 breaks by default, as on Linux), and
 the flows `exceptions`, `U2` and `D4` pin the codes and both continue paths.
+Two more consequences of the Linux-like defaults: `raise(SIGUSR1)` stops
+before its handler runs (the `signal_handler` flow turns `mac_sigusr1` off),
+and a `kill -9` of the debuggee is reported first as a SIGKILL stop (0x9;
+`PT_ATTACHEXC` reports it as a soft signal and `mac_sigkill` breaks, as
+`linux_sigkill` does), the exit following the continue (`D9`; a launched
+process then reports exit code 9, an attached one 0 on this machine with or
+without the stop, since the demon learns a non-child's exit status only from
+`NOTE_EXITSTATUS`: `D9_exit_code_is_signal` stays open).
 
 ### Open
 
@@ -746,7 +754,12 @@ implementation):
   the process exits 0; with the defaults the first-chance stop, and a continue
   that stops on the re-executed fault again (the policy below). The
   `signal_handler` flow turns `mac_sigusr1` off so that `raise(SIGUSR1)` reaches
-  its handler (SIGUSR1 breaks by default, as `linux_sigusr1` does).
+  its handler (SIGUSR1 breaks by default, as `linux_sigusr1` does), and `D9`
+  continues once past the SIGKILL stop a `kill -9` now produces (`mac_sigkill`
+  breaks by default) before expecting the exit; its exit code check (9) fails
+  for the attached process with or without that stop (exit code 0: see "Status
+  and open issues"), as do `fork/D2_exit_code_from_child` (0 instead of 7) and
+  `D1_debuggee_ran_to_completion` on the pre-change binary too.
 
 Policy, not bugs (the suite expects these):
 
