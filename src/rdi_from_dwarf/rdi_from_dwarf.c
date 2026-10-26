@@ -3255,6 +3255,7 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
           DW2_Attrib *external_attrib = &dw2_attrib_nil;
           DW2_Attrib *decl_attrib = &dw2_attrib_nil;
           DW2_Attrib *abstract_origin_attrib = &dw2_attrib_nil;
+          DW2_Attrib *specification_attrib = &dw2_attrib_nil;
           DW2_Attrib *call_file_attrib = &dw2_attrib_nil;
           DW2_Attrib *call_line_attrib = &dw2_attrib_nil;
           DW2_Attrib *call_column_attrib = &dw2_attrib_nil;
@@ -3277,6 +3278,7 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
               Case(external,  External);
               Case(decl,      Declaration);
               Case(abstract_origin, AbstractOrigin);
+              Case(specification,   Specification);
               Case(call_file,       CallFile);
               Case(call_line,       CallLine);
               Case(call_column,     CallColumn);
@@ -3299,14 +3301,18 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
           // inlined subroutines, their parameters & variables, and out-of-line
           // instances of functions which were also inlined, carry no name or type
           // of their own; they refer to the abstract instance, which carries them.
+          // out-of-line definitions of C++ member functions (and of static members)
+          // likewise refer to their declaration inside the class, via a
+          // specification (which may itself point at an abstract origin).
           //
-          if(abstract_origin_attrib != &dw2_attrib_nil &&
+          DW2_Attrib *origin_attrib = (abstract_origin_attrib != &dw2_attrib_nil) ? abstract_origin_attrib : specification_attrib;
+          if(origin_attrib != &dw2_attrib_nil &&
              (tag.kind == DW_TagKind_InlinedSubroutine ||
               tag.kind == DW_TagKind_SubProgram ||
               tag.kind == DW_TagKind_Variable ||
               tag.kind == DW_TagKind_FormalParameter))
           {
-            U64 origin_off = dw2_reference_info_off_from_form_val(unit_parse_ctx, &abstract_origin_attrib->val);
+            U64 origin_off = dw2_reference_info_off_from_form_val(unit_parse_ctx, &origin_attrib->val);
             for(U64 hop_idx = 0; hop_idx < 8 && origin_off != 0 && contains_1u64(unit_info_tag_range, origin_off); hop_idx += 1)
             {
               DW2_Tag *origin_tag = push_array(scratch2.arena, DW2_Tag, 1);
