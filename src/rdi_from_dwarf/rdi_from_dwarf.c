@@ -106,15 +106,25 @@ d2r_line_table_builder_flush(Arena *arena, RDIM_LineTableChunkList *line_tables,
 }
 
 internal void
-d2r_line_table_builder_append(Arena *arena, Arena *scratch_arena, RDIM_LineTableChunkList *line_tables, D2R_FileSeqMap *file_seq_map, D2R_LineTableBuilder *b, D2R_LineTableBuilder **first_open_builder, U64 voff_min, U64 voff_max, RDIM_SrcFile *src_file, U32 line_num, U16 col_num)
+d2r_line_table_builder_append(Arena *arena, Arena *scratch_arena, RDIM_LineTableChunkList *line_tables, D2R_FileSeqMap *file_seq_map, D2R_LineTableBuilder *b, D2R_LineTableBuilder **first_open_builder, U64 voff_min, U64 voff_max, RDIM_SrcFile *src_file, U32 line_num, U16 col_num, B32 is_stmt)
 {
   if(voff_max <= voff_min || src_file == 0 || line_num == 0)
   {
     return;
   }
-  
+
   // rjf: continuing the previous line? -> extend it
-  if(b->line_count != 0 && b->voff_opl == voff_min && b->src_file == src_file && b->line_nums[b->line_count-1] == line_num)
+  //
+  // NOTE(rjf): rows which are not statements (is_stmt == 0) mark code which
+  // belongs to a line but is not a place to stop at (compilers emit them for
+  // scheduled & merged code, heavily in optimized builds). they do not begin
+  // a new line, so that their code is stepped through as part of the preceding
+  // statement, as other debuggers do; only where this table has no line to
+  // extend (the first row of a sequence, the first piece of an inlined block)
+  // they begin one, with their own line. a statement row in another file
+  // always begins a line, even at the same line number.
+  //
+  if(b->line_count != 0 && b->voff_opl == voff_min && (!is_stmt || (b->src_file == src_file && b->line_nums[b->line_count-1] == line_num)))
   {
     b->voff_opl = voff_max;
     return;
@@ -186,31 +196,67 @@ d2r_distribute_line_row(Arena *arena, Arena *scratch_arena, RDIM_LineTableChunkL
     // innermost scope at an address to find the tables to consult. the
     // containment tree only serves to find the innermost site at an address.
     //
-    if(inner == 0 && row_inner != 0)
+    D2R_InlineNode *inner_node = inner ? inner->node : 0;
+
+    // rjf: the row began inside a deeper inline site which ends before this
+    // piece (the last row of inlined code commonly extends to the next row,
+    // across the "no source" rows which follow it): from the perspective of
+    // the sites still containing the piece, and of the unit, this is still
+    // the inlined call, so the innermost of them gets the line of the call
+    // directly below it on the chain, rather than the inlined function's line
+    D2R_InlineNode *below = 0;
+    if(row_inner != 0 && row_inner != inner)
     {
-      // rjf: the row began inside an inline site, but runs past its end (the
-      // last row of inlined code commonly extends to the next row, across the
-      // "no source" rows which follow it): from the unit's perspective this
-      // is still the inlined call, so the unit's table gets the line of the
-      // outermost call, rather than the inlined function's line
-      D2R_InlineNode *outermost = row_inner->node;
-      for(; outermost->parent != 0; outermost = outermost->parent) {}
-      d2r_line_table_builder_append(arena, scratch_arena, line_tables, file_seq_map, unit_builder, first_open_builder, voff, piece_opl, outermost->call_src_file, outermost->call_line, outermost->call_col);
-    }
-    else
-    {
-      // rjf: the innermost site's table (or the unit's) gets the row's own line
-      D2R_LineTableBuilder *inner_builder = inner ? inner->node->builder : unit_builder;
-      d2r_line_table_builder_append(arena, scratch_arena, line_tables, file_seq_map, inner_builder, first_open_builder, voff, piece_opl, row->src_file, row->line_num, row->col_num);
-      
-      // rjf: each enclosing site's table (and finally the unit's) gets the line of the call it inlined
-      for(D2R_InlineNode *child = inner ? inner->node : 0; child != 0; child = child->parent)
+      D2R_InlineNode *n = row_inner->node;
+      for(; n != 0 && n != inner_node; n = n->parent)
       {
-        D2R_LineTableBuilder *outer_builder = child->parent ? child->parent->builder : unit_builder;
-        d2r_line_table_builder_append(arena, scratch_arena, line_tables, file_seq_map, outer_builder, first_open_builder, voff, piece_opl, child->call_src_file, child->call_line, child->call_col);
+        below = n;
+      }
+      if(n != inner_node)
+      {
+        below = 0; // the row's site is not nested in this piece's: an unrelated site
       }
     }
-    
+
+    // rjf: the innermost site's table (or the unit's) gets the row's own line,
+    // or the call line of the chain below it
+    {
+      D2R_LineTableBuilder *inner_builder = inner_node ? inner_node->builder : unit_builder;
+      RDIM_SrcFile *src_file = row->src_file;
+      U32 line_num = row->line_num;
+      U16 col_num = row->col_num;
+      B32 is_stmt = row->is_stmt;
+      if(below != 0 && below->call_src_file != 0 && below->call_line != 0)
+      {
+        src_file = below->call_src_file;
+        line_num = below->call_line;
+        col_num  = below->call_col;
+        is_stmt  = 1;
+      }
+      d2r_line_table_builder_append(arena, scratch_arena, line_tables, file_seq_map, inner_builder, first_open_builder, voff, piece_opl, src_file, line_num, col_num, is_stmt);
+    }
+
+    // rjf: each enclosing site's table (and finally the unit's) gets the line
+    // of the call it inlined; a site without a usable call site (no file, or
+    // line 0) passes the row's own line up instead, so that no table is left
+    // with a hole
+    for(D2R_InlineNode *child = inner_node; child != 0; child = child->parent)
+    {
+      D2R_LineTableBuilder *outer_builder = child->parent ? child->parent->builder : unit_builder;
+      RDIM_SrcFile *src_file = child->call_src_file;
+      U32 line_num = child->call_line;
+      U16 col_num = child->call_col;
+      B32 is_stmt = 1;
+      if(src_file == 0 || line_num == 0)
+      {
+        src_file = row->src_file;
+        line_num = row->line_num;
+        col_num  = row->col_num;
+        is_stmt  = row->is_stmt;
+      }
+      d2r_line_table_builder_append(arena, scratch_arena, line_tables, file_seq_map, outer_builder, first_open_builder, voff, piece_opl, src_file, line_num, col_num, is_stmt);
+    }
+
     voff = piece_opl;
   }
 }
@@ -655,10 +701,19 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
           {
             root_dir = ctx->unit_dir;
           }
-          String8 full_file_path = str8f(scratch2.arena, "%S%s%S%s%S",
-                                         root_dir, root_dir.size != 0 ? "/" : "",
-                                         dir->file_name, dir->file_name.size != 0 ? "/" : "",
-                                         f->file_name);
+          // rjf: an absolute file name stands on its own (DWARF 5 names the
+          // primary file in full in entry 0, and clang's rows use that entry
+          // when the source lies outside the compilation directory); a relative
+          // one is resolved against its directory entry, and that against the
+          // compilation directory
+          String8 full_file_path = f->file_name;
+          if(path_style_from_str8(f->file_name) == PathStyle_Relative)
+          {
+            full_file_path = str8f(scratch2.arena, "%S%s%S%s%S",
+                                   root_dir, root_dir.size != 0 ? "/" : "",
+                                   dir->file_name, dir->file_name.size != 0 ? "/" : "",
+                                   f->file_name);
+          }
           full_file_path = path_normalized_from_string(scratch2.arena, full_file_path);
           U64 hash = u64_hash_from_str8(full_file_path);
           U64 slot_idx = hash%slots_count;
@@ -991,21 +1046,19 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
             last_row = &line_seq->last_chunk->v[line_seq->last_chunk->count-1];
           }
           
-          // rjf: determine if we need a new line
+          // rjf: determine if we need a new row
           //
           // TODO(rjf): in some cases this can trigger w/ DWARF due to columnar changes;
           // we need to adjust this when we want to start correctly supporting columnar
           // line info / stepping
           //
-          // NOTE(rjf): rows which are not statements (is_stmt == 0) mark code which
-          // belongs to a line but is not a place to stop at (compilers emit them for
-          // scheduled & merged code, heavily in optimized builds). They do not begin
-          // a new line here, so that their code is stepped through as part of the
-          // preceding statement, as other debuggers do; only the first row of a
-          // sequence always begins one. a statement row in another file always
-          // begins a line, even at the same line number.
+          // NOTE(rjf): rows which are not statements (is_stmt == 0) are kept, with
+          // the flag; whether they extend the line before them is decided per
+          // table once the inline sites are known (d2r_line_table_builder_append):
+          // merged here, the first rows of an inlined block, which LLVM does not
+          // mark as statements, would carry the caller's line into the site's table.
           //
-          B32 need_new_line = (last_row == 0 || (vm_regs.is_stmt && (last_row->line_num != (U32)vm_regs.line || last_row->src_file != src_file)));
+          B32 need_new_line = (last_row == 0 || last_row->line_num != (U32)vm_regs.line || last_row->src_file != src_file || (vm_regs.is_stmt && !last_row->is_stmt));
           
           // rjf: need new line -> push row (beginning a sequence, if needed)
           if(need_new_line)
@@ -1031,6 +1084,7 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
             row->src_file = src_file;
             row->line_num = (U32)vm_regs.line;
             row->col_num  = (U16)vm_regs.column;
+            row->is_stmt  = (B16)vm_regs.is_stmt;
             // NOTE(rjf): use for comparing against llvm-dwarfdump --debug-line
 #if 0
             printf("0x%016I64x %6i %6i %6i %3i %13I64x %7i %s%s%s%s\n",
@@ -3114,11 +3168,12 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
           U64 voff_opl = 0;
           if(dw_attrib_class_from_form_kind(unit_parse_ctx->version, unit_parse_ctx->exts, hipc_attrib->val.kind) & DW_AttribClass_Address)
           {
-            voff_opl = voff_base + hipc_attrib->val.u128.u64[0];
+            // rjf: an address (DWARF <= 3), rather than an offset from low_pc
+            voff_opl = hipc_attrib->val.addr - base_vaddr;
           }
           else
           {
-            voff_opl = hipc_attrib->val.addr;
+            voff_opl = voff_base + hipc_attrib->val.u128.u64[0];
           }
           rdim_rng1u64_chunk_list_push(arena, &unit_voff_ranges, 256, (RDIM_Rng1U64){voff_base, voff_opl});
         }
@@ -3218,6 +3273,7 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
           RDIM_Namespace *container_namespace;
           RDIM_LocationCaseList framebase_location_cases;
           D2R_InlineNode *inline_node; // when the tag is an inlined subroutine
+          B32 in_abstract_instance;    // within an abstract instance of an inlined function: no symbols
         };
         D2R_ParentNode *top_parent = 0;
         D2R_ParentNode *free_parent = 0;
@@ -3250,6 +3306,7 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
           DW2_Attrib *external_attrib = &dw2_attrib_nil;
           DW2_Attrib *decl_attrib = &dw2_attrib_nil;
           DW2_Attrib *abstract_origin_attrib = &dw2_attrib_nil;
+          DW2_Attrib *specification_attrib = &dw2_attrib_nil;
           DW2_Attrib *call_file_attrib = &dw2_attrib_nil;
           DW2_Attrib *call_line_attrib = &dw2_attrib_nil;
           DW2_Attrib *call_column_attrib = &dw2_attrib_nil;
@@ -3272,6 +3329,7 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
               Case(external,  External);
               Case(decl,      Declaration);
               Case(abstract_origin, AbstractOrigin);
+              Case(specification,   Specification);
               Case(call_file,       CallFile);
               Case(call_line,       CallLine);
               Case(call_column,     CallColumn);
@@ -3289,23 +3347,52 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
           B32 is_decl = (decl_attrib != &dw2_attrib_nil);
           
           ////////////////////////
-          //- rjf: resolve abstract origins
+          //- rjf: resolve abstract origins & specifications
           //
           // inlined subroutines, their parameters & variables, and out-of-line
           // instances of functions which were also inlined, carry no name or type
           // of their own; they refer to the abstract instance, which carries them.
+          // out-of-line definitions of member functions and of static data
+          // members refer to their declaration in the class the same way, via
+          // DW_AT_specification. either may lead into another unit (DW_FORM_ref_addr:
+          // dsymutil's ODR type uniquing, LTO), so every hop finds the unit the
+          // offset lands in, and reads with that unit's context.
           //
-          if(abstract_origin_attrib != &dw2_attrib_nil &&
-             (tag.kind == DW_TagKind_InlinedSubroutine ||
-              tag.kind == DW_TagKind_SubProgram ||
-              tag.kind == DW_TagKind_Variable ||
-              tag.kind == DW_TagKind_FormalParameter))
+          DW2_ParseCtx *type_attrib_ctx = unit_parse_ctx;  // the unit `type_attrib` belongs to
+          U64 origin_subprogram_info_off = 0;               // the first DW_TAG_subprogram the chain reached: it has the typed parameters
+          U64 origin_subprogram_unit_idx = unit_idx;
+          if(tag.kind == DW_TagKind_InlinedSubroutine ||
+             tag.kind == DW_TagKind_SubProgram ||
+             tag.kind == DW_TagKind_Variable ||
+             tag.kind == DW_TagKind_FormalParameter)
           {
-            U64 origin_off = dw2_reference_info_off_from_form_val(unit_parse_ctx, &abstract_origin_attrib->val);
-            for(U64 hop_idx = 0; hop_idx < 8 && origin_off != 0 && contains_1u64(unit_info_tag_range, origin_off); hop_idx += 1)
+            DW2_Attrib *origin_attrib = abstract_origin_attrib;
+            if(origin_attrib == &dw2_attrib_nil)
             {
+              origin_attrib = specification_attrib;
+            }
+            DW2_ParseCtx *origin_ctx = unit_parse_ctx;
+            U64 origin_unit_idx = unit_idx;
+            U64 origin_off = (origin_attrib != &dw2_attrib_nil) ? dw2_reference_info_off_from_form_val(origin_ctx, &origin_attrib->val) : 0;
+            for(U64 hop_idx = 0; hop_idx < 8 && origin_off != 0; hop_idx += 1)
+            {
+              if(!contains_1u64(unit_info_tag_ranges[origin_unit_idx], origin_off))
+              {
+                U64 new_unit_num = rng1u64_array_num_from_value__binary_search(&unit_info_tag_ranges_array, origin_off);
+                if(new_unit_num == 0)
+                {
+                  break;
+                }
+                origin_unit_idx = new_unit_num-1;
+                origin_ctx = &unit_parse_ctxs[origin_unit_idx];
+              }
               DW2_Tag *origin_tag = push_array(scratch2.arena, DW2_Tag, 1);
-              dw2_read_tag(scratch2.arena, raw, unit_parse_ctx, raw->sec[DW_SectionKind_Info].data, origin_off, origin_tag);
+              dw2_read_tag(scratch2.arena, raw, origin_ctx, raw->sec[DW_SectionKind_Info].data, origin_off, origin_tag);
+              if(origin_tag->kind == DW_TagKind_SubProgram && origin_subprogram_info_off == 0)
+              {
+                origin_subprogram_info_off = origin_off;
+                origin_subprogram_unit_idx = origin_unit_idx;
+              }
               if(name.size == 0)      { name      = dw2_attrib_from_kind(origin_tag, DW_AttribKind_Name)->val.string; }
               if(link_name.size == 0) { link_name = dw2_attrib_from_kind(origin_tag, DW_AttribKind_LinkageName)->val.string; }
               if(type_attrib == &dw2_attrib_nil)
@@ -3314,6 +3401,7 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
                 if(origin_type_attrib != &dw2_attrib_nil)
                 {
                   type_attrib = origin_type_attrib;
+                  type_attrib_ctx = origin_ctx;
                 }
               }
               DW2_Attrib *next_origin_attrib = dw2_attrib_from_kind(origin_tag, DW_AttribKind_AbstractOrigin);
@@ -3321,7 +3409,7 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
               {
                 next_origin_attrib = dw2_attrib_from_kind(origin_tag, DW_AttribKind_Specification);
               }
-              origin_off = (next_origin_attrib != &dw2_attrib_nil) ? dw2_reference_info_off_from_form_val(unit_parse_ctx, &next_origin_attrib->val) : 0;
+              origin_off = (next_origin_attrib != &dw2_attrib_nil) ? dw2_reference_info_off_from_form_val(origin_ctx, &next_origin_attrib->val) : 0;
             }
           }
           
@@ -3349,7 +3437,8 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
               U64 voff_opl = 0;
               if(dw_attrib_class_from_form_kind(unit_parse_ctx->version, unit_parse_ctx->exts, hipc_attrib->val.kind) & DW_AttribClass_Address)
               {
-                voff_opl = hipc_attrib->val.addr;
+                // rjf: an address (DWARF <= 3), rather than an offset from low_pc
+                voff_opl = hipc_attrib->val.addr - base_vaddr;
               }
               else
               {
@@ -3360,21 +3449,38 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
           }
           
           ////////////////////////
+          //- rjf: abstract instances of inlined functions (DW_AT_inline, no code
+          // of their own) are only referred to; they, and their parameters,
+          // variables & blocks, are not symbols (the concrete instances are, under
+          // the same names)
+          //
+          B32 is_abstract_instance = (tag.kind == DW_TagKind_SubProgram && inline_attrib != &dw2_attrib_nil && ranges.count == 0);
+          B32 in_abstract_instance = (is_abstract_instance || (top_parent != 0 && top_parent->in_abstract_instance));
+
+          ////////////////////////
           //- rjf: unpack type
           //
           RDIM_Type *type = 0;
-          if(type_attrib != &dw2_attrib_nil || tag.kind == DW_TagKind_SubProgram)
+          if(type_attrib != &dw2_attrib_nil || tag.kind == DW_TagKind_SubProgram || tag.kind == DW_TagKind_InlinedSubroutine)
           {
             // rjf: functions need to get their type info from themselves; the type attrib
             // only references the return type. so, in that case, we'll use the procedure's
-            // own info offset / unit index, rather than the type attribute's.
+            // own info offset / unit index, rather than the type attribute's. inlined
+            // subroutines, and concrete instances & member function definitions, use
+            // the first subprogram their origin chain reached (the abstract instance,
+            // or the declaration): their own parameters carry no types.
             U64 type_info_off = start_off;
             U64 type_unit_idx = unit_idx;
-            
-            // rjf: attrib -> (info_off, unit_idx)
-            if(tag.kind != DW_TagKind_SubProgram)
+            if(origin_subprogram_info_off != 0 && (tag.kind == DW_TagKind_SubProgram || tag.kind == DW_TagKind_InlinedSubroutine))
             {
-              type_info_off = dw2_reference_info_off_from_form_val(unit_parse_ctx, &type_attrib->val);
+              type_info_off = origin_subprogram_info_off;
+              type_unit_idx = origin_subprogram_unit_idx;
+            }
+
+            // rjf: attrib -> (info_off, unit_idx)
+            if(tag.kind != DW_TagKind_SubProgram && tag.kind != DW_TagKind_InlinedSubroutine)
+            {
+              type_info_off = dw2_reference_info_off_from_form_val(type_attrib_ctx, &type_attrib->val);
               type_unit_idx = unit_idx;
               if(!contains_1u64(unit_info_tag_range, type_info_off))
               {
@@ -3460,6 +3566,17 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
                   SLLQueuePush(locs.first, locs.last, n);
                   locs.count += 1;
                 }break;
+                case DW_FormKind_Block1: // NOTE(rjf): DWARF <= 3 encodes location expressions as blocks (clang -gdwarf-3, gcc)
+                case DW_FormKind_Block2:
+                case DW_FormKind_Block4:
+                case DW_FormKind_Block:
+                {
+                  DW2_LocNode *n = push_array(scratch2.arena, DW2_LocNode, 1);
+                  n->v.expr = attrib->val.string;
+                  n->v.range = r1u64(0, max_U64);
+                  SLLQueuePush(locs.first, locs.last, n);
+                  locs.count += 1;
+                }break;
                 case DW_FormKind_LocListx:   // NOTE(rjf): dwarf5+, loclistx -> location list offset table
                 case DW_FormKind_SecOffset:  // NOTE(rjf): pre-dwarf5, location section offset -> a location list
                 {
@@ -3486,8 +3603,14 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
                 
                 //- rjf: iterate each frame base location case, or once if there are none,
                 // and convert the location in that context
+                //
+                // NOTE: variables under namespaces, classes and modules (and the locals
+                // of a function without DW_AT_frame_base) have a parent without frame
+                // base cases; they take the nil case like unit-level variables do, else
+                // they would get no location at all.
+                //
                 RDIM_LocationCase nil_framebase_loc_case = {0, {0}, {0, max_U64}};
-                for(RDIM_LocationCase *framebase_loc_n = top_parent ? top_parent->framebase_location_cases.first : &nil_framebase_loc_case;
+                for(RDIM_LocationCase *framebase_loc_n = (top_parent != 0 && top_parent->framebase_location_cases.first != 0) ? top_parent->framebase_location_cases.first : &nil_framebase_loc_case;
                     framebase_loc_n != 0;
                     framebase_loc_n = framebase_loc_n->next)
                 {
@@ -4184,6 +4307,14 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
                   //- rjf: collect
                   {
                     RDIM_Rng1U64 voff_range = {range.min - base_vaddr, range.max - base_vaddr};
+                    if(range.min == 0 && range.max == max_U64)
+                    {
+                      // rjf: a single location (exprloc, DW_LLE_default_location) holds
+                      // everywhere; its sentinel range is not an address range to rebase
+                      // (it wrapped to [-base, -base) where the image base is not 0)
+                      voff_range.min = 0;
+                      voff_range.max = max_U64;
+                    }
                     if(bytecode_is_framebase_dependent)
                     {
                       voff_range.min = Max(voff_range.min, framebase_voff_range.min);
@@ -4227,7 +4358,7 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
             
             //- rjf: subprograms (procedures)
             case DW_TagKind_SubProgram:
-            if(!is_decl)
+            if(!is_decl && !is_abstract_instance)
             {
               RDIM_Scope *root_scope = rdim_scope_chunk_list_push(arena, &dst_artifacts->scopes, chunk_count);
               RDIM_Symbol *procedure = rdim_symbol_chunk_list_push(arena, &dst_artifacts->procedures, chunk_count);
@@ -4290,7 +4421,7 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
             //- rjf: variables
             case DW_TagKind_Variable:
             case DW_TagKind_FormalParameter:
-            if(name.size != 0)
+            if(name.size != 0 && !in_abstract_instance)
             {
               U64 var_chunk_count = chunk_count;
               RDIM_SymbolChunkList *dst_symbols = &dst_artifacts->global_variables;
@@ -4315,6 +4446,7 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
             
             //- rjf: lexical blocks (scopes)
             case DW_TagKind_LexicalBlock:
+            if(!in_abstract_instance)
             {
               RDIM_Scope *scope = rdim_scope_chunk_list_push(arena, &dst_artifacts->scopes, chunk_count);
               scope->voff_ranges = ranges;
@@ -4458,6 +4590,7 @@ d2r_convert(Arena *arena, D2R_ConvertParams *params)
             n->tag_kind = tag.kind;
             n->info_off = start_off;
             n->inline_node = new_inline_node;
+            n->in_abstract_instance = in_abstract_instance;
             n->scope = new_scope_open ? new_scope_open : top_parent ? top_parent->scope : 0;
             n->container_type = new_scope_open ? 0 : container_type;
             n->container_namespace = new_scope_open ? 0 : container_namespace;

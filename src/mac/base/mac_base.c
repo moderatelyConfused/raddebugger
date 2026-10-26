@@ -98,6 +98,44 @@ mac_ipc_name_from_name(Arena *arena, String8 name)
   return result;
 }
 
+internal void
+mac_owned_ipc_name_push(String8 ipc_name, B32 is_shared_memory)
+{
+  pthread_mutex_lock(&mac_state.entity_mutex);
+  if(mac_state.owned_ipc_name_count == 0)
+  {
+    atexit(mac_unlink_owned_ipc_names);
+  }
+  B32 is_recorded = 0;
+  for(U64 idx = 0; idx < mac_state.owned_ipc_name_count; idx += 1)
+  {
+    if(str8_match(str8_cstring(mac_state.owned_ipc_names[idx].name), ipc_name, 0))
+    {
+      is_recorded = 1;
+      break;
+    }
+  }
+  if(!is_recorded && mac_state.owned_ipc_name_count < ArrayCount(mac_state.owned_ipc_names))
+  {
+    MAC_OwnedIPCName *n = &mac_state.owned_ipc_names[mac_state.owned_ipc_name_count];
+    mac_state.owned_ipc_name_count += 1;
+    MemoryCopy(n->name, ipc_name.str, Min(ipc_name.size, sizeof(n->name)-1));
+    n->is_shared_memory = is_shared_memory;
+  }
+  pthread_mutex_unlock(&mac_state.entity_mutex);
+}
+
+internal void
+mac_unlink_owned_ipc_names(void)
+{
+  for(U64 idx = 0; idx < mac_state.owned_ipc_name_count; idx += 1)
+  {
+    MAC_OwnedIPCName *n = &mac_state.owned_ipc_names[idx];
+    if(n->is_shared_memory) { shm_unlink(n->name); }
+    else                    { sem_unlink(n->name); }
+  }
+}
+
 internal U64
 mac_relative_us_from_endt_us(U64 endt_us)
 {
@@ -376,6 +414,10 @@ shared_memory_alloc(U64 size, String8 name)
     {
       id = shm_open((char *)ipc_name.str, O_RDWR|O_CREAT, 0600);
     }
+    if(id >= 0)
+    {
+      mac_owned_ipc_name_push(ipc_name, 1);
+    }
   }
 
   if(id >= 0)
@@ -479,7 +521,13 @@ thread_launch(ThreadEntryPointFunctionType *f, void *p)
   entity->thread.func = f;
   entity->thread.ptr = p;
   {
-    int pthread_result = pthread_create(&entity->thread.handle, 0, mac_thread_entry_point, entity);
+    // NOTE(rjf): macOS gives secondary threads a 512 KiB stack by default; match
+    // the other platforms' sizes (Linux: 8 MB)
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, MB(8));
+    int pthread_result = pthread_create(&entity->thread.handle, &attr, mac_thread_entry_point, entity);
+    pthread_attr_destroy(&attr);
     if(pthread_result != 0)
     {
       mac_entity_release(entity);
@@ -753,6 +801,7 @@ semaphore_alloc(U32 initial_count, U32 max_count, String8 name)
       entity->semaphore.is_owner = 1;
       entity->semaphore.posix_handle = s;
       MemoryCopy(entity->semaphore.name, ipc_name.str, Min(ipc_name.size, sizeof(entity->semaphore.name)-1));
+      mac_owned_ipc_name_push(ipc_name, 0);
       good = 1;
     }
   }

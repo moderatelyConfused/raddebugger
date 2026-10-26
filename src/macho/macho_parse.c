@@ -445,6 +445,15 @@ macho_bin_from_data(Arena *arena, String8 data)
           if(nlist->n_type == MACHO_N_OSO)
           {
             bin.oso_count += 1;
+            // rjf: identify the debug map by its object paths & modification times
+            // (n_value): the same code linked from recompiled objects keeps its UUID
+            // but not this hash (see the dSYM cache in radbin)
+            String8 oso_name = {0};
+            if(nlist->n_strx < bin.string_table.size)
+            {
+              oso_name = str8_cstring_capped(bin.string_table.str + nlist->n_strx, bin.string_table.str + bin.string_table.size);
+            }
+            bin.debug_map_hash = u64_hash_from_str8(oso_name) ^ (bin.debug_map_hash*0x9E3779B97F4A7C15ull + nlist->n_value*0x100000001B3ull);
           }
         }
       }

@@ -1919,10 +1919,6 @@ ev_string_iter_next(Arena *arena, EV_StringIter *it, String8 *out_string)
                   {
                     inline_site_count += 1;
                   }
-                  else
-                  {
-                    break;
-                  }
                 }
                 
                 // rjf: depth in [1, max]? -> form name from inline site
@@ -1934,16 +1930,16 @@ ev_string_iter_next(Arena *arena, EV_StringIter *it, String8 *out_string)
                   {
                     RDI_Scope *s = rdi_element_from_name_idx(rdi, Scopes, s_idx);
                     s_idx_next = s->parent_scope_idx;
+                    if(s->inline_site_idx == 0)
+                    {
+                      continue;
+                    }
                     if(s_inline_depth == ptr_data->type->depth)
                     {
                       inline_site = rdi_element_from_name_idx(rdi, InlineSites, s->inline_site_idx);
                       break;
                     }
                     s_inline_depth -= 1;
-                    if(s_inline_depth == 0)
-                    {
-                      break;
-                    }
                   }
                   if(inline_site != 0)
                   {

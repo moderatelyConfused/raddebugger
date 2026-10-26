@@ -9,6 +9,15 @@ SkippedTest(d2r_regressions)
     test_input_path(arena, ctx, s("raddbg_linux_dac63d6b/raddbg")),
   };
   
+  // rjf: skip without the test data inputs
+  for EachElement(bin_idx, bin_paths)
+  {
+    if(properties_from_file_path(bin_paths[bin_idx]).modified == 0)
+    {
+      TestSkip();
+    }
+  }
+  
   // rjf: generate RDIs
   {
     ProcessList processes = {0};
@@ -72,6 +81,15 @@ Test(d2r_determinism)
   {
     test_input_path(arena, ctx, s("raddbg_linux_dac63d6b/raddbg")),
   };
+  
+  // rjf: skip without the test data inputs
+  for EachElement(bin_idx, bin_paths)
+  {
+    if(properties_from_file_path(bin_paths[bin_idx]).modified == 0)
+    {
+      TestSkip();
+    }
+  }
   for EachElement(bin_idx, bin_paths)
   {
     // rjf: unpack paths, make output directory
