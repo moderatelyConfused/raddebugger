@@ -253,6 +253,84 @@ Open:
 * A headless driver (the demon from a console program, the way `torture`
   does) would still be useful; the `--ipc` loop above is the next best thing.
 
+## Converter conformance corpus (2026-10-25, night)
+
+`src/mac/tests/macho_corpus/` holds a Mach-O test corpus and a checker for the
+DWARF → RDI converter; `RESULTS.md` there is the table of the last run (with a
+hand-maintained findings section at the end).
+
+* `build_corpus.sh [-o <dir>]` builds the matrix into a directory outside the
+  repository (default `$TMPDIR/raddbg_macho_corpus`): C at `-O0`, `-O2`,
+  `-O3 -fomit-frame-pointer`, `-flto`, `-gdwarf-3`, `-gdwarf-4`, with relative
+  source paths, and with `DW_AT_call_file`/`DW_AT_call_line` stripped from the
+  inline sites (assembly rewrite); C++ (templates, virtual calls, exceptions,
+  lambdas) at `-O0`, `-O2`, `-flto`; a dylib with an executable linking it and
+  one `dlopen()`ing it; a static library (`N_OSO` into the archive); threads
+  with `_Thread_local`; large frames / VLAs / `alloca`; deep recursion; signal
+  handlers; an arm64+x86_64 universal binary; the Zig generator in Debug,
+  ReleaseSafe and ReleaseFast (`zig build --prefix ... --cache-dir ...`, the
+  project is not touched); Rust (`split-debuginfo=unpacked`) and Swift. Every
+  entry comes twice: with a `.dSYM` next to it, and as the bare executable with
+  only its debug map, so that `radbin` runs `dsymutil` itself.
+* `python3 -I check_corpus.py [--build-dir <dir>] [--results RESULTS.md]`
+  converts every binary with `build/radbin --rdi` and validates `radbin --dump`
+  against `dwarfdump --debug-line` / `--debug-info` / `--uuid` of the dSYM (its
+  own `dsymutil` run for debug-map entries) and `otool -l`: the guid is the
+  `LC_UUID`; `voff_max` and the binary sections cover the text; one unit per
+  CU; every `is_stmt` row is covered, with its line and file, by the unit's
+  table or, inside a `DW_TAG_inlined_subroutine`, by the innermost site's,
+  while the enclosing tables carry `DW_AT_call_line`; tables are sorted,
+  non-empty, inside the image and inside a DWARF sequence; procedures, lexical
+  blocks and inline sites match the DIE tree structurally (ranges as voffs,
+  names, nesting); inline sites have function types; source line maps agree
+  with the tables; file-scope globals and thread-locals exist with their
+  addresses. 70 binaries take about 25 s; the largest (the Zig Debug
+  generator, 2.7 MB of DWARF) converts in 0.1 s.
+
+Found by the corpus and fixed (`dwarf_parse.c`, `rdi_from_dwarf.c`,
+`macho_parse.c`, `radbin.c`):
+
+* `.debug_rnglists` / `.debug_loclists`: a `DW_RLE_base_addressx` (and
+  `base_address`) entry pushed an empty range at address 0, so every scope
+  with `DW_AT_ranges` in clang's DWARF 5 (dsymutil begins each list with one)
+  carried `[-base, -base)`, the scope vmap reached `0xffffffff00000000`, and
+  multi-range lexical blocks and inline sites did not match their DIEs.
+* Line table file names: an absolute DWARF 5 file name was appended to its
+  include directory (`<comp_dir>/<absolute path>`); entry 0 names the primary
+  file in full and clang's rows use it whenever the source lies outside the
+  compilation directory, so the debugger could not find the source.
+* `DW_FORM_ref_addr` references resolved to 0 (dsymutil's ODR uniquing turns
+  `DW_AT_specification` / `DW_AT_abstract_origin` into them, LTO too), and
+  `DW_AT_specification` was never followed: C++ member function definitions
+  and Rust methods were nameless procedures, inline sites of libc++ and LTO
+  builds were named `???`, static data member definitions were dropped. The
+  origin chain now follows both, across units, with the owning unit's context.
+* Variables under namespaces, classes and modules (Rust statics and
+  `thread_local!`, Swift globals, C++ class statics) had no location: the
+  frame-base iteration ran zero times for a parent without frame-base cases.
+* DWARF ≤ 3 location expressions (`DW_FORM_block1`) were ignored (`-gdwarf-3`:
+  no global or TLS locations); `DW_AT_high_pc` of address class was not
+  rebased.
+* From the converter review: inline sites carried the inlinee's return type
+  instead of its function type; abstract instances became rangeless
+  procedures; the single-location sentinel range was rebased; `is_stmt`
+  merging at decode time could carry the caller's line into the first entry of
+  a site's table (rows now keep the flag and extend lines per table); sites
+  without a usable call site (Swift's `/<compiler-generated>`, line 0) left
+  holes in the enclosing tables; a row running past a nested site now gives the
+  enclosing site's table the call line below it.
+* `radbin`'s generated-dSYM cache was keyed by `LC_UUID` only; ld64 hashes the
+  image contents, so the same code with other debug info (`-gdwarf-3`, other
+  source paths, a comment added) shared an entry. The key now includes a hash
+  of the debug map's object paths and modification times (`MACHO_Bin.debug_map_hash`).
+
+Open: Swift functions directly under `DW_TAG_module` get no function type (56
+of 84 procedures in `swiftprog-O`; struct methods do), so their inline sites
+have none either; the checker does not look at locals' locations or types;
+code that the line program attributes to an inlinee's line outside the site's
+ranges keeps that line in the enclosing table (the row-merging heuristic; a
+Rust `dealloc` example is in `RESULTS.md`).
+
 ## Known gaps / follow-ups
 
 * Rendering uses one shared `NSOpenGLContext` that is re-targeted with

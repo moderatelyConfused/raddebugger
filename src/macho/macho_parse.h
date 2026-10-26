@@ -96,6 +96,7 @@ struct MACHO_Bin
   MACHO_DysymtabCommand dysymtab;
   U64 stab_count;      // number of symbolic debugging (stab) entries
   U64 oso_count;       // number of N_OSO stabs (debug map object file references)
+  U64 debug_map_hash;  // hash of the N_OSO paths & modification times: identifies the objects a dSYM would be linked from
   B32 has_debug_map;   // oso_count != 0
 
   //- rjf: identity

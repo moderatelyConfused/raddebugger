@@ -101,7 +101,9 @@ internal int d2r_unique_tag_node_is_less_than(D2R_UniqueTagNode **l, D2R_UniqueT
 // sites' line tables (RDI, like PDB, attributes inlined code to the call site's
 // line in the unit's table, and to the inlined function's lines in the site's).
 
-// a row begins a line; its code extends to the next row of its sequence
+// a row begins a line; its code extends to the next row of its sequence.
+// rows which are not statements (is_stmt == 0) extend the line before them
+// in whichever table they land in, and only begin one where there is none.
 typedef struct D2R_LineRow D2R_LineRow;
 struct D2R_LineRow
 {
@@ -109,6 +111,7 @@ struct D2R_LineRow
   RDIM_SrcFile *src_file;
   U32 line_num;
   U16 col_num;
+  B16 is_stmt;
 };
 
 typedef struct D2R_LineRowChunk D2R_LineRowChunk;
@@ -201,7 +204,7 @@ struct D2R_InlineRange
 internal int d2r_inline_range_compare(D2R_InlineRange *a, D2R_InlineRange *b);
 internal D2R_InlineRange *d2r_inline_range_from_voff(D2R_InlineRange *ranges, U64 count, U64 voff, U64 *next_range_min_out);
 internal void d2r_line_table_builder_flush(Arena *arena, RDIM_LineTableChunkList *line_tables, D2R_FileSeqMap *file_seq_map, D2R_LineTableBuilder *b);
-internal void d2r_line_table_builder_append(Arena *arena, Arena *scratch_arena, RDIM_LineTableChunkList *line_tables, D2R_FileSeqMap *file_seq_map, D2R_LineTableBuilder *b, D2R_LineTableBuilder **first_open_builder, U64 voff_min, U64 voff_max, RDIM_SrcFile *src_file, U32 line_num, U16 col_num);
+internal void d2r_line_table_builder_append(Arena *arena, Arena *scratch_arena, RDIM_LineTableChunkList *line_tables, D2R_FileSeqMap *file_seq_map, D2R_LineTableBuilder *b, D2R_LineTableBuilder **first_open_builder, U64 voff_min, U64 voff_max, RDIM_SrcFile *src_file, U32 line_num, U16 col_num, B32 is_stmt);
 internal void d2r_distribute_line_row(Arena *arena, Arena *scratch_arena, RDIM_LineTableChunkList *line_tables, D2R_FileSeqMap *file_seq_map, D2R_LineTableBuilder *unit_builder, D2R_LineTableBuilder **first_open_builder, D2R_InlineRange *inline_ranges, U64 inline_range_count, D2R_LineRow *row, U64 row_voff_opl);
 
 ////////////////////////////////
