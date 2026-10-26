@@ -893,10 +893,17 @@ dw2_reference_info_off_from_form_val(DW2_ParseCtx *ctx, DW2_FormVal *v)
     case DW_FormKind_Ref2:
     case DW_FormKind_Ref4:
     case DW_FormKind_Ref8:
+    case DW_FormKind_RefUData:
     {
       result = ctx->unit_base_info_off + v->u128.u64[0];
     }break;
-    // TODO(rjf): DW_FormKind_RefAddr, DW_FormKind_RefUData, DW_FormKind_RefSig8, DW_FormKind_RefSup8, etc.
+    // NOTE: a ref_addr is an offset from the start of .debug_info (clang uses it
+    // for DW_AT_specification of out-of-line C++ member function definitions)
+    case DW_FormKind_RefAddr:
+    {
+      result = v->u128.u64[0];
+    }break;
+    // TODO(rjf): DW_FormKind_RefSig8, DW_FormKind_RefSup8, etc.
   }
   return result;
 }
