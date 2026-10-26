@@ -189,6 +189,7 @@ internal void
 rd_test__stepping_regressions_from_binary(Arena *arena, TestCtx *ctx, String8 binary_path, String8 start_symbol, B32 step_over_on_even)
 {
   Temp scratch = scratch_begin(&arena, 1);
+  Arena *iter_arena = arena_alloc(); // NOTE: a third scratch would alias `arena` (the test output's)
   String8List test_log_strings = {0};
   String8 target_binary = str8_chop_last_dot(str8_skip_last_slash(binary_path));
   
@@ -204,10 +205,12 @@ rd_test__stepping_regressions_from_binary(Arena *arena, TestCtx *ctx, String8 bi
       B32 ready_for_next_operation = 0;
       B32 saw_process = 0;
       U64 deadline_us = now_time_us() + 300000000;
+      U64 last_cmd_us = 0;
       String8 next_step_cmd = {0};
       for(U64 cmd_idx = 0;;)
       {
-        Temp scratch2 = scratch_begin(&scratch.arena, 1);
+        arena_clear(iter_arena);
+        Temp scratch2 = {iter_arena, 0};
         
         // rjf: need next operation -> do op
         if(ready_for_next_operation)
@@ -231,6 +234,7 @@ rd_test__stepping_regressions_from_binary(Arena *arena, TestCtx *ctx, String8 bi
           String8 step_response = rd_test__ipc_cmd(scratch2.arena, ctx, ipc_port, step_cmd);
           (void)step_response;
           test_outf("command %I64u: %S\n", cmd_idx, step_cmd);
+          last_cmd_us = now_time_us();
           cmd_idx += 1;
         }
         
@@ -279,6 +283,18 @@ rd_test__stepping_regressions_from_binary(Arena *arena, TestCtx *ctx, String8 bi
             ready_for_next_operation = 1;
             last_stop_count = stop_count;
           }
+          
+          // rjf: a step the debugger could not perform (step out of the outermost
+          // frame, once `main` has returned into dyld) leaves the thread stopped
+          // where it was: let the process run to its end
+          U64 running = 0;
+          try_u64_from_str8_c_rules(md_child_from_string(state, s("running"), 0)->first->string, &running);
+          if(!ready_for_next_operation && !process_exited && running == 0 && last_cmd_us != 0 && now_time_us() - last_cmd_us > 3000000)
+          {
+            test_outf("command %I64u did not run the thread; continuing the process\n", cmd_idx-1);
+            rd_test__ipc_cmd(scratch2.arena, ctx, ipc_port, s("run"));
+            last_cmd_us = now_time_us();
+          }
         }
         
         // rjf: if we are ready for the next operation, then accumulate deterministic log info
@@ -314,7 +330,6 @@ rd_test__stepping_regressions_from_binary(Arena *arena, TestCtx *ctx, String8 bi
           }
         }
         
-        scratch_end(scratch2);
         if(process_exited)
         {
           test_outf("process exited after %I64u commands\n", cmd_idx);
@@ -341,6 +356,7 @@ rd_test__stepping_regressions_from_binary(Arena *arena, TestCtx *ctx, String8 bi
     rd_test__exemplar_test_finish(arena, ctx, test_log_strings);
   }
   
+  arena_release(iter_arena);
   scratch_end(scratch);
 }
 
