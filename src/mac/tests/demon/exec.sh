@@ -9,7 +9,7 @@
 source "$(dirname ${(%):-%x})/common.sh"
 build_c exec_echo
 build_c echo_hi
-write_project exec_echo $S/exec_echo "$S/echo_hi" </dev/null
+write_project exec_echo $S/exec_echo "$S/echo_hi"
 launch $S/exec_echo.raddbg
 st0=$(ipc state)
 check "exec_echo is the main module before the exec" 'module_names "$st0" | grep -q exec_echo'
@@ -24,7 +24,7 @@ check "the demon noticed the exec" 'grep -q "exec.d; rediscovering" $CTRL_LOG'
 check "the old image was unloaded at the exec and echo_hi loaded" 'grep -B12 "string: *\"$S/echo_hi\"" $CTRL_LOG | grep -q "kind: *LoadModule" && [[ $(log_events_before UnloadModule "kind: *ExitProcess") -ge 2 ]]'
 
 echo "== for information: exec of the platform binary /bin/echo"
-write_project exec_echo $S/exec_echo "" </dev/null
+write_project exec_echo $S/exec_echo ""
 launch $S/exec_echo.raddbg
 ipc run >/dev/null
 wait_no_threads 50

@@ -8,7 +8,7 @@ source "$(dirname ${(%):-%x})/common.sh"
 build_c detach_signal
 
 echo "== detach at a SIGUSR1 stop (handler installed)"
-write_project detach_signal $S/detach_signal "" <<'EOF'
+write_project detach_signal $S/detach_signal "" - <<'EOF'
 mac_sigusr1: 1
 mac_sigterm: 1
 EOF
@@ -27,7 +27,7 @@ check "main continued ('after' printed)" 'grep -q "^after$" $S/detach_signal.std
 check "the demon logged the signal it left pending" 'grep -q "detaching pid .* at its signal 30" $CTRL_LOG'
 
 echo "== detach at a SIGTERM stop (default disposition: the process must die of it)"
-write_project detach_signal $S/detach_signal "term" <<'EOF'
+write_project detach_signal $S/detach_signal "term" - <<'EOF'
 mac_sigusr1: 1
 mac_sigterm: 1
 EOF

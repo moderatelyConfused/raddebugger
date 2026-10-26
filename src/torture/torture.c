@@ -184,15 +184,37 @@ t_run_caller(void *raw_ctx)
     LogScopeResult log_scope_result = log_scope_end(scratch.arena);
     if(log_scope_result.strings[LogMsgKind_Info].size != 0)
     {
+      // rjf: the exemplar is looked up in the tree first (`src/<layer>/tests/exemplars/<test>/`,
+      // committed and reviewed), then under local/test_data/exemplars/<test>/ (downloaded, or
+      // recorded by a first run). A test without any exemplar records this run under local/
+      // and is skipped with a message: a run compared against nothing is not a pass.
       String8 current_path = str8f(scratch.arena, "%S/current", g_wdir);
-      String8 exemplar_path = str8f(scratch.arena, "%S/exemplar_%S_%S", g_exemplar_dir, lower_from_str8(scratch.arena, string_from_operating_system(OperatingSystem_CURRENT)), lower_from_str8(scratch.arena, string_from_arch(Arch_CURRENT)));
+      String8 exemplar_file_name = str8f(scratch.arena, "exemplar_%S_%S", lower_from_str8(scratch.arena, string_from_operating_system(OperatingSystem_CURRENT)), lower_from_str8(scratch.arena, string_from_arch(Arch_CURRENT)));
+      String8 root_dir_path = str8_chop_last_slash(get_process_info()->binary_path);
+      String8 in_tree_exemplar_path = str8f(scratch.arena, "%S/src/%S/tests/exemplars/%S/%S", root_dir_path, ctx->test->layer, ctx->test->label, exemplar_file_name);
+      String8 local_exemplar_path = str8f(scratch.arena, "%S/%S", g_exemplar_dir, exemplar_file_name);
       String8 current = log_scope_result.strings[LogMsgKind_Info];
+      String8 exemplar_path = in_tree_exemplar_path;
       String8 exemplar = data_from_file_path(scratch.arena, exemplar_path);
+      if(exemplar.size == 0)
+      {
+        exemplar_path = local_exemplar_path;
+        exemplar = data_from_file_path(scratch.arena, exemplar_path);
+      }
       write_data_to_file_path(current_path, current);
       if(exemplar.size == 0)
       {
+        // TODO(rjf): @hack, see below
+        TestCtx *ctx = &test_ctx;
+        Arena *arena = scratch.arena;
         make_directory(g_exemplar_dir);
-        copy_file_path(exemplar_path, current_path);
+        copy_file_path(local_exemplar_path, current_path);
+        test_outf("exemplar created from this run: %S\n", path_normalized_from_string(scratch.arena, local_exemplar_path));
+        test_outf("inspect it, then re-run (it is compared from now on); a reviewed copy belongs in the tree at %S\n", path_normalized_from_string(scratch.arena, in_tree_exemplar_path));
+        if(ctx->result_out->status == TestStatus_Pass)
+        {
+          ctx->result_out[0] = (TestResult){.status = TestStatus_Skip};
+        }
       }
       else
       {
@@ -243,7 +265,13 @@ t_run_caller(void *raw_ctx)
       t_errorf("%S\n", g_output);
     }
   }
-  
+  // rjf: a skipped test's own messages (why it skipped: an exemplar it just recorded, say)
+  else if (ctx->result.status == TestStatus_Skip) {
+    for EachNode(n, String8Node, test_out.first) {
+      t_errorf("  %S", n->string);
+    }
+  }
+
   scratch_end(scratch);
 }
 
@@ -846,19 +874,59 @@ t_invoke_env(String8 exe_path, String8 cmdline, String8List env, U64 timeout_us)
   int   kq  = kqueue();
   if (kq < 0) {
     fprintf(stderr, "ERROR: failed to create kqueue for process %d\n", pid);
+    int status;
+    if (MAC_RETRY_ON_EINTR(waitpid(pid, &status, 0)) >= 0) {
+      g_last_exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : max_U64;
+    }
     goto exit;
   }
+  B32 is_process_live = 1;
   {
+    // rjf: one receipt per change (EV_RECEIPT), so that the three registrations are
+    // independent: a child which exited before this point fails its EVFILT_PROC
+    // registration with ESRCH, and without receipts kevent stopped at that change and
+    // never registered the pipes either, so the wait below blocked forever (for
+    // timeout_us == max_U64). Such a process is reaped right here (waitpid returns at
+    // once, the child is gone) and the loop only drains the pipes to their EOF.
     struct kevent changes[3] = {0};
-    EV_SET(&changes[0], pid, EVFILT_PROC, EV_ADD, NOTE_EXIT, 0, 0);
-    EV_SET(&changes[1], captures_linux[0].fds[0], EVFILT_READ, EV_ADD, 0, 0, 0);
-    EV_SET(&changes[2], captures_linux[1].fds[0], EVFILT_READ, EV_ADD, 0, 0, 0);
-    if (MAC_RETRY_ON_EINTR(kevent(kq, changes, ArrayCount(changes), 0, 0, 0)) < 0) {
-      fprintf(stderr, "ERROR: failed to register process %d with kqueue, errno %d\n", pid, errno);
+    struct kevent receipts[ArrayCount(changes)] = {0};
+    EV_SET(&changes[0], pid, EVFILT_PROC, EV_ADD|EV_RECEIPT, NOTE_EXIT, 0, 0);
+    EV_SET(&changes[1], captures_linux[0].fds[0], EVFILT_READ, EV_ADD|EV_RECEIPT, 0, 0, 0);
+    EV_SET(&changes[2], captures_linux[1].fds[0], EVFILT_READ, EV_ADD|EV_RECEIPT, 0, 0, 0);
+    B32 process_registered = 1;
+    int receipt_count = MAC_RETRY_ON_EINTR(kevent(kq, changes, ArrayCount(changes), receipts, ArrayCount(receipts), 0));
+    if (receipt_count < 0) {
+      fprintf(stderr, "ERROR: failed to register process %d and its pipes with kqueue, errno %d\n", pid, errno);
+      process_registered = 0;
+      for EachElement(i, captures_linux) { captures_linux[i].is_live = 0; }
+    }
+    for (int receipt_idx = 0; receipt_idx < receipt_count; receipt_idx += 1) {
+      struct kevent *receipt = &receipts[receipt_idx];
+      if ((receipt->flags & EV_ERROR) && receipt->data != 0) {
+        if (receipt->filter == EVFILT_PROC) {
+          if (receipt->data != ESRCH) {
+            fprintf(stderr, "ERROR: failed to register process %d with kqueue, errno %d\n", pid, (int)receipt->data);
+          }
+          process_registered = 0;
+        } else {
+          fprintf(stderr, "ERROR: failed to register a pipe of process %d with kqueue, errno %d\n", pid, (int)receipt->data);
+          for EachElement(i, captures_linux) {
+            if (receipt->ident == (uintptr_t)captures_linux[i].fds[0]) { captures_linux[i].is_live = 0; }
+          }
+        }
+      }
+    }
+    if (!process_registered) {
+      int status;
+      if (MAC_RETRY_ON_EINTR(waitpid(pid, &status, 0)) >= 0) {
+        g_last_exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : max_U64;
+      } else {
+        fprintf(stderr, "ERROR: failed to reap process %d\n", pid);
+      }
+      is_process_live = 0;
     }
   }
-  
-  B32  is_process_live          = 1;
+
   U64  endt_us                  = ENDT_US(timeout_us);
   U64  read_buffer_default_size = MB(1);
   U64  read_buffer_size         = read_buffer_default_size;
@@ -1208,7 +1276,7 @@ t_help(void)
   fprintf(stderr, "   -gcc:<path>           Override default gcc path\n");
   fprintf(stderr, "   -linker:<path>        Path to PE/COFF linker\n");
   fprintf(stderr, "   -print_stdout         Print to console stdout and stderr of a run\n");
-  fprintf(stderr, "   -out:<path>           Directory path for test outputs (default \"%.*s\")\n", str8_varg(g_out));
+  fprintf(stderr, "   -out:<path>           Directory path for test outputs (default \"%.*s\" next to the torture binary)\n", str8_varg(g_out));
   fprintf(stderr, "   -build_only           Build debugger harness without running the tests\n");
   fprintf(stderr, "   -verbose              Enable verbose mode\n");
   fprintf(stderr, "   -help                 Print help menu and exit\n");
@@ -1375,6 +1443,11 @@ t_entry_point(CmdLine *cmdline)
 #endif
   
   // Handle -out
+  //
+  // rjf: without -out, the artifacts go next to the torture binary (build/torture_artifacts),
+  // wherever torture is run from (they used to land in the working directory: a run from the
+  // repository root wrote torture_artifacts/ and torture.out there). An explicit -out path is
+  // taken as given, relative to the working directory.
   {
     CmdLineOpt *out_opt = cmd_line_opt_from_string(cmdline, str8_lit("out"));
     if (out_opt) {
@@ -1383,9 +1456,11 @@ t_entry_point(CmdLine *cmdline)
       } else {
         fprintf(stderr, "ERROR: -out invalid number of arguments");
       }
+    } else {
+      g_out = str8f(scratch.arena, "%S/%S", get_process_info()->binary_path, g_out);
     }
   }
-  
+
   //
   // Make Output Directory
   //
@@ -1394,10 +1469,11 @@ t_entry_point(CmdLine *cmdline)
     fprintf(stderr, "ERROR: unable to create output directory \"%.*s\"\n", str8_varg(g_out));
     goto exit;
   }
-  
+
   //
-  // Clean up output from previous run
+  // Clean up output from previous run (the last invoked process' stdout, in the output directory)
   //
+  g_stdout_file_name = str8f(scratch.arena, "%S/%S", g_out, g_stdout_file_name);
   delete_file_at_path(g_stdout_file_name);
   
   //

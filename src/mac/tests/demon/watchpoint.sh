@@ -9,7 +9,7 @@
 # (IPC output suppresses addresses, so the pointer's value cannot be checked through `eval`.)
 source "$(dirname ${(%):-%x})/common.sh"
 build_c watch_global
-write_project watch_global $S/watch_global "" <<'EOF'
+write_project watch_global $S/watch_global "" - <<'EOF'
 breakpoint:
 {
   address_location: "(uint64)p"

@@ -7,7 +7,7 @@
 # are allocated; a thread created and writing within one uninterrupted run is not caught.)
 source "$(dirname ${(%):-%x})/common.sh"
 build_c watch_thread
-write_project watch_thread $S/watch_thread "" <<'EOF'
+write_project watch_thread $S/watch_thread "" - <<'EOF'
 mac_sigusr1: 0
 breakpoint:
 {

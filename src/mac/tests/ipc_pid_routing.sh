@@ -17,28 +17,37 @@
 #
 # Settings: RADDBG, PORT_A (7603), PORT_B (7604), HARNESS_DIR, SLEEPER (a long-lived target
 # binary; built if missing).
+#
+# This proof drives two instances on two ports by hand and never through lib.sh's single-instance
+# dbg_start / ipc / wait_up: the routing under test is the client's, and every reply must be traced to
+# the instance it was addressed to. It takes from lib.sh only the binary, the scratch directory,
+# `field` and the listener lookup by port (lsof, LISTEN on the port: no connection).
 set -u
-RD=${RADDBG:-"$(cd "$(dirname ${(%):-%x})/../../.." && pwd)/build/raddbg"}
+source "$(cd "$(dirname ${(%):-%x})" && pwd)/lib.sh"
 PA=${PORT_A:-7603}
 PB=${PORT_B:-7604}
-S=${HARNESS_DIR:-$(mktemp -d /tmp/raddbg_ipc_pid.XXXXXX)}
-mkdir -p $S
+# a scratch directory of our own is removed at exit; a HARNESS_DIR given by the caller is theirs
+remove_owned_harness_dir_at_exit
 SLEEPER=${SLEEPER:-"$S/sleeper"}
 # rd_ipc_port_from_pid (raddbg_main.c): a window of the registered range, 20000..39999
 port_from_pid() { echo $(( 20000 + ($1 % 20000) )); }
-field() { echo "$1" | grep -m1 " $2:" | awk '{print $2}'; }
-wait_listen() { local port=$1; for i in $(seq 1 400); do lsof -nP -iTCP:$port -sTCP:LISTEN 2>/dev/null | grep -q raddbg && return 0; sleep 0.05; done; return 1; }
+wait_listen() { local port=$1; for i in $(seq 1 400); do [[ -n "$(listener_pid $port)" ]] && return 0; sleep 0.05; done; return 1; }
 listens_on() { lsof -nP -iTCP:$2 -sTCP:LISTEN 2>/dev/null | grep -q " $1 "; }
+# from_pid <expected pid> <reply>: the reply came from the expected instance. Every reply below is
+# checked this way: the user's own debugger (default port 7423, and its own pid-derived port) could
+# answer a misrouted command, and a reply from it must fail the proof, never pass it.
+from_pid() { [[ -n "$2" && "$(field "$2" pid)" == "$1" ]]; }
 fails=0
 
-for port in $PA $PB; do pgrep -f "raddbg --ipc_port:$port" | xargs kill -9 2>/dev/null; done
+for port in $PA $PB; do pid=$(listener_pid $port); [[ -n "$pid" ]] && kill -9 $pid 2>/dev/null; done
 rm -f $S/a.raddbg_user $S/b.raddbg_user
 
 ($RD --ipc_port:$PA --user:$S/a.raddbg_user --project:$S/a.raddbg --logs:$S/logs_a > $S/a.out 2>&1 &)
 ($RD --ipc_port:$PB --user:$S/b.raddbg_user --project:$S/b.raddbg --logs:$S/logs_b > $S/b.out 2>&1 &)
 wait_listen $PA || { echo "A never listened on $PA"; exit 1; }
 wait_listen $PB || { echo "B never listened on $PB"; exit 1; }
-PIDA=$(pgrep -f "raddbg --ipc_port:$PA"); PIDB=$(pgrep -f "raddbg --ipc_port:$PB")
+PIDA=$(listener_pid $PA); PIDB=$(listener_pid $PB)
+[[ -n "$PIDA" && -n "$PIDB" && "$PIDA" != "$PIDB" ]] || { echo "FAIL: A ($PIDA) and B ($PIDB) are not two distinct instances"; kill -9 $PIDA $PIDB 2>/dev/null; exit 1; }
 PPA=$(port_from_pid $PIDA); PPB=$(port_from_pid $PIDB)
 echo "instance A pid=$PIDA default_port=$PA pid_port=$PPA"
 echo "instance B pid=$PIDB default_port=$PB pid_port=$PPB"
@@ -54,13 +63,13 @@ else
   echo "NOTE: pid ports collided ($PPA); skipping ownership cross-check"
 fi
 
-# drive each specific instance by --pid; `state` names the instance which answered
+# drive each specific instance by --pid; `state` names the instance which answered (from_pid)
 ra=$($RD --ipc --pid:$PIDA state 2>&1); echo "$ra" | grep -q "version" && echo "OK: --pid:$PIDA state replied" || { echo "FAIL: --pid:$PIDA no reply"; fails=$((fails+1)); }
 rb=$($RD --ipc --pid:$PIDB state 2>&1); echo "$rb" | grep -q "version" && echo "OK: --pid:$PIDB state replied" || { echo "FAIL: --pid:$PIDB no reply"; fails=$((fails+1)); }
-[[ "$(field "$ra" pid)" == "$PIDA" ]] && echo "OK: --pid:$PIDA reached the instance with pid $PIDA" || { echo "FAIL: --pid:$PIDA reached pid '$(field "$ra" pid)'"; fails=$((fails+1)); }
-[[ "$(field "$rb" pid)" == "$PIDB" ]] && echo "OK: --pid:$PIDB reached the instance with pid $PIDB" || { echo "FAIL: --pid:$PIDB reached pid '$(field "$rb" pid)'"; fails=$((fails+1)); }
-# default-port path still works
-rp=$($RD --ipc_port:$PA --ipc state 2>&1); echo "$rp" | grep -q "version" && echo "OK: --ipc_port:$PA state replied" || { echo "FAIL: default-port path broke"; fails=$((fails+1)); }
+from_pid $PIDA "$ra" && echo "OK: --pid:$PIDA reached the instance with pid $PIDA" || { echo "FAIL: --pid:$PIDA reached pid '$(field "$ra" pid)'"; fails=$((fails+1)); }
+from_pid $PIDB "$rb" && echo "OK: --pid:$PIDB reached the instance with pid $PIDB" || { echo "FAIL: --pid:$PIDB reached pid '$(field "$rb" pid)'"; fails=$((fails+1)); }
+# default-port path still works, and reaches A (not another instance)
+rp=$($RD --ipc_port:$PA --ipc state 2>&1); from_pid $PIDA "$rp" && echo "OK: --ipc_port:$PA state replied from pid $PIDA" || { echo "FAIL: --ipc_port:$PA reached pid '$(field "$rp" pid)' (expected $PIDA)"; fails=$((fails+1)); }
 
 # ipc_pid_attach: attach by pid through --pid routing; the command's own --pid is the target's
 if [[ ! -x "$SLEEPER" ]]; then
@@ -79,12 +88,15 @@ $RD --ipc --pid:$PIDA "attach --pid:$TPID" >/dev/null 2>&1
 attached=""
 for i in $(seq 1 50); do
   sa=$($RD --ipc --pid:$PIDA state 2>&1)
+  from_pid $PIDA "$sa" || { sa=""; sleep 0.1; continue; }   # a reply from another instance says nothing about A
   attached=$(echo "$sa" | sed -n '/^ processes:/,/^ call_stack:/p' | grep "   id:" | awk '{print $2}' | head -1)
   [[ "$attached" == "$TPID" ]] && break
   sleep 0.1
 done
+from_pid $PIDA "$sa" || { echo "FAIL: ipc_pid_attach: --pid:$PIDA state did not reply from pid $PIDA"; fails=$((fails+1)); }
 [[ "$attached" == "$TPID" ]] && echo "OK: ipc_pid_attach: --pid:$PIDA attach --pid:$TPID attached the sleeper ($TPID)" || { echo "FAIL: ipc_pid_attach: instance A lists process '$attached', expected the sleeper $TPID"; fails=$((fails+1)); }
 sb=$($RD --ipc --pid:$PIDB state 2>&1)
+from_pid $PIDB "$sb" || { echo "FAIL: --pid:$PIDB state did not reply from pid $PIDB (got '$(field "$sb" pid)')"; fails=$((fails+1)); }
 [[ "$(echo "$sb" | sed -n '/^ processes:/,/^ call_stack:/p' | grep -c '   id:')" == "0" ]] && echo "OK: instance B has no process (the attach reached A only)" || { echo "FAIL: instance B got a process"; fails=$((fails+1)); }
 $RD --ipc --pid:$PIDA "kill --process:$TPID" >/dev/null 2>&1
 sleep 0.3

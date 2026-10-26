@@ -8,7 +8,7 @@
 # chance stop whose continue delivers the signal to the handler, is the flow suite's `D4`.)
 source "$(dirname ${(%):-%x})/common.sh"
 build_c sigsegv_handler
-write_project sigsegv_handler $S/sigsegv_handler "" <<'EOF'
+write_project sigsegv_handler $S/sigsegv_handler "" - <<'EOF'
 mac_exc_bad_access: 0
 mac_sigsegv: 0
 mac_sigbus: 0

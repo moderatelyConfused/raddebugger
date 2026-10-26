@@ -1,17 +1,16 @@
 #!/bin/zsh
 # Detach: the debugger forgets the process within a second and the debuggee runs on; with two attached
 # processes, detaching one leaves the other known and runnable.
-# Needs the Zig generator project (GENERATOR_SRC, default ~/Desktop/Etc/October-2026/generator) and zig
-# (ZIG, default ~/.zvm/bin/zig); the generator is built (debug, arm64) into the harness directory.
+# Needs the Zig generator project (GENERATOR_DIR, default ~/Desktop/Etc/October-2026/generator) and zig
+# (ZIG, default ~/.zvm/bin/zig; lib.sh's generator_locate); the generator is built (debug, arm64) into
+# the harness directory.
 source "$(dirname ${(%):-%x})/common.sh"
-GEN_SRC=${GENERATOR_SRC:-$HOME/Desktop/Etc/October-2026/generator}
-ZIG=${ZIG:-$HOME/.zvm/bin/zig}
-if [[ ! -x $ZIG || ! -f $GEN_SRC/src/main.zig ]]; then echo "detach: SKIP (needs zig at $ZIG and the generator project at $GEN_SRC)"; exit 0; fi
-(cd $GEN_SRC && $ZIG build -p $S/generator --cache-dir $S/zig-cache) || { echo "detach: SKIP (the generator build failed)"; exit 0; }
-GEN=$S/generator/bin/generator
+generator_locate || { echo "detach: SKIP (needs zig at $ZIG and the generator project at $GENERATOR_DIR)"; exit 0; }
+generator_build $S/generator || { echo "detach: SKIP (the generator build failed)"; exit 0; }
+GEN=$GENERATOR_BIN
 $GEN > $S/generator.expected.txt
-GEN_BP=$GEN_SRC/src/main.zig:$(grep -n -m1 "while (try rng.next())" $GEN_SRC/src/main.zig | cut -d: -f1)
-write_project generator $GEN "" </dev/null
+GEN_BP=$GENERATOR_MAIN:$(line_of_pattern $GENERATOR_MAIN "while (try rng.next())")
+write_project generator $GEN ""
 build_c sleeper
 
 echo "== detach: one process"

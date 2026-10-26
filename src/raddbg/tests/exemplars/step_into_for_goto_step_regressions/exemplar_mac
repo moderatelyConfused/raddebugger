@@ -1,0 +1,6 @@
+stop: main @ step_into_for_goto.c:18
+stop: main @ step_into_for_goto.c:19
+stop: main @ step_into_for_goto.c:21
+stop: main @ step_into_for_goto.c:22
+stop: main @ step_into_for_goto.c:20
+stop: main @ step_into_for_goto.c:24

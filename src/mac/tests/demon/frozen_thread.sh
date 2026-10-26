@@ -15,7 +15,7 @@
 # fault's pending exception was answered with a passing run's flag and the process died of SIGSEGV.
 source "$(dirname ${(%):-%x})/common.sh"
 build_c frozen_thread
-write_project frozen_thread $S/frozen_thread "" <<'EOF'
+write_project frozen_thread $S/frozen_thread "" - <<'EOF'
 mac_sigusr1: 0
 EOF
 launch $S/frozen_thread.raddbg

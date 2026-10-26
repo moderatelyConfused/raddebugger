@@ -13,20 +13,16 @@
 # The script launches an instance, adds and runs a long-lived target (so there is
 # a live debuggee), confirms running==1 and the debuggee process exists, sends a
 # plain `exit` (must be refused, instance still alive), then `exit
-# --force_confirm:1`, and checks the instance process is gone shortly after (and
-# reports what happened to the debuggee).
+# --force_confirm:1`, and checks the instance process is gone shortly after, and
+# the debuggee with it.
 #
 # Settings: RADDBG, SLEEPER (a long-lived target binary; built if missing),
-# IPC_PORT (7607), HARNESS_DIR.
+# IPC_PORT (7607), HARNESS_DIR (see lib.sh: the instance, `ipc`, `field`).
 set -u
-ROOT="$(cd "$(dirname ${(%):-%x})/../../.." && pwd)"
-RD=${RADDBG:-"$ROOT/build/raddbg"}
-P=${IPC_PORT:-7607}
-S=${HARNESS_DIR:-$(mktemp -d /tmp/raddbg_ipc_exit.XXXXXX)}
+export IPC_PORT=${IPC_PORT:-7607}
+source "$(cd "$(dirname ${(%):-%x})" && pwd)/lib.sh"
+remove_owned_harness_dir_at_exit
 SLEEPER=${SLEEPER:-"$S/sleeper"}
-mkdir -p $S
-ipc() { $RD --ipc_port:$P --ipc "$@" 2>&1; }
-field() { echo "$1" | grep -m1 " $2:" | awk '{print $2}'; }
 
 # build a long-lived debuggee if one was not provided
 if [[ ! -x "$SLEEPER" ]]; then
@@ -39,13 +35,12 @@ EOF
   SLEEPER="$S/sleeper"
 fi
 
-pgrep -f "raddbg --ipc_port:$P" | xargs kill -9 2>/dev/null
-rm -f $S/u.raddbg_user
-($RD --ipc_port:$P --user:$S/u.raddbg_user --project:$S/p.raddbg --logs:$S/logs > $S/out.txt 2>&1 &)
-for i in $(seq 1 400); do lsof -nP -iTCP:$P -sTCP:LISTEN 2>/dev/null | grep -q raddbg && break; sleep 0.05; done
+# a fresh instance (dbg_start: an earlier one on the port is killed, readiness is the listener, the pid
+# is RD_PID), then the first `state` answered before the test's own commands
+dbg_start $S/p.raddbg || { echo "FAIL: no instance listens on $IPC_PORT"; exit 1; }
 (ipc state >/dev/null 2>&1 &)
-for i in $(seq 1 100); do ipc state | grep -q version && break; sleep 0.1; done
-PID=$(pgrep -f "raddbg --ipc_port:$P")
+wait_up >/dev/null
+PID=$RD_PID
 echo "instance pid $PID"
 
 ipc add_target "$SLEEPER" >/dev/null 2>&1
@@ -66,29 +61,31 @@ refusal=$(ipc exit 2>&1 | head -1)
 echo "reply: $refusal"
 sleep 0.5
 refused=0
-if echo "$refusal" | grep -q "^error: exit: still attached" && pgrep -f "raddbg --ipc_port:$P" >/dev/null; then refused=1; fi
+if echo "$refusal" | grep -q "^error: exit: still attached" && kill -0 $PID 2>/dev/null; then refused=1; fi
 echo "plain exit refused, instance still alive: $refused"
-if [[ $refused -ne 1 ]]; then echo "FAIL: a plain exit with a live debuggee was not refused"; pgrep -f "raddbg --ipc_port:$P" | xargs kill -9 2>/dev/null; kill -9 $DBG_PID 2>/dev/null; exit 1; fi
+if [[ $refused -ne 1 ]]; then echo "FAIL: a plain exit with a live debuggee was not refused"; kill -9 $PID 2>/dev/null; kill -9 $DBG_PID 2>/dev/null; exit 1; fi
 
 echo "=== sending IPC exit --force_confirm:1 ==="
 ipc exit --force_confirm:1 >/dev/null 2>&1
-# the instance must terminate shortly
+# the instance must terminate shortly, and take its debuggee down with it (the GUI's confirmed
+# close kills the attached processes; a debuggee left running would be an orphan of the test)
 gone=0
-for i in $(seq 1 50); do pgrep -f "raddbg --ipc_port:$P" >/dev/null || { gone=1; break; }; sleep 0.1; done
-sleep 0.3
-dbg_gone=1; kill -0 $DBG_PID 2>/dev/null && dbg_gone=0
+for i in $(seq 1 50); do kill -0 $PID 2>/dev/null || { gone=1; break; }; sleep 0.1; done
+dbg_gone=0
+for i in $(seq 1 30); do kill -0 $DBG_PID 2>/dev/null || { dbg_gone=1; break; }; sleep 0.1; done
 
 echo "instance terminated after exit: $gone"
 echo "debuggee (pid $DBG_PID) terminated: $dbg_gone"
 
 # cleanup
-pgrep -f "raddbg --ipc_port:$P" | xargs kill -9 2>/dev/null
+kill -9 $PID 2>/dev/null
 [[ $dbg_gone -eq 0 ]] && kill -9 $DBG_PID 2>/dev/null
 echo "----"
-if [[ $gone -eq 1 ]]; then
-  echo "PASS: IPC exit quit the instance despite a live debuggee (debuggee terminated: $dbg_gone)"
+if [[ $gone -eq 1 && $dbg_gone -eq 1 ]]; then
+  echo "PASS: IPC exit quit the instance despite a live debuggee, and the debuggee with it"
   exit 0
 else
-  echo "FAIL: instance still running after IPC exit"
+  [[ $gone -eq 1 ]]     || echo "FAIL: instance still running after IPC exit"
+  [[ $dbg_gone -eq 1 ]] || echo "FAIL: the debuggee (pid $DBG_PID) survived the instance's exit"
   exit 1
 fi

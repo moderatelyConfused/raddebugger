@@ -10,16 +10,17 @@
 # symbol-only files and sweeps). Checks: the old directories are gone, the new one and the
 # real ones remain, the ctrl log records the removal.
 #
-# Settings: RADDBG, IPC_PORT (7611), HARNESS_DIR.
+# Settings: RADDBG, IPC_PORT (7611), HARNESS_DIR (see lib.sh: the instance, `ipc`, `field`, the waits).
 set -u
-ROOT="$(cd "$(dirname ${(%):-%x})/../../.." && pwd)"
-RD=${RADDBG:-"$ROOT/build/raddbg"}
-P=${IPC_PORT:-7611}
-S=${HARNESS_DIR:-$(mktemp -d /tmp/raddbg_sweep.XXXXXX)}
+export IPC_PORT=${IPC_PORT:-7611}
+source "$(cd "$(dirname ${(%):-%x})" && pwd)/lib.sh"
+remove_owned_harness_dir_at_exit
+# the instance's HOME (and this script's: nothing here needs the real one) is under the scratch
+# directory, so the symbol-only image files and the sweep stay out of the user's cache
+export HOME=$S/home
 IMAGES=$S/home/Library/Caches/raddbg/images
 mkdir -p $S/src $IMAGES
-ipc() { $RD --ipc_port:$P --ipc "$@" 2>&1; }
-field() { echo "$1" | grep -m1 " $2:" | awk '{print $2}'; }
+WAIT_STOP_POLLS=200   # the first stop includes the conversions and the sweep: 20 s
 
 cat > $S/src/hi.c <<'EOF'
 #include <stdio.h>
@@ -36,20 +37,17 @@ mkdir -p $IMAGES/00000000-0000-0000-0000-00000000NEW1; head -c 4096 /dev/zero > 
 before=$(ls $IMAGES | wc -l | tr -d ' ')
 
 fails=0
-rm -f $S/u.raddbg_user $S/p.raddbg; rm -rf $S/logs
-HOME=$S/home $RD --ipc_port:$P --user:$S/u.raddbg_user --project:$S/p.raddbg --logs:$S/logs > $S/out.txt 2>&1 &
-PID=$!
-for i in $(seq 1 600); do lsof -nP -iTCP:$P -sTCP:LISTEN 2>/dev/null | grep -q raddbg && break; sleep 0.05; done
+# a fresh project and log (dbg_start: fresh user file, an earlier instance on the port killed, the listener awaited)
+rm -f $S/p.raddbg; rm -rf $S/logs
+dbg_start $S/p.raddbg || { echo "FAIL: no instance listens on $IPC_PORT"; exit 1; }
+PID=$RD_PID
 ipc add_target "$S/src/hi" >/dev/null 2>&1
 ipc add_function_breakpoint main >/dev/null 2>&1
-ipc run >/dev/null 2>&1
-for i in $(seq 1 200); do st=$(ipc state); sc=$(field "$st" stop_count); [[ "$(field "$st" running)" == "0" && -n "$sc" && "$sc" -gt 0 ]] && break; sleep 0.1; done
-sym=$(ipc state | grep -m1 ip_voff_symbol | cut -d'"' -f2)
+st=$(run_stop)
+sym=$(stop_symbol "$st")
 echo "stopped at main (symbol=\"$sym\")"
 [[ "$sym" == main ]] || { echo "FAIL: did not stop at main"; fails=$((fails+1)); }
-ipc exit >/dev/null 2>&1
-for i in $(seq 1 100); do kill -0 $PID 2>/dev/null || break; sleep 0.05; done
-kill -9 $PID 2>/dev/null
+dbg_stop
 
 after=$(ls $IMAGES | wc -l | tr -d ' ')
 echo "images directories: $before seeded -> $after after the stop (the debuggee's own shared-cache images were added)"
