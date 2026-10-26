@@ -48,17 +48,24 @@ bundled with Zig: `zig cc -target aarch64-macos -fsyntax-only ...`).
   (no rollback). Single stepping: `MDSCR_EL1.SS` via `ARM_DEBUG_STATE64`.
   Watchpoints: `DBGWCR/DBGWVR` via `ARM_DEBUG_STATE64`; since arm64 reports
   them before the access, the demon steps past the access internally.
-* Modules: a permanent `brk` on dyld's `_dyld_debugger_notification`
+* Modules: a permanent `brk` on dyld's debugger-notification function
   (`x0` = mode, `x1` = count, `x2` = `dyld_image_info[]`) reports loads and
   unloads; the demon steps over its own trap internally. Mode 3
   (`dyld_image_dyld_moved`, dyld handing over to its copy in the shared cache)
-  re-targets the trap to the new dyld. As a safety net, every stop compares
-  `dyld_all_image_infos.infoArrayCount` with the last seen count and diffs the
-  image list when it changed (or when the trap could not be placed; the
-  `notification` pointer is used as a fallback once dyld has rebased, with
-  pointer-authentication bits stripped). Module info is parsed from the
-  in-memory Mach-O header (`__unwind_info`, `__eh_frame`, UUID, entry point,
-  `__thread_vars`).
+  re-targets the trap to the new dyld. The notifier address is the pointer dyld
+  publishes in `dyld_all_image_infos.notification` (on this macOS the
+  shared-cache dyld's `_lldb_image_notifier`; its local symbol is not in the
+  on-disk dyld's symbol table, so the published pointer, PAC-stripped, is the
+  reliable source, with a symbol lookup — `_dyld_debugger_notification`,
+  `__dyld_debugger_notification`, `_lldb_image_notifier` — as a fallback). As a
+  safety net, every stop re-reads `dyld_all_image_infos` and diffs the image
+  list against the last seen count. The struct address captured at launch
+  belongs to the initial dyld and goes stale once dyld hands over (the old
+  struct keeps reporting one image), so the demon reads both the cached address
+  and the one `TASK_DYLD_INFO` currently reports and keeps whichever lists more
+  images (`mac_dmn_process_read_all_image_infos`); the trap is (re)armed from
+  that struct's notifier. Module info is parsed from the in-memory Mach-O header
+  (`__unwind_info`, `__eh_frame`, UUID, entry point, `__thread_vars`).
 * Exception codes reported to the engine: BSD signal numbers, or
   `0x10000 + EXC_*` for Mach exception types (see `mac/mac.mdesk`).
 * TLS: `dmn_thread_get_module_tls_vaddr` returns the thread's TLS block for
@@ -77,12 +84,54 @@ bundled with Zig: `zig cc -target aarch64-macos -fsyntax-only ...`).
   stepping into a call, or a `ret`. `uwnd_arm64_code_state_from_pc`
   (`unwind/unwind.c`) replays the prologue instructions from the function
   start (or, without a known start, recognizes a frame setup ahead of pc) and
-  scans ahead for a return through the remaining stack pops; in those states
-  the return address is `lr`, the caller's `fp` is still in `fp`, and only
-  the entry stack pointer is computed from the code. In DWARF mode the CFI row
-  is evaluated with `fp` pointed back at the intact frame record, so that the
-  callee-saved registers are restored from their slots as usual. Verified on a
-  Linux host against the prologues and epilogues of a Zig-built arm64 binary.
+  scans ahead for a return; in those states the return address is `lr`, the
+  caller's `fp` is still in `fp`, and only the entry stack pointer is computed
+  from the code. In DWARF mode the CFI row is evaluated with `fp` pointed back
+  at the intact frame record, so that the callee-saved registers are restored
+  from their slots as usual.
+* The analysis reads the code through the unwind's `MemoryMap`, which the
+  engine fills on demand: when the window around pc (`[pc-128, pc+128)`,
+  clamped to pc's page, always including a known function start) is not in
+  the map yet, the analysis reports `UWND_ARM64_CodeState_NeedRead` and the
+  unwinders return `UWND_StepStatus_FailedMemoryRead` with that range; the
+  engine reads it and retries the step (one extra round trip for the stopped
+  frame). Before this the reads silently failed and every pc looked like a
+  function body, so the frame-pointer rule was applied at a `ret` or in a
+  prologue and the caller's frame went missing (step out then overshot by a
+  frame).
+* The forward scan treats every instruction which can be shown not to write
+  `sp`, `x29` or `x30` as transparent (`uwnd_arm64_code_is_frame_neutral`),
+  lets conditional branches fall through, and stops at calls, traps, frame
+  record restores, pushes and unknown instructions. Reaching `ret` that way
+  means `lr` is intact and the entry `sp` is `sp` plus the pops passed, which
+  also covers frameless leaves that never store a frame record (dyld's
+  `_tlv_get_addr`, which every Zig `threadlocal` access calls): a step into
+  such a line now shows the caller as frame 1, and step out returns to it. A
+  `b`/`br` right after the frame record pop (or any stack pop) is a tail call.
+  The prologue replay is relaxed the same way, so argument moves between the
+  stack adjustment and the stores do not end it.
+* Outer frames hold return addresses. `UWND_ModuleInfo.pc_is_return_address`
+  (set by the engine for every frame but the first) makes the module lookup,
+  the `__unwind_info` lookup, the FDE search and the CFI row selection use
+  `pc-1`, the call's own address, and skips the code analysis (the code at a
+  return address has not run). Without it a function ending in a call to a
+  noreturn function was attributed to the function that follows it in the
+  binary, and the unwind stopped there. A CIE with the `S` augmentation marks
+  a signal trampoline: `UWND_StepResult.is_signal_frame` is surfaced so the
+  engine does not treat the frame above it as a return address.
+* The end of a frame-pointer chain (`fp == 0`) is the outermost frame (pc 0,
+  a good step) rather than an error, in both the compact-frame rule and the
+  moduleless unwinder, and the engine keeps the frames it has when an outer
+  frame's step fails or needs memory it cannot read; a thread blocked in
+  `sleep` shows `__semwait_signal` up to `thread_start`. When the code at the
+  *stopped* pc cannot be read at all (a call through a bad pointer),
+  `pc_code_unreadable` is set and the moduleless unwinder treats the stop as
+  the callee's first instruction (return address in `lr`), as lldb does.
+* Decoder: `stp`/`ldp` to `[sp]` are recognized by `(code & 0x3a000000) ==
+  0x28000000` (bit 25 clear); the old mask also matched logical
+  shifted-register ops with `Rn = xzr`, so `mov xN, xM` counted as a 16-byte
+  pair store. `src/mac/tests/unwind_arm64_test.c` checks the decoder and the
+  analysis on hand-assembled sequences (build line in its header).
 
 ## Display scaling
 
@@ -209,16 +258,47 @@ parts of the execution; calls to `next()` after the first jump straight to
   The IPC listener sets `SO_REUSEADDR` (a restarted debugger could not bind
   while old connections lingered) and messages that arrive before the first
   window exists are run and answered instead of dropped.
-* Still open in IPC: the *first* reply of a fresh instance is delivered to
-  the instance itself (its listener receives a packet of the reply's size
-  right after the reply is sent), so the first `--ipc` client waits out its
-  10 s timeout; every later command is answered within ~40 ms. The connection
-  lookup in `sock_async_tick` (`mac_socket.c`) is where to look.
+* The *first* `--ipc` reply of a fresh instance no longer stalls. The earlier
+  10 s wait came from the listener rebind and the main-loop wakeup (both fixed
+  above), not a misdelivered reply: instrumenting the fallback `connect` in
+  `sock_async_tick` showed it never fires, and the reply always goes back on
+  the accepted socket (~0.1 s). The connection lookup was hardened anyway so
+  the endpoint stored on accept and the one reconstructed on recv/send are
+  byte-identical for every address family: `SOCK_Endpoint.kind` is set on
+  accept and carried in the ring header's protocol word, so the hash and
+  `MemoryMatchStruct` agree (`mac_socket.c`). A reply larger than the
+  listener's recv chunk is also reassembled by the `--ipc` client now, so
+  `state` with a full module list is no longer truncated (`raddbg_main.c`).
+  Verified by `tests/ipc_first_reply.sh` (10 fresh instances, first `state`
+  under 1 s each).
+* `raddbg --ipc --pid:<pid>` routes to a specific instance (used by
+  `raddbg/tests/raddbg_tests.c`). Each instance additionally listens on a port
+  derived from its own pid (`rd_ipc_port_from_pid`, `raddbg_main.c`), and a
+  client with `--pid` derives the same port; the default port 7423 is
+  untouched, so interactive clients are unaffected
+  (`tests/ipc_pid_routing.sh`).
+* Dynamic library load/unload events now arrive (previously the demon logged
+  "could not find _dyld_debugger_notification ... load events will be
+  synthesized at stops" and only the main executable and dyld appeared, so
+  frames in shared-cache modules had no module and no unwind info). Two causes,
+  both in `mac_demon.c`: the symbol `_dyld_debugger_notification` does not exist
+  in this macOS' dyld (the notifier is `_lldb_image_notifier`), and the
+  `dyld_all_image_infos` address captured at launch goes stale after dyld hands
+  over to its shared-cache copy. The demon now prefers the published
+  `notification` pointer and re-queries `TASK_DYLD_INFO`, reading whichever of
+  the two candidate structs lists more images. After a stop in `main`,
+  `ctrl_thread.raddbg_log` and `state` modules list libSystem.B.dylib,
+  libsystem_kernel.dylib and the rest, and a dlopen/dlclose produce LoadModule /
+  UnloadModule events (`tests/dyld_module_events.sh`). Still missing: a function
+  breakpoint in a no-DWARF shared-cache module (e.g. `write`) cannot resolve,
+  because `rdi_from_macho.c` converts only `__DWARF`, not the Mach-O symbol
+  table, into RDI procedures — a separate converter change.
 * Driving the debugger from a script: `launch_and_step_into` sent over `--ipc`
   has no target in its registers and launches nothing; send `step_into` with
-  no process instead. Fire one throwaway command in the background right
-  after the port accepts connections, to absorb the first-reply stall. `exit` over IPC does not quit an instance with a live
-  process (kill it by pid). A `step_into` at the first instruction of an
+  no process instead. `exit` over IPC now quits an instance even with a live
+  debuggee: the external-driver path force-confirms the "attached to a live
+  process" popup and tears the debuggee down like the GUI's close
+  (`tests/ipc_exit_live.sh`). A `step_into` at the first instruction of an
   inlined call only selects the next inline frame, without a run. Each IPC
   `state` renders a frame, so poll at 100ms or slower. The harness used
   (`h.sh`: launch, breakpoint, run, step, printing every stop with its inline
@@ -237,13 +317,18 @@ Open:
   return address (`lr`, or `[sp]` on x64) and keep stepping" (the module ->
   `d_dbgi_key_from_module` -> `di_rdi_from_key` -> `rdi_line_info_idx_from_voff`
   lookup is available on that thread). A UI-level "step out, then resume the
-  step into" was tried and removed: at the first instruction of a frameless
-  function without known unwind info the unwinder falls back to the frame
-  pointer chain and skips the callee's frame, so the step out returned one
-  frame too far (`range` -> `entryPoint`). That unwinder weakness is itself
-  worth fixing (prefer `lr` when nothing was pushed yet); shared-cache
-  modules may also lack unwind info because dyld's notification hook is not
-  found here ("dynamic library load events will be synthesized at stops").
+  step into" was tried and removed when the unwinder still skipped the
+  caller of a frameless function (fixed since, see "Unwinding": the step out
+  from `_tlv_get_addr` returns to the caller now).
+* Frame names of outer frames come from the raw return address (the UI and
+  `d_call_stack_from_unwind` look symbols and scopes up at pc, not pc-1), so
+  a frame whose call does not return (`fn a() void { @panic("x"); }`) is
+  named after the function which follows it in the binary; the unwind itself
+  is right (its callers are found).
+* Call stacks are artifacts computed asynchronously: the first `--ipc eval`
+  of another thread's frame (`query:threads[1].call_stack[0].address`) can
+  come back empty ("Could not find a member named `address`") while the
+  stack is being built; the same query a moment later answers.
 * `step_out` from an inlined function steps out of the concrete function; it
   could use the selected inline site's ranges (`step_out_scope` already works
   from scope ranges).
@@ -253,6 +338,135 @@ Open:
 * A headless driver (the demon from a console program, the way `torture`
   does) would still be useful; the `--ipc` loop above is the next best thing.
 
+## Converter conformance corpus (2026-10-25, night)
+
+`src/mac/tests/macho_corpus/` holds a Mach-O test corpus and a checker for the
+DWARF → RDI converter; `RESULTS.md` there is the table of the last run (with a
+hand-maintained findings section at the end).
+
+* `build_corpus.sh [-o <dir>]` builds the matrix into a directory outside the
+  repository (default `$TMPDIR/raddbg_macho_corpus`): C at `-O0`, `-O2`,
+  `-O3 -fomit-frame-pointer`, `-flto`, `-gdwarf-3`, `-gdwarf-4`, with relative
+  source paths, and with `DW_AT_call_file`/`DW_AT_call_line` stripped from the
+  inline sites (assembly rewrite); C++ (templates, virtual calls, exceptions,
+  lambdas) at `-O0`, `-O2`, `-flto`; a dylib with an executable linking it and
+  one `dlopen()`ing it; a static library (`N_OSO` into the archive); threads
+  with `_Thread_local`; large frames / VLAs / `alloca`; deep recursion; signal
+  handlers; an arm64+x86_64 universal binary; the Zig generator in Debug,
+  ReleaseSafe and ReleaseFast (`zig build --prefix ... --cache-dir ...`, the
+  project is not touched); Rust (`split-debuginfo=unpacked`) and Swift. Every
+  entry comes twice: with a `.dSYM` next to it, and as the bare executable with
+  only its debug map, so that `radbin` runs `dsymutil` itself.
+* `python3 -I check_corpus.py [--build-dir <dir>] [--results RESULTS.md]`
+  converts every binary with `build/radbin --rdi` and validates `radbin --dump`
+  against `dwarfdump --debug-line` / `--debug-info` / `--uuid` of the dSYM (its
+  own `dsymutil` run for debug-map entries) and `otool -l`: the guid is the
+  `LC_UUID`; `voff_max` and the binary sections cover the text; one unit per
+  CU; every `is_stmt` row is covered, with its line and file, by the unit's
+  table or, inside a `DW_TAG_inlined_subroutine`, by the innermost site's,
+  while the enclosing tables carry `DW_AT_call_line`; tables are sorted,
+  non-empty, inside the image and inside a DWARF sequence; procedures, lexical
+  blocks and inline sites match the DIE tree structurally (ranges as voffs,
+  names, nesting); inline sites have function types; source line maps agree
+  with the tables; file-scope globals and thread-locals exist with their
+  addresses. 70 binaries take about 25 s; the largest (the Zig Debug
+  generator, 2.7 MB of DWARF) converts in 0.1 s.
+
+Found by the corpus and fixed (`dwarf_parse.c`, `rdi_from_dwarf.c`,
+`macho_parse.c`, `radbin.c`):
+
+* `.debug_rnglists` / `.debug_loclists`: a `DW_RLE_base_addressx` (and
+  `base_address`) entry pushed an empty range at address 0, so every scope
+  with `DW_AT_ranges` in clang's DWARF 5 (dsymutil begins each list with one)
+  carried `[-base, -base)`, the scope vmap reached `0xffffffff00000000`, and
+  multi-range lexical blocks and inline sites did not match their DIEs.
+* Line table file names: an absolute DWARF 5 file name was appended to its
+  include directory (`<comp_dir>/<absolute path>`); entry 0 names the primary
+  file in full and clang's rows use it whenever the source lies outside the
+  compilation directory, so the debugger could not find the source.
+* `DW_FORM_ref_addr` references resolved to 0 (dsymutil's ODR uniquing turns
+  `DW_AT_specification` / `DW_AT_abstract_origin` into them, LTO too), and
+  `DW_AT_specification` was never followed: C++ member function definitions
+  and Rust methods were nameless procedures, inline sites of libc++ and LTO
+  builds were named `???`, static data member definitions were dropped. The
+  origin chain now follows both, across units, with the owning unit's context.
+* Variables under namespaces, classes and modules (Rust statics and
+  `thread_local!`, Swift globals, C++ class statics) had no location: the
+  frame-base iteration ran zero times for a parent without frame-base cases.
+* DWARF ≤ 3 location expressions (`DW_FORM_block1`) were ignored (`-gdwarf-3`:
+  no global or TLS locations); `DW_AT_high_pc` of address class was not
+  rebased.
+* From the converter review: inline sites carried the inlinee's return type
+  instead of its function type; abstract instances became rangeless
+  procedures; the single-location sentinel range was rebased; `is_stmt`
+  merging at decode time could carry the caller's line into the first entry of
+  a site's table (rows now keep the flag and extend lines per table); sites
+  without a usable call site (Swift's `/<compiler-generated>`, line 0) left
+  holes in the enclosing tables; a row running past a nested site now gives the
+  enclosing site's table the call line below it.
+* `radbin`'s generated-dSYM cache was keyed by `LC_UUID` only; ld64 hashes the
+  image contents, so the same code with other debug info (`-gdwarf-3`, other
+  source paths, a comment added) shared an entry. The key now includes a hash
+  of the debug map's object paths and modification times (`MACHO_Bin.debug_map_hash`).
+
+Open: Swift functions directly under `DW_TAG_module` get no function type (56
+of 84 procedures in `swiftprog-O`; struct methods do), so their inline sites
+have none either; the checker does not look at locals' locations or types;
+code that the line program attributes to an inlinee's line outside the site's
+ranges keeps that line in the enclosing table (the row-merging heuristic; a
+Rust `dealloc` example is in `RESULTS.md`).
+## Tests
+
+`./run_tests.sh clang debug` (or `release`) builds `raddbg`, `raddbg_non_graphical`,
+`radlink`, `radbin` and `torture` with `./build.sh meta ...` and runs `build/torture`
+over every registered test; macOS is clang-only. Arguments after `--` go to torture,
+e.g. `./run_tests.sh clang debug -- -keep_going -ipc_port:7705 '*'`. By hand:
+
+```
+./build.sh meta clang debug raddbg raddbg_non_graphical radlink radbin torture
+cd build && ./torture -clang:/usr/bin/clang -keep_going -ipc_port:7705 '*'
+```
+
+The `raddbg/*` tests launch `raddbg_non_graphical` instances and drive them over IPC;
+those instances listen on `-ipc_port:<n>` (default: 7700 + torture's pid modulo 100), so
+a debugger open on the default port is left alone. Each test's own user and project
+files, the debugger's console output and the built debuggees land in
+`build/torture_artifacts/<test>/`.
+
+The prebuilt test inputs (`local/test_data/inputs`, fetched by `run_tests.bat` from
+data.raddbg.com) are Windows executables and PDBs, so on macOS the stepping regressions
+run over `src/mule/old_test_debuggees/{basic_stepping_test,step_into_for_goto}.c`,
+compiled on the fly with the host clang (`-g -O0`, Mach-O + dSYM). They launch with
+`step_into` (stop at the entry point, `main`), then alternate `step_into` / `step_over`
+and log every stop (lines, voff, symbol) until the process exits; the log is compared
+with `local/test_data/exemplars/<test>/exemplar_mac`, which the first run creates (and
+`eval2_regressions` writes `exemplar_mac_arm64`). Inspect a new exemplar before trusting
+it: `basic_stepping_test_step_regressions_0` records main:49, 51, foo:33, 35, main:51, 55,
+then a stop at voff 0x4ac without lines, which is the `_printf` stub (`__stubs`): a step
+into the line's last call enters the stub, and the step out from there returns one
+frame too far (see "Step-into and code without line info" above), so the process runs
+to its exit. `step_into_for_goto` records 18, 19, 21, 22, 20, 24 (clang attributes the
+loop's back-jump to the `}` on line 22).
+
+State on 2026-10-25, debug and release builds (158 registered tests): 144 pass, 13
+skip, 1 fail.
+
+* Skipped: the four `mule_main_9ff1e58f_*` stepping tests and the `p2r_*` / `d2r_*`
+  converter tests (no test data on this machine; `run_tests.sh` does not download it),
+  `mdesk/tokenizer` and `d2r_regressions` (skipped upstream), and the four linker
+  tests that need MSVC (`icf_cpp_*` compile with `cl.exe`, `icf_llvm_addrsig*` link
+  `libcmt.lib`): `T_SkipWithoutCl()` in `torture.h`.
+* Failing: `linker/default_lib_matches_explicit_path`. radlink parses its command line
+  with link.exe rules, so an input given as an absolute POSIX path is taken for a
+  `/option` and dropped; the test's second iteration passes the library as
+  `/.../sdk libs/provider.lib`. Reproduce in `build/torture_artifacts/default_lib_matches_explicit_path`:
+  `../../radlink /subsystem:console /entry:entry /out:default.exe entry.obj /include:first_provider "$PWD/sdk libs/provider.lib" /defaultlib:provider.lib`
+  (unresolved `first_provider`); the same command with the relative path links.
+* Fixed to get here: an absolute POSIX path as the command-line target was treated as a
+  `/flag` and never became a target (`rd_init`); `torture` captured child output with
+  `pipe2` and pidfds (now kqueue on macOS), looked for `cl.exe`, and had no mac
+  tables; `lnk_file_rename` used `/proc/self/fd` (now `F_GETPATH`); the first run of
+  an exemplar test compared against a missing exemplar instead of creating it.
 ## Scripted feature-flow suite (src/mac/tests/flows)
 
 `src/mac/tests/flows/run_flows.sh` drives a private debugger instance (its own
@@ -300,13 +514,15 @@ codes), plus `NOTE` lines for observations without a verdict.
 
 ### Results and findings (2026-10-25, this branch)
 
-Fixed here:
+Fixed here (the suite found them; the first and third were fixed independently
+on `macos-arm64-port` at the same time, and the merge kept that branch's
+implementation):
 
 * `--ipc` replies were cut at 4 KB: `mac_socket.c` hands received data out one
   `recv()` chunk at a time and the client in `raddbg_main.c` took the first
   chunk as the whole reply, so `state` with the system libraries loaded (after
   an attach) ended inside the module list. The client gathers packets until
-  the header's size is met.
+  the header's size is met (see "IPC" above).
 * All `T[N]` arrays of one element type became the first one seen
   (`int arr[3]` and `int g_array[8]` both `int [4]`, `sizeof` 16): the DWARF
   converter's type deduplication hashes each tag's attributes, but
@@ -321,9 +537,9 @@ Fixed here:
   not follow (only `DW_AT_abstract_origin`), and clang encodes it as
   `DW_FORM_ref_addr`, which `dw2_reference_info_off_from_form_val` did not
   decode at all (`dwarf_parse.c`). The origin walk now starts at the
-  specification and `ref_addr` / `ref_udata` references resolve. The names are
-  still unqualified (`area`, not `Rect::area`): the container is not derived
-  from the declaration's parent.
+  specification and follows `ref_addr` references into other units (the
+  converter-corpus work above). The names are still unqualified (`area`, not
+  `Rect::area`): the container is not derived from the declaration's parent.
 
 Policy, not bugs (the suite expects these):
 

@@ -10,6 +10,15 @@ Test(p2r_regressions)
     test_input_path(arena, ctx, s("mule_main_9ff1e58f/mule_module.pdb")),
   };
   
+  // rjf: skip without the test data inputs
+  for EachElement(pdb_idx, pdb_paths)
+  {
+    if(properties_from_file_path(pdb_paths[pdb_idx]).modified == 0)
+    {
+      TestSkip();
+    }
+  }
+  
   // rjf: generate RDIs
   {
     ProcessList processes = {0};
@@ -74,6 +83,15 @@ Test(p2r_determinism)
     test_input_path(arena, ctx, s("mule_main_9ff1e58f/mule_main.pdb")),
     test_input_path(arena, ctx, s("mule_main_9ff1e58f/mule_module.pdb")),
   };
+  
+  // rjf: skip without the test data inputs
+  for EachElement(pdb_idx, pdb_paths)
+  {
+    if(properties_from_file_path(pdb_paths[pdb_idx]).modified == 0)
+    {
+      TestSkip();
+    }
+  }
   for EachElement(pdb_idx, pdb_paths)
   {
     // rjf: unpack paths, make output directory

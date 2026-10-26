@@ -10395,6 +10395,7 @@ TEST(icf_comdat_symlink_chain)
 
 TEST(icf_llvm_addrsig)
 {
+  T_SkipWithoutCl(); // links libcmt.lib and runs the executable
   char *main_c = "int foo() { return 123; }\n"
                  "int bar() { return 123; }\n"
                  "int main() {\n"
@@ -10425,6 +10426,7 @@ TEST(icf_llvm_addrsig)
 // object; ICF must parse and mark the resolved symbol's object, not the referrer.
 TEST(icf_llvm_addrsig_external_symbol)
 {
+  T_SkipWithoutCl(); // links libcmt.lib
   char *ref_c = "extern int ext_sig();\n"
                 "int (*ext_sig_addr)() = &ext_sig;\n"
                 "int entry() { return ext_sig_addr(); }\n";
@@ -10663,6 +10665,7 @@ TEST(icf_readonly_non_vftable_data_policy)
 
 TEST(icf_cpp_identical_functions_fold)
 {
+  T_SkipWithoutCl();
   char source[] =
     "extern \"C\" __declspec(noinline) int a(void) { return 42; }\n"
     "extern \"C\" __declspec(noinline) int b(void) { return 42; }\n"
@@ -10685,6 +10688,7 @@ TEST(icf_cpp_identical_functions_fold)
 
 TEST(icf_cpp_multihop_functions_do_not_fold)
 {
+  T_SkipWithoutCl();
   char source[] =
     "__declspec(noinline) int leaf_a(void) { return 1; }\n"
     "__declspec(noinline) int leaf_b(void) { return 2; }\n"

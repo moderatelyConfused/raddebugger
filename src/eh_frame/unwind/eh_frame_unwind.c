@@ -5,15 +5,18 @@
 //~ rjf: Stepping From A Known FDE
 
 internal UWND_StepResult
-eh_uwnd_step_from_fde_vaddr(Arch arch, MemoryMap *memory_map, EH_PtrCtx *ptr_ctx, U64 fde_vaddr, U64 tls_vaddr, void *regs, U64 *cfa_out)
+eh_uwnd_step_from_fde_vaddr(Arch arch, MemoryMap *memory_map, EH_PtrCtx *ptr_ctx, U64 fde_vaddr, U64 tls_vaddr, void *regs, B32 pc_is_return_address, U64 *cfa_out)
 {
   Temp scratch = scratch_begin(0, 0);
   B32 done = 0;
   UWND_StepResult result = {0};
   {
-    //- rjf: unpack context
+    //- rjf: unpack context. an outer frame's pc is the return address of a
+    // call: the row in effect is the call's own (pc-1), as the return address
+    // may lie past the function's last row (a call which does not return)
     ARCH_Info *arch_info = arch_info_from_arch(arch);
     U64 pc = arch_ip_from_reg_block(arch_info, regs);
+    U64 rule_pc = pc - (pc_is_return_address ? 1 : 0);
     
     //- rjf: parse info from FDE entry
     DW_CIE cie = {0};
@@ -141,13 +144,21 @@ eh_uwnd_step_from_fde_vaddr(Arch arch, MemoryMap *memory_map, EH_PtrCtx *ptr_ctx
       fde_inst_data_off = eh_read_fde(fde_data, 0, fde_fmt, arch, fde_vaddr_range.min, ptr_ctx, &cie, &fde);
       cie_inst_data = str8_skip(cie_data, cie_inst_data_off);
       fde_inst_data = str8_skip(fde_data, fde_inst_data_off);
+      
+      // rjf: a CIE augmented with "S" describes a signal trampoline: the pc
+      // this step produces is the interrupted instruction, not a return address
+      if(!done)
+      {
+        String8 aug_string = str8_substr(cie_data, cie.aug_string_range);
+        result.is_signal_frame = (str8_find_needle(aug_string, 0, str8_lit("S"), 0) < aug_string.size);
+      }
     }
     
     //- rjf: parse CIE/FDE info, produce CFI row for this PC
     U64 reg_count = dw_reg_count_from_arch(arch);
     DW_CFIRow cfi_row = {0};
     cfi_row.reg_rules = push_array(scratch.arena, DW_UnwindRule, reg_count);
-    if(!done && contains_1u64(fde.pc_range, pc))
+    if(!done && contains_1u64(fde.pc_range, rule_pc))
     {
       U64 code_align_factor = cie.code_align_factor;
       S64 data_align_factor = cie.data_align_factor;
@@ -458,7 +469,7 @@ eh_uwnd_step_from_fde_vaddr(Arch arch, MemoryMap *memory_map, EH_PtrCtx *ptr_ctx
           
           // rjf: exit early if we found the CFI row for this pc
           {
-            U64 pc_off = (pc - fde.pc_range.min);
+            U64 pc_off = (rule_pc - fde.pc_range.min);
             if(cfi_row.base_pc_off <= pc_off && pc_off < new_base_pc_off)
             {
               computed_row = 1;
@@ -688,6 +699,11 @@ eh_uwnd_step(Arch arch, MemoryMap *memory_map, UWND_ModuleInfo *module_info, U64
     EH_PtrCtx *ptr_ctx = &unwind_info->ptr_ctx;
     ARCH_Info *arch_info = arch_info_from_arch(arch);
     U64 pc = arch_ip_from_reg_block(arch_info, regs);
+    if(module_info->pc_is_return_address)
+    {
+      // rjf: an outer frame: the call (pc-1) is in the function, the return address may not be
+      pc -= 1;
+    }
     
     //- rjf: find nearest FDE entry to the IP
     U64 fde_vaddr = 0;
@@ -733,7 +749,7 @@ eh_uwnd_step(Arch arch, MemoryMap *memory_map, UWND_ModuleInfo *module_info, U64
     }
     
     //- rjf: step using the FDE
-    result = eh_uwnd_step_from_fde_vaddr(arch, memory_map, ptr_ctx, fde_vaddr, tls_vaddr, regs, cfa_out);
+    result = eh_uwnd_step_from_fde_vaddr(arch, memory_map, ptr_ctx, fde_vaddr, tls_vaddr, regs, module_info->pc_is_return_address, cfa_out);
   }
   return result;
 }

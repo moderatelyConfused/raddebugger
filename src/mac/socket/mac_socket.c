@@ -85,12 +85,14 @@ mac_sock_listener_thread_entry_point(void *p)
           case AF_INET:
           {
             struct sockaddr_in *ipv4 = (struct sockaddr_in *)&addr;
+            endpoint.kind = SOCK_EndpointKind_IPv4;
             endpoint.port = ntohs(ipv4->sin_port);
             endpoint.address_u32[0] = ipv4->sin_addr.s_addr;
           }break;
           case AF_INET6:
           {
             struct sockaddr_in6 *ipv6 = (struct sockaddr_in6 *)&addr;
+            endpoint.kind = SOCK_EndpointKind_IPv6;
             endpoint.port = ntohs(ipv6->sin6_port);
             MemoryCopy(endpoint.address_u8, ipv6->sin6_addr.s6_addr, sizeof(endpoint.address_u8));
           }break;
@@ -145,9 +147,14 @@ mac_sock_listener_thread_entry_point(void *p)
       if(recv_result > 0)
       {
         RingGuard g = guarded_ring_open(session->s2u_ring);
+        // NOTE: the endpoint kind rides in the high 32 bits of the protocol word, so
+        // the endpoint reconstructed in sock_recv is byte-identical to the one stored
+        // on accept (otherwise the connection lookup in sock_async_tick, which hashes
+        // and MemoryMatchStructs the whole endpoint, would miss and open a stray
+        // connection instead of replying on the accepted socket).
         U64 header[5] =
         {
-          (U64)SOCK_Protocol_TCP,
+          (U64)SOCK_Protocol_TCP | ((U64)endpoint.kind << 32),
           (U64)endpoint.port,
           endpoint.address_u64[0],
           endpoint.address_u64[1],
@@ -216,9 +223,10 @@ sock_async_tick(void)
             if(guarded_ring_try_read(&g, sizeof(header), header))
             {
               got_more = 1;
-              SOCK_Protocol protocol = (SOCK_Protocol)header[0];
+              SOCK_Protocol protocol = (SOCK_Protocol)(header[0] & 0xffffffff);
               U16 port = (U16)header[1];
               SOCK_Endpoint endpoint = {0};
+              endpoint.kind = (SOCK_EndpointKind)(header[0] >> 32);
               endpoint.address_u64[0] = header[2];
               endpoint.address_u64[1] = header[3];
               endpoint.port = port;
@@ -455,7 +463,10 @@ sock_send(SOCK_Session session, SOCK_Protocol protocol, SOCK_Endpoint endpoint, 
     U64 size_cap = s->u2s_ring->ring->size - sizeof(header);
     U64 size = Min(data.size, size_cap);
     {
-      header[0] = (U64)protocol;
+      // NOTE: the endpoint kind rides in the high 32 bits of the protocol word (see
+      // the listener thread); sock_async_tick reconstructs the full endpoint from it
+      // so the connection-cache lookup matches what was stored on accept.
+      header[0] = (U64)protocol | ((U64)endpoint.kind << 32);
       header[1] = (U64)endpoint.port;
       header[2] = endpoint.address_u64[0];
       header[3] = endpoint.address_u64[1];
@@ -494,8 +505,9 @@ sock_recv(Arena *arena, SOCK_Session session, SOCK_Protocol *protocol_out, SOCK_
         U64 size_cap = s->s2u_ring->ring->size - sizeof(header);
         if(protocol_out != 0)
         {
-          protocol_out[0] = (SOCK_Protocol)header[0];
+          protocol_out[0] = (SOCK_Protocol)(header[0] & 0xffffffff);
         }
+        endpoint_out->kind = (SOCK_EndpointKind)(header[0] >> 32);
         endpoint_out->port = (U16)header[1];
         endpoint_out->address_u64[0] = header[2];
         endpoint_out->address_u64[1] = header[3];

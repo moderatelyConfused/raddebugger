@@ -572,6 +572,25 @@ internal D_WAKEUP_FUNCTION_DEF(wakeup_hook_ctrl)
 }
 
 ////////////////////////////////
+//~ rjf: IPC Port <-> PID Mapping
+//
+// The IPC transport is one TCP listener per instance (default port 7423, or
+// --ipc_port). To let a client address a *specific* instance by pid
+// (`raddbg --ipc --pid:<pid> <cmd>`, as src/raddbg/tests/raddbg_tests.c does),
+// each instance also derives a private port from its own pid and the client
+// derives the same port from --pid. The default port is never changed, so
+// interactive clients and the user's own debugger are unaffected.
+
+internal U16
+rd_ipc_port_from_pid(U64 pid)
+{
+  // rjf: into the IANA dynamic/ephemeral range (49152..65535), away from 7423
+  // and any well-known ports.
+  U16 port = (U16)(49152 + (pid % 16384));
+  return port;
+}
+
+////////////////////////////////
 //~ rjf: Per-Frame Entry Point
 
 internal B32
@@ -608,6 +627,8 @@ entry_point(CmdLine *cmd_line)
   U64 jit_code = 0;
   U64 jit_addr = 0;
   U64 ipc_port = 7423;
+  U64 ipc_target_pid = 0;
+  B32 ipc_port_is_explicit = 0;
   {
     if(cmd_line_has_flag(cmd_line, s("ipc")))
     {
@@ -632,10 +653,12 @@ entry_point(CmdLine *cmd_line)
     try_u64_from_str8_c_rules(jit_addr_string, &jit_addr);
     String8 ipc_port_string = cmd_line_string(cmd_line, s("ipc_port"));
     U64 ipc_port_try = 0;
-    if(try_u64_from_str8_c_rules(ipc_port_string, &ipc_port_try))
+    ipc_port_is_explicit = try_u64_from_str8_c_rules(ipc_port_string, &ipc_port_try);
+    if(ipc_port_is_explicit)
     {
       ipc_port = ipc_port_try;
     }
+    try_u64_from_str8_c_rules(cmd_line_string(cmd_line, s("pid")), &ipc_target_pid);
     jit_attach = (jit_addr != 0);
   }
   
@@ -707,6 +730,19 @@ entry_point(CmdLine *cmd_line)
       //- rjf: set up socket session for IPC
       SOCK_Session ipc_sock_session = sock_session_open((U16)ipc_port, wakeup_hook_ctrl);
       
+      //- rjf: also listen on a port derived from our own pid, so a client can address
+      // *this* instance with `raddbg --ipc --pid:<pid> <cmd>` even when another instance
+      // already holds the default port (see rd_ipc_port_from_pid). The default port is
+      // untouched; non-pid clients are unaffected.
+      SOCK_Session ipc_pid_session = {0};
+      {
+        U16 ipc_pid_port = rd_ipc_port_from_pid(get_process_info()->pid);
+        if(ipc_pid_port != (U16)ipc_port)
+        {
+          ipc_pid_session = sock_session_open(ipc_pid_port, wakeup_hook_ctrl);
+        }
+      }
+      
       //- rjf: main application loop
       {
         for(B32 quit = 0; !quit;)
@@ -715,10 +751,20 @@ entry_point(CmdLine *cmd_line)
           B32 ipc_command_frame = 0;
           SOCK_Protocol ipc_protocol = SOCK_Protocol_TCP;
           SOCK_Endpoint ipc_endpoint = {0};
+          SOCK_Session ipc_reply_session = ipc_sock_session;
           {
             Temp scratch = scratch_begin(0, 0);
             String8 packet = {0};
-            if(sock_recv(scratch.arena, ipc_sock_session, &ipc_protocol, &ipc_endpoint, &packet, 0))
+            B32 ipc_got_packet = sock_recv(scratch.arena, ipc_sock_session, &ipc_protocol, &ipc_endpoint, &packet, 0);
+            if(!ipc_got_packet && ipc_pid_session.u64[0] != 0)
+            {
+              ipc_got_packet = sock_recv(scratch.arena, ipc_pid_session, &ipc_protocol, &ipc_endpoint, &packet, 0);
+              if(ipc_got_packet)
+              {
+                ipc_reply_session = ipc_pid_session;
+              }
+            }
+            if(ipc_got_packet)
             {
               // rjf: use header to determine message portion
               String8 msg = {0};
@@ -835,7 +881,7 @@ entry_point(CmdLine *cmd_line)
             str8_list_push_front(scratch.arena, &rd_state->cmd_outputs, str8_struct(&packet_size));
             str8_list_push_front(scratch.arena, &rd_state->cmd_outputs, str8_struct(&ipc_packet_magic_start));
             String8 msg = str8_list_join(scratch.arena, &rd_state->cmd_outputs, 0);
-            sock_send(ipc_sock_session, ipc_protocol, ipc_endpoint, msg, now_time_us()+5000000);
+            sock_send(ipc_reply_session, ipc_protocol, ipc_endpoint, msg, now_time_us()+5000000);
           }
         }
       }
@@ -856,6 +902,12 @@ entry_point(CmdLine *cmd_line)
         endpoint.address_u8[0] = 127;
         endpoint.address_u8[3] = 1;
         endpoint.port = (U16)ipc_port;
+        // rjf: `--pid:<pid>` (without an explicit `--ipc_port`) targets the instance's
+        // pid-derived IPC port (see rd_ipc_port_from_pid), reaching that specific instance.
+        if(ipc_target_pid != 0 && !ipc_port_is_explicit)
+        {
+          endpoint.port = rd_ipc_port_from_pid(ipc_target_pid);
+        }
         String8 explicit_ipc_addr_arg = cmd_line_string(cmd_line, s("ipc_addr"));
         if(explicit_ipc_addr_arg.size != 0)
         {
@@ -891,32 +943,30 @@ entry_point(CmdLine *cmd_line)
         SOCK_Protocol outputs_protocol = SOCK_Protocol_TCP;
         SOCK_Endpoint outputs_endpoint = {0};
         String8 packet = {0};
-        U64 recv_endt_us = now_time_us()+10000000;
-        if(sock_recv(scratch.arena, ipc_sock_session, &outputs_protocol, &outputs_endpoint, &packet, recv_endt_us) &&
+        if(sock_recv(scratch.arena, ipc_sock_session, &outputs_protocol, &outputs_endpoint, &packet, now_time_us()+10000000) &&
            str8_match(packet, str8_struct(&ipc_packet_magic_start), StringMatchFlag_RightSideSloppy) &&
            packet.size >= sizeof(ipc_packet_magic_start) + sizeof(U64))
         {
+          U64 header_size = sizeof(ipc_packet_magic_start) + sizeof(U64);
           U64 msg_size = *(U64 *)(packet.str + sizeof(ipc_packet_magic_start));
-          String8 msg = str8_skip(packet, sizeof(ipc_packet_magic_start) + sizeof(U64));
-          // NOTE: the socket layer hands received data out one recv() chunk at a time
-          // (4 KB on macOS), so a reply longer than that (e.g. `state` with many
-          // modules) arrives as several packets; gather until the header's size is met.
-          if(msg.size < msg_size)
+          // rjf: a reply larger than the listener's recv chunk arrives as several ring
+          // packets (the first carries the magic+size header); accumulate continuation
+          // packets until the whole message has been received.
+          String8List msg_parts = {0};
+          str8_list_push(scratch.arena, &msg_parts, str8_skip(packet, header_size));
+          U64 got = packet.size - header_size;
+          U64 recv_endt = now_time_us()+10000000;
+          while(got < msg_size)
           {
-            String8List msg_parts = {0};
-            str8_list_push(scratch.arena, &msg_parts, msg);
-            for(U64 gathered = msg.size; gathered < msg_size;)
+            String8 more = {0};
+            if(!sock_recv(scratch.arena, ipc_sock_session, &outputs_protocol, &outputs_endpoint, &more, recv_endt) || more.size == 0)
             {
-              String8 more = {0};
-              if(!sock_recv(scratch.arena, ipc_sock_session, &outputs_protocol, &outputs_endpoint, &more, recv_endt_us) || more.size == 0)
-              {
-                break;
-              }
-              str8_list_push(scratch.arena, &msg_parts, more);
-              gathered += more.size;
+              break;
             }
-            msg = str8_list_join(scratch.arena, &msg_parts, 0);
+            str8_list_push(scratch.arena, &msg_parts, more);
+            got += more.size;
           }
+          String8 msg = str8_list_join(scratch.arena, &msg_parts, 0);
           msg.size = Min(msg.size, msg_size);
           U8 split_char = 0;
           outputs = str8_split(scratch.arena, msg, &split_char, 1, 0);
@@ -962,6 +1012,10 @@ entry_point(CmdLine *cmd_line)
                    "This will close the debugger automatically after all processes exit, if they all exited successfully (with code 0), and ran with no interruptions.\n\n"
                    "--ipc <command>\n"
                    "This will launch the debugger in the non-graphical IPC mode, which is used to communicate with another running instance of the debugger. The debugger instance will launch, send the specified command, then immediately terminate. This may be used by editors or other programs to control the debugger.\n\n"
+                   "--ipc_port:<port>\n"
+                   "Overrides the default IPC TCP port (7423) that the debugger listens on, and that --ipc connects to.\n\n"
+                   "--pid:<pid>\n"
+                   "With --ipc, addresses the debugger instance with the given pid (it listens on a port derived from its pid in addition to the default), so a specific instance can be driven even when several are running.\n\n"
                    "--gen_crash_dump\n"
                    "Generate mini dump on crash.\n\n"
                    "--logs:<path>\n"

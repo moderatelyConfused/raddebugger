@@ -376,8 +376,31 @@ d_trap_net_from_thread__step_over_line(Arena *arena, D_Entity *thread, U64 inlin
     {
       Rng1U64 voff_range = n->v.voff_range;
       Rng1U64 vaddr_range = d_vaddr_range_from_voff_range(module, voff_range);
+      // NOTE: a range strictly containing the stepped line's is an enclosing call
+      // site of the same file & line (recursive inlining): not this frame's line
+      if(vaddr_range.min <= line_vaddr_rng.min && line_vaddr_rng.max <= vaddr_range.max &&
+         !(vaddr_range.min == line_vaddr_rng.min && vaddr_range.max == line_vaddr_rng.max))
+      {
+        continue;
+      }
       rng1u64_list_push(scratch.arena, &all_vaddr_ranges_on_same_line, vaddr_range);
       log_infof("same_line_range: {%S:%I64i, 0x%I64x, 0x%I64x}\n", n->v.file_path, n->v.pt.line, vaddr_range.min, vaddr_range.max);
+    }
+    
+    // rjf: the stepped line's own range is one of them (the lookup by file & line
+    // may have found an enclosing call site's range at its address instead)
+    B32 has_own_range = 0;
+    for EachNode(n, Rng1U64Node, all_vaddr_ranges_on_same_line.first)
+    {
+      if(n->v.min == line_vaddr_rng.min && n->v.max == line_vaddr_rng.max)
+      {
+        has_own_range = 1;
+        break;
+      }
+    }
+    if(!has_own_range && line_vaddr_rng.min < line_vaddr_rng.max)
+    {
+      rng1u64_list_push(scratch.arena, &all_vaddr_ranges_on_same_line, line_vaddr_rng);
     }
   }
   
@@ -639,8 +662,31 @@ d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread, U64 inlin
     {
       Rng1U64 voff_range = n->v.voff_range;
       Rng1U64 vaddr_range = d_vaddr_range_from_voff_range(module, voff_range);
+      // NOTE: a range strictly containing the stepped line's is an enclosing call
+      // site of the same file & line (recursive inlining): not this frame's line
+      if(vaddr_range.min <= line_vaddr_rng.min && line_vaddr_rng.max <= vaddr_range.max &&
+         !(vaddr_range.min == line_vaddr_rng.min && vaddr_range.max == line_vaddr_rng.max))
+      {
+        continue;
+      }
       rng1u64_list_push(scratch.arena, &all_vaddr_ranges_on_same_line, vaddr_range);
       log_infof("same_line_range: {%S:%I64i, 0x%I64x, 0x%I64x}\n", n->v.file_path, n->v.pt.line, vaddr_range.min, vaddr_range.max);
+    }
+    
+    // rjf: the stepped line's own range is one of them (the lookup by file & line
+    // may have found an enclosing call site's range at its address instead)
+    B32 has_own_range = 0;
+    for EachNode(n, Rng1U64Node, all_vaddr_ranges_on_same_line.first)
+    {
+      if(n->v.min == line_vaddr_rng.min && n->v.max == line_vaddr_rng.max)
+      {
+        has_own_range = 1;
+        break;
+      }
+    }
+    if(!has_own_range && line_vaddr_rng.min < line_vaddr_rng.max)
+    {
+      rng1u64_list_push(scratch.arena, &all_vaddr_ranges_on_same_line, line_vaddr_rng);
     }
   }
   
@@ -1247,7 +1293,7 @@ d_lines_from_dbgi_key_path_voff(Arena *arena, DI_Key dbgi_key, String8 dbgi_path
 // match wins: the call site's own line also appears in the site's table, for
 // the call's setup code, with a shorter range.)
 internal RDI_ParsedLineTable
-d_parsed_line_table_from_voff_line_num(RDI_Parsed *rdi, U64 voff, U32 line_num)
+d_parsed_line_table_from_voff_line_num(RDI_Parsed *rdi, U64 voff, U32 src_file_idx, U32 line_num)
 {
   RDI_ParsedLineTable result = {0};
   B32 found = 0;
@@ -1260,7 +1306,8 @@ d_parsed_line_table_from_voff_line_num(RDI_Parsed *rdi, U64 voff, U32 line_num)
     RDI_LineTable *line_table = rdi_element_from_name_idx(rdi, LineTables, unit->line_table_idx);
     rdi_parsed_from_line_table(rdi, line_table, &unit_parsed);
     U64 idx = rdi_line_info_idx_from_voff(&unit_parsed, voff);
-    if(idx < unit_parsed.count && unit_parsed.voffs[idx] <= voff && voff < unit_parsed.voffs[idx+1] && unit_parsed.lines[idx].line_num == line_num)
+    if(idx < unit_parsed.count && unit_parsed.voffs[idx] <= voff && voff < unit_parsed.voffs[idx+1] &&
+       unit_parsed.lines[idx].file_idx == src_file_idx && unit_parsed.lines[idx].line_num == line_num)
     {
       result = unit_parsed;
       found = 1;
@@ -1292,7 +1339,8 @@ d_parsed_line_table_from_voff_line_num(RDI_Parsed *rdi, U64 voff, U32 line_num)
       RDI_ParsedLineTable parsed = {0};
       rdi_parsed_from_line_table(rdi, line_table, &parsed);
       U64 idx = rdi_line_info_idx_from_voff(&parsed, voff);
-      if(idx < parsed.count && parsed.voffs[idx] <= voff && voff < parsed.voffs[idx+1] && parsed.lines[idx].line_num == line_num)
+      if(idx < parsed.count && parsed.voffs[idx] <= voff && voff < parsed.voffs[idx+1] &&
+         parsed.lines[idx].file_idx == src_file_idx && parsed.lines[idx].line_num == line_num)
       {
         result = parsed;
         found = 1;
@@ -1370,7 +1418,7 @@ d_lines_array_from_dbgi_key_file_path_line_range(Arena *arena, DI_Key dbgi_key, 
         if(lines_num_voffs[line_idx] < max_voffs_per_line) ProfScope("iterate voffs (%i)", voff_count) for(U64 idx = 0; idx < voff_count; idx += 1)
         {
           U64 base_voff = voffs[idx];
-          RDI_ParsedLineTable unit_line_info = d_parsed_line_table_from_voff_line_num(rdi, base_voff, u32_from_u64_saturate((U64)line_num));
+          RDI_ParsedLineTable unit_line_info = d_parsed_line_table_from_voff_line_num(rdi, base_voff, src_id, u32_from_u64_saturate((U64)line_num));
           U64 line_info_idx = rdi_line_info_idx_from_voff(&unit_line_info, base_voff);
           if(unit_line_info.voffs != 0)
           {

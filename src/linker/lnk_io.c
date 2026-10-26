@@ -121,7 +121,7 @@ lnk_file_set_delete_on_close(File handle, B32 delete_file)
   FILE_DISPOSITION_INFO file_disposition = {0};
   file_disposition.DeleteFile            = (BOOL)delete_file;
   is_set = SetFileInformationByHandle((HANDLE)handle.u64[0], FileDispositionInfo, &file_disposition, sizeof(file_disposition));
-#elif OS_LINUX
+#elif OS_LINUX || OS_MAC
   // no equivalent
   is_set = 1;
 #else
@@ -148,7 +148,7 @@ lnk_file_rename(File handle, String8 new_name)
   MemoryCopy(rename_info->FileName, new_name16.str, new_name16.size * sizeof(new_name16.str[0]));
 
   is_renamed = SetFileInformationByHandle((HANDLE)handle.u64[0], FileRenameInfo, buffer, buffer_size);
-#else
+#elif OS_LINUX
   char fd_proc_path[128];
   raddbg_snprintf(fd_proc_path, sizeof(fd_proc_path), "/proc/self/fd/%d", (int)handle.u64[0]);
 
@@ -159,6 +159,14 @@ lnk_file_rename(File handle, String8 new_name)
   if (path_size > 0) {
     is_renamed = rename(path, (char *)push_cstr(scratch.arena, new_name).str) == 0;
   }
+#elif OS_MAC
+  // no /proc; the path of an open descriptor comes from fcntl
+  char path[PATH_MAX] = {0};
+  if (fcntl((int)handle.u64[0], F_GETPATH, path) != -1) {
+    is_renamed = rename(path, (char *)push_cstr(scratch.arena, new_name).str) == 0;
+  }
+#else
+# error "TODO: file rename"
 #endif
   scratch_end(scratch);
   return is_renamed;

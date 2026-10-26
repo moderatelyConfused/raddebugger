@@ -900,7 +900,7 @@ pe_x64_uwnd_step(Arch arch, MemoryMap *memory_map, UWND_ModuleInfo *module_info,
     //
     if(!done && (!first_pdata || (!has_pdata_and_in_epilog && !xdata_unwind_did_machframe)))
     {
-      result = uwnd_step_moduleless(arch, memory_map, regs);
+      result = uwnd_step_moduleless(arch, memory_map, module_info, regs);
       done = (result.status != UWND_StepStatus_Good);
     }
     

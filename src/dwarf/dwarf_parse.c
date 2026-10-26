@@ -547,6 +547,7 @@ dw2_read_form_val(DW_Raw *raw, DW2_ParseCtx *ctx, String8 data, U64 off, DW_Form
         off += str8_deserial_read(data, off, &size, bytes_to_read, bytes_to_read);
         val.u128.u64[0] = size;
         val.u128.u64[1] = og_read_off;
+        val.string = str8_substr(data, r1u64(off, off+size)); // the block's data (DWARF <= 3 location expressions)
         off += size;
       }break;
       
@@ -897,8 +898,9 @@ dw2_reference_info_off_from_form_val(DW2_ParseCtx *ctx, DW2_FormVal *v)
     {
       result = ctx->unit_base_info_off + v->u128.u64[0];
     }break;
-    // NOTE: a ref_addr is an offset from the start of .debug_info (clang uses it
-    // for DW_AT_specification of out-of-line C++ member function definitions)
+    // NOTE: a reference into any unit of .debug_info; dsymutil's ODR type
+    // uniquing turns DW_AT_specification / DW_AT_abstract_origin into these,
+    // as do LTO builds. the caller has to find the unit the offset lands in.
     case DW_FormKind_RefAddr:
     {
       result = v->u128.u64[0];
@@ -1484,6 +1486,9 @@ dw2_rnglist_from_form_val(Arena *arena, DW2_ParseCtx *ctx, DW_Raw *raw, DW2_Form
           default:{good_range = 0;}break;
           case DW_RLE_BaseAddressx:
           {
+            // NOTE: base address entries produce no range of their own (dsymutil
+            // begins every list with one; a pushed empty range at address 0 ended
+            // up in scopes as [0 - base, 0 - base))
             good_range = 0;
             U64 addr_idx = 0;
             off += str8_deserial_read_uleb128(data, off, &addr_idx);
@@ -1492,7 +1497,6 @@ dw2_rnglist_from_form_val(Arena *arena, DW2_ParseCtx *ctx, DW_Raw *raw, DW2_Form
               U64 new_base_addr = 0;
               if(dw2_try_offset_from_table_idx(ctx->addr_table, addr_idx, &new_base_addr))
               {
-                good_range = 1;
                 base_addr = new_base_addr;
               }
             }
@@ -1543,6 +1547,7 @@ dw2_rnglist_from_form_val(Arena *arena, DW2_ParseCtx *ctx, DW_Raw *raw, DW2_Form
           }break;
           case DW_RLE_BaseAddress:
           {
+            good_range = 0;
             U64 new_base_addr = 0;
             off += str8_deserial_read(data, off, &new_base_addr, ctx->addr_size, ctx->addr_size);
             base_addr = new_base_addr;
@@ -1690,6 +1695,8 @@ dw2_loclist_from_form_val(Arena *arena, DW2_ParseCtx *ctx, DW_Raw *raw, DW2_Form
           default:{good_loc = 0;}break;
           case DW_LLE_BaseAddressx:
           {
+            // NOTE: base address entries carry no location of their own (see the
+            // rnglist decoder above)
             good_loc = 0;
             U64 addr_idx = 0;
             off += str8_deserial_read_uleb128(data, off, &addr_idx);
@@ -1698,7 +1705,6 @@ dw2_loclist_from_form_val(Arena *arena, DW2_ParseCtx *ctx, DW_Raw *raw, DW2_Form
               U64 new_base_addr = 0;
               if(dw2_try_offset_from_table_idx(ctx->addr_table, addr_idx, &new_base_addr))
               {
-                good_loc = 1;
                 base_addr = new_base_addr;
               }
             }
@@ -1753,6 +1759,7 @@ dw2_loclist_from_form_val(Arena *arena, DW2_ParseCtx *ctx, DW_Raw *raw, DW2_Form
           }break;
           case DW_LLE_BaseAddress:
           {
+            good_loc = 0;
             U64 new_base_addr = 0;
             off += str8_deserial_read(data, off, &new_base_addr, ctx->addr_size, ctx->addr_size);
             base_addr = new_base_addr;
