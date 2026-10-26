@@ -440,6 +440,8 @@ struct RD_State
   B32 override_focus_on_stop;
   S32 frame_depth;
   U64 frame_eval_memread_endt_us;
+  U64 exited_process_count;             // processes which ended since the debugger started, and ...
+  U64 last_exit_code;                   // ... the exit code of the last one (reported by `--ipc state`)
   SOCK_Endpoint ipc_sock_endpoint;
   UI_State *ui_stub;
   
