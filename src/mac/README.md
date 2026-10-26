@@ -253,6 +253,172 @@ Open:
 * A headless driver (the demon from a console program, the way `torture`
   does) would still be useful; the `--ipc` loop above is the next best thing.
 
+## Scripted feature-flow suite (src/mac/tests/flows)
+
+`src/mac/tests/flows/run_flows.sh` drives a private debugger instance (its own
+IPC port, user file and logs; never the user's port 7423) through the feature
+flows against small Mach-O debuggees and prints `PASS`/`FAIL` per check with
+the expected and observed values (file:line, symbol, inline depth, values, exit
+codes), plus `NOTE` lines for observations without a verdict.
+
+* Debuggees: `src/mac/tests/flows/debuggees/*.c|cpp`, built by
+  `build_debuggees.sh` into `build/flows` (`FLOWS_BUILD_DIR`) as `-g -O0` and
+  `-g -O2` variants with dSYM bundles (compiled and linked separately: a
+  one-step `clang -g x.c -o x` deletes its object before `dsymutil` can link
+  the dSYM, leaving only a debug map), plus `basic_O2_nofp`
+  (`-fomit-frame-pointer`), single-variant debuggees for the review scenarios
+  and the Zig generator (debug build; `--prefix`/`--cache-dir` under
+  `build/flows`, the generator's directory is untouched). Lines the scenarios
+  refer to carry `// @tag` comments; the runner looks the numbers up by tag.
+* Run: `zsh src/mac/tests/flows/run_flows.sh` (all, ~7 minutes),
+  `run_flows.sh -l` (list), `run_flows.sh stepping_O0 eval_O0` (some).
+  `HARNESS_DIR` keeps the project files, the user file and `logs/`
+  (`ui_thread.raddbg_log`: trap nets; `ctrl_thread.raddbg_log`: demon
+  events); `FLOWS_KEEP_LOGS=1` copies each scenario's logs and the debuggee's
+  output to `$HARNESS_DIR/logs_<scenario>/`. Scenario names: plain = feature
+  flows, `F*` = stepping/inline-frame review, `D*` = demon review, `U*` =
+  unwinder review.
+* `--ipc` additions for scripting: `state` reports `processes` (pids),
+  `exited_process_count` / `last_exit_code`, `selected_thread`, each thread's
+  `frozen` flag, the selected thread's `call_stack` (per frame `unwind_count`,
+  `inline_depth`, `ip`, `module`, `symbol` (callers looked up at the call),
+  `ip_symbol` (at the frame's pc itself), `file_name`, `line_num`), the
+  `breakpoints` (`id`, `location`, `condition`, `hit_count`, `enabled`) and
+  the stop event's `bp_id`; `--process:<pid>` / `--thread:<tid>` options name
+  control entities by the ids `state` reports (`kill --process:123`,
+  `freeze_thread --thread:456`, `select_thread --thread:456`, `detach
+  --process:123`); `--prefer_disasm:1` / `--force_confirm:1` set the boolean
+  registers. Option values cannot contain spaces (`--string:i==3`).
+* Scripting caveats: right after a stop `eval` of a global can answer "`x`
+  could not be found" for a few hundred milliseconds (`di_match_from_string`
+  searches the debug infos asynchronously and `eval` does not wait); the
+  runner's `ev` retries. `eval` over `--ipc` runs with `disable_addresses`:
+  pointers print their pointee, address casts give 0, a function's address
+  cannot be read (`&inner` prints the signature); use the stop's `ip` from
+  `state`. Never `wait` on a shell background process the debugger attached
+  to: `ptrace` reparents it to the debugger.
+
+### Results and findings (2026-10-25, this branch)
+
+Fixed here:
+
+* `--ipc` replies were cut at 4 KB: `mac_socket.c` hands received data out one
+  `recv()` chunk at a time and the client in `raddbg_main.c` took the first
+  chunk as the whole reply, so `state` with the system libraries loaded (after
+  an attach) ended inside the module list. The client gathers packets until
+  the header's size is met.
+* All `T[N]` arrays of one element type became the first one seen
+  (`int arr[3]` and `int g_array[8]` both `int [4]`, `sizeof` 16): the DWARF
+  converter's type deduplication hashes each tag's attributes, but
+  `DW_TAG_subrange_type` (where `DW_AT_count` lives) and `DW_TAG_enumerator`
+  were not among the hashed tags (`rdi_from_dwarf.c`, `need_tag_hash`), so
+  every array of `int` had the same tree hash. Both are hashed now; `.rdi`s
+  rebuild automatically (older than the debugger binary).
+* C++ member functions defined out of line were unnamed procedures (empty stop
+  symbols and call stack entries for `Rect::area`, constructors, lambdas'
+  `operator()`): their names, types and linkage names live in the declaration
+  the definition refers to with `DW_AT_specification`, which the converter did
+  not follow (only `DW_AT_abstract_origin`), and clang encodes it as
+  `DW_FORM_ref_addr`, which `dw2_reference_info_off_from_form_val` did not
+  decode at all (`dwarf_parse.c`). The origin walk now starts at the
+  specification and `ref_addr` / `ref_udata` references resolve. The names are
+  still unqualified (`area`, not `Rect::area`): the container is not derived
+  from the declaration's parent.
+
+Policy, not bugs (the suite expects these):
+
+* A step into a function stops at its opening brace (the prologue's line), as
+  upstream does; the first statement is one step over away.
+* A `__thread` variable reads 0 until the thread has touched one of the
+  image's thread-locals (dyld allocates the block lazily, so
+  `dmn_thread_get_module_tls_vaddr` finds none before).
+
+Open, recorded with evidence by the suite (owners: the demon, unwinder and
+stepping agents):
+
+* Expression (function-name) breakpoints added while a process is live are
+  resolved once, on the control thread, through `e_eval_from_string` ->
+  `di_match_from_string(..., endt_us = 0)`: when the asynchronous debug-info
+  search has not seen the name yet the breakpoint gets no trap and never hits
+  (`breakpoints_O0/func_bp_cold_symbol`; the Zig `range`, `F5b big_frame`
+  without the warm-up). Evaluating the name once before adding the breakpoint
+  works around it; the fix is a deadline for the ctrl thread's breakpoint
+  resolution (`dbg_engine_ctrl.c`,
+  `d_ctrl_thread__append_resolved_module_user_bp_traps` and
+  `..._process_user_bp_traps`).
+* Soft signals neither stop nor get delivered: `abort()` and `raise(SIGINT)`
+  produce an `Exception` demon event, the engine filters it (`stop_cause: 0`;
+  the `mac_*` exception filter settings read as off) and continues with
+  `ignore_previous_exception`, so `raise(SIGINT)` returns and the process
+  exits 0 (`exceptions`, `U2` with `abort`). Hardware exceptions stop only on
+  their escalated second chance: `__builtin_trap` is reported as SIGTRAP (0x5)
+  after the first-chance EXC_BREAKPOINT was continued, a NULL store as SIGSEGV
+  (0xb) after EXC_BAD_ACCESS; hence `D4` (SIGSEGV handler, filters off) still
+  stops, and the handler runs only after a manual continue.
+* Breakpoint hits on several threads at once: the demon reports every thread's
+  pending exception in one `dmn_ctrl_run` (four `Breakpoint` events in the
+  `threads_breakpoints` ctrl log), the engine stops for the first, and the
+  resume replies to all pending exceptions with the traps already removed, so
+  the other hits are lost (1 of 4 worker hits in the first launch).
+* Call stacks of threads other than the stopping one are empty (`U3` sleeping
+  thread, the spinner in `threads_freeze`, `D5`).
+* Modules: only the executable and dyld are ever listed (`D3`, `modules`,
+  `breakpoint_dylib`): the dyld notification hook is not found and the
+  per-stop image sync adds nothing, so dylib breakpoints never resolve,
+  `write` is not found and the TLS getter (`U5`) stops in code without a
+  module (empty call stack).
+* Detach (`D1`, `attach_detach`): `dmn_ctrl_detach` releases the process
+  without reporting it, while `d_ctrl_thread__detach` waits for a
+  `DMN_EventKind_ExitProcess` of that process (win32 queues detached processes
+  and synthesizes their exit/unload events in the next run); the process stays
+  listed and a launched debuggee stays stopped (`D1`).
+* fork (`fork`/D2): the child inherits the exception ports and the `brk`
+  written at `child_work`; the demon answers the unknown task's exception with
+  success, the child re-executes the trap forever and the parent's `waitpid`
+  never returns.
+* exec (`exec`, `D6`): `execv`/`execl` fail inside the debuggee (exit 5, the
+  `perror` path; see the scenario's NOTE for errno).
+* Watchpoints (`watchpoint`, `D8`): consecutive stops report the same ip and
+  lag the write (stop 2 shows the value before the store, stop 3 after it, in
+  the same iteration), and the demon's watchpoint event carries no `user_data`
+  (trap id), so the stop is not attributed to the user breakpoint: `bp_id` is
+  0, the hit count stays 0 and a condition on the data breakpoint is ignored.
+* Step out of a signal handler runs to the process' end
+  (`signal_handler/handler_step_out`); a step over `longjmp` as well
+  (`longjmp`; gdb/lldb stop after `setjmp`).
+* Calls through stubs: a step into on a line calling `strlen` (through
+  `__stubs`) or a weak template instantiation (`twice<int>` in `cpp_O0` goes
+  through a stub too) lands on the stub's first instruction; there the
+  unwinder reports the caller's caller as frame 1 (`main` instead of
+  `libsystem_call`: the frame-pointer chain is used although nothing was
+  pushed yet), so the following step out returns one frame too far, and a step
+  over the stub's indirect jump runs to the process' end (`stepping_O0`,
+  `stepping_cpp`). The same frame-1 loss shows at any function's first
+  instruction after an instruction step into a call (`stepping_O0/inst_into_call_stack`).
+* Step over a tail call (`b tail_target` at -O2) ends in the callee's first
+  line instead of after the call in the caller (`stepping_O2`).
+* After a watchpoint stop, `eval` reads inconsistent values (`i`, `sum`,
+  `g_watched` that cannot coexist in program order) and the same ip is
+  reported for consecutive stops: the registers the frontend reads after the
+  demon's internal step past the access look stale (`watchpoint` NOTEs).
+* A stop in a new thread created after another thread exited evaluates in the
+  main thread's context (`D7`: `idx` reads 0, the call stack lacks
+  `worker_body`), although the thread list is right.
+* A stop inside a Zig coroutine (`zig_generator/fiber_stack`) shows the
+  previous stop's call stack (main's frames): the unwind on the fiber stack
+  produces nothing and the stale artifact stays.
+* `eval` of locals held in registers at -O2 (`F4a` `r`, `F6` `node`) gives 0
+  or "could not be found".
+* `F7`: with a disassembly tab focused, a step into at the first instruction
+  of an inlined call only selects the next inline frame (pc unchanged).
+* `F1`/`F2`: a step over at inline depth 1 from `next`'s last line stops at the
+  helper's instruction LLVM scheduled into that line (shown as the helper's
+  call line at depth 1), not at main's second call; identical on 20 runs.
+  `F1b`: a step over `next`'s first line ends on the same line.
+* `F4b`: the breakpoint on `inl.h:3` first stops in the second inlined
+  instance (call site `inl_main.c:4`). `F6`: a step into on a line whose first
+  call goes into libSystem (`qsort_b`) stops there, without line info.
+
 ## Known gaps / follow-ups
 
 * Rendering uses one shared `NSOpenGLContext` that is re-targeted with
