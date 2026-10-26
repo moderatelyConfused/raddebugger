@@ -32,8 +32,11 @@ run_cmd() { local st0=$(ipc state); local before=$(field "$st0" stop_count); bef
 step() { for i in $(seq 1 ${2:-1}); do run_cmd "$1" "$i"; done; }
 go() { run_cmd run run; }
 bp() { ipc "add_breakpoint --file_path:$1" >/dev/null; }
-kill_test_instances() { for pid in $(pgrep -f "raddbg $P"); do kill -9 $pid 2>/dev/null; done; for i in $(seq 1 100); do pgrep -f "raddbg $P" >/dev/null || break; sleep 0.05; done; }
-launch() { kill_test_instances; rm -f $S/test.raddbg_user; (nohup $RD $P --project:$1 --user:$S/test.raddbg_user --logs:$S/logs > $S/raddbg_stdout.txt 2>&1 &); for i in $(seq 1 100); do nc -z -G 1 127.0.0.1 ${P#--ipc_port:} >/dev/null 2>&1 && break; sleep 0.05; done; (ipc state >/dev/null 2>&1 &); sleep 0.2; wait_up && launch_target && wait_dbginfo; }
-# NOTE: the first IPC reply of a fresh instance is misdelivered (see README); the throwaway `state` above absorbs that 10s client timeout in the background
+# the instance started by launch/start_debugger is killed by its recorded pid (RD_PID); any other instance
+# still listening on this harness' port (a crashed earlier run) is found by its listener and killed by pid too
+kill_test_instances() { local pids="$RD_PID $(lsof -nP -iTCP:${P#--ipc_port:} -sTCP:LISTEN 2>/dev/null | awk 'NR>1 && $1 ~ /raddbg/ {print $2}')"; for pid in ${=pids}; do kill -9 $pid 2>/dev/null; done; for i in $(seq 1 100); do lsof -nP -iTCP:${P#--ipc_port:} -sTCP:LISTEN 2>/dev/null | grep -q raddbg || break; sleep 0.05; done; RD_PID=""; }
+# readiness is the instance's own listener (lsof, LISTEN on the port): no probe connection, no fixed sleep
+wait_listener() { RD_PID=""; for i in $(seq 1 400); do RD_PID=$(lsof -nP -iTCP:${P#--ipc_port:} -sTCP:LISTEN 2>/dev/null | awk 'NR>1 && $1 ~ /raddbg/ {print $2; exit}'); [[ -n "$RD_PID" ]] && return 0; sleep 0.05; done; echo "no instance listens on port ${P#--ipc_port:}"; return 1; }
+launch() { kill_test_instances; rm -f $S/test.raddbg_user; (nohup $RD $P --project:$1 --user:$S/test.raddbg_user --logs:$S/logs > $S/raddbg_stdout.txt 2>&1 &); wait_listener && wait_up && launch_target && wait_dbginfo; }
 # step_into with no process launches the active target and stops at its entry (launch_and_step_into over IPC has no target cfg in its registers); retry until the stop is seen
 launch_target() { for i in $(seq 1 20); do local before=$(field "$(ipc state)" stop_count); before=${before:-0}; ipc step_into >/dev/null; for j in $(seq 1 40); do st=$(ipc state); local sc=$(field "$st" stop_count); if [[ "$(field "$st" running)" == "0" && -n "$sc" && "$sc" -gt "$before" ]]; then show "$st" entry; return 0; fi; sleep 0.05; done; done; echo "launch failed"; return 1; }
