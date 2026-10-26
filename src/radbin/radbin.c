@@ -1123,6 +1123,51 @@ rb_thread_entry_point(void *p)
           ProfScope("convert") dwarf_bake_params = d2r_convert(arena, &convert_params);
         }
         
+        //- rjf: Mach-O inputs w/o DWARF => symbol table -> RDI conversion
+        //
+        // images from the dyld shared cache (libSystem & co.; the debugger hands
+        // us a symbol-only copy of the in-memory image, see mac_demon.c) and other
+        // executables/dylibs without DWARF still carry their defined symbols in
+        // LC_SYMTAB. procedures from those let function breakpoints, `eval` and
+        // call stack frames name them.
+        if(!convert_done && input_files_from_format_table[RB_FileFormat_MachO].count != 0)
+        {
+          RB_File *symtab_file = 0;
+          {
+            Temp scratch = scratch_begin(&arena, 1);
+            for(RB_FileNode *n = input_files_from_format_table[RB_FileFormat_MachO].first; n != 0; n = n->next)
+            {
+              MACHO_Bin bin = macho_bin_from_data(scratch.arena, n->v->data);
+              if(bin.is_valid && bin.hdr.filetype != MACHO_MH_DSYM && bin.has_symtab && bin.symbols.count != 0)
+              {
+                symtab_file = n->v;
+                break;
+              }
+            }
+            scratch_end(scratch);
+          }
+          if(symtab_file != 0)
+          {
+            convert_done = 1;
+            log_infof("Mach-O file w/o DWARF specified; converting its symbol table to RDI\n");
+            if(lane_idx() == 0)
+            {
+              Temp scratch = scratch_begin(&arena, 1);
+              MACHO_Bin bin = macho_bin_from_data(scratch.arena, symtab_file->data);
+              M2R_SymtabConvertParams convert_params = {0};
+              {
+                convert_params.exe_name      = symtab_file->path;
+                convert_params.data          = symtab_file->data;
+                convert_params.bin           = &bin;
+                convert_params.subset_flags  = subset_flags;
+                convert_params.deterministic = cmd_line_has_flag(cmdline, str8_lit("deterministic"));
+              }
+              ProfScope("convert") dwarf_bake_params = m2r_bake_params_from_macho_symtab(arena, &convert_params);
+              scratch_end(scratch);
+            }
+          }
+        }
+        
         //- rjf: PDB inputs => PDB -> RDI conversion
         if(input_files_from_format_table[RB_FileFormat_PDB].count != 0)
         {
@@ -1265,7 +1310,7 @@ rb_thread_entry_point(void *p)
       //- rjf: no viable input paths
       if(!convert_done && cmdline->inputs.node_count != 0)
       {
-        log_user_errorf("Could not load debug info from the specified inputs. You must provide a valid PDB file, an executable image (PE, ELF, Mach-O) file with DWARF debug info, a dSYM bundle's DWARF file, or RDI file(s).");
+        log_user_errorf("Could not load debug info from the specified inputs. You must provide a valid PDB file, an executable image (PE, ELF, Mach-O) file with DWARF debug info, a Mach-O image with a symbol table, a dSYM bundle's DWARF file, or RDI file(s).");
       }
       
       //- rjf: bake
