@@ -48,17 +48,24 @@ bundled with Zig: `zig cc -target aarch64-macos -fsyntax-only ...`).
   (no rollback). Single stepping: `MDSCR_EL1.SS` via `ARM_DEBUG_STATE64`.
   Watchpoints: `DBGWCR/DBGWVR` via `ARM_DEBUG_STATE64`; since arm64 reports
   them before the access, the demon steps past the access internally.
-* Modules: a permanent `brk` on dyld's `_dyld_debugger_notification`
+* Modules: a permanent `brk` on dyld's debugger-notification function
   (`x0` = mode, `x1` = count, `x2` = `dyld_image_info[]`) reports loads and
   unloads; the demon steps over its own trap internally. Mode 3
   (`dyld_image_dyld_moved`, dyld handing over to its copy in the shared cache)
-  re-targets the trap to the new dyld. As a safety net, every stop compares
-  `dyld_all_image_infos.infoArrayCount` with the last seen count and diffs the
-  image list when it changed (or when the trap could not be placed; the
-  `notification` pointer is used as a fallback once dyld has rebased, with
-  pointer-authentication bits stripped). Module info is parsed from the
-  in-memory Mach-O header (`__unwind_info`, `__eh_frame`, UUID, entry point,
-  `__thread_vars`).
+  re-targets the trap to the new dyld. The notifier address is the pointer dyld
+  publishes in `dyld_all_image_infos.notification` (on this macOS the
+  shared-cache dyld's `_lldb_image_notifier`; its local symbol is not in the
+  on-disk dyld's symbol table, so the published pointer, PAC-stripped, is the
+  reliable source, with a symbol lookup — `_dyld_debugger_notification`,
+  `__dyld_debugger_notification`, `_lldb_image_notifier` — as a fallback). As a
+  safety net, every stop re-reads `dyld_all_image_infos` and diffs the image
+  list against the last seen count. The struct address captured at launch
+  belongs to the initial dyld and goes stale once dyld hands over (the old
+  struct keeps reporting one image), so the demon reads both the cached address
+  and the one `TASK_DYLD_INFO` currently reports and keeps whichever lists more
+  images (`mac_dmn_process_read_all_image_infos`); the trap is (re)armed from
+  that struct's notifier. Module info is parsed from the in-memory Mach-O header
+  (`__unwind_info`, `__eh_frame`, UUID, entry point, `__thread_vars`).
 * Exception codes reported to the engine: BSD signal numbers, or
   `0x10000 + EXC_*` for Mach exception types (see `mac/mac.mdesk`).
 * TLS: `dmn_thread_get_module_tls_vaddr` returns the thread's TLS block for
@@ -209,16 +216,47 @@ parts of the execution; calls to `next()` after the first jump straight to
   The IPC listener sets `SO_REUSEADDR` (a restarted debugger could not bind
   while old connections lingered) and messages that arrive before the first
   window exists are run and answered instead of dropped.
-* Still open in IPC: the *first* reply of a fresh instance is delivered to
-  the instance itself (its listener receives a packet of the reply's size
-  right after the reply is sent), so the first `--ipc` client waits out its
-  10 s timeout; every later command is answered within ~40 ms. The connection
-  lookup in `sock_async_tick` (`mac_socket.c`) is where to look.
+* The *first* `--ipc` reply of a fresh instance no longer stalls. The earlier
+  10 s wait came from the listener rebind and the main-loop wakeup (both fixed
+  above), not a misdelivered reply: instrumenting the fallback `connect` in
+  `sock_async_tick` showed it never fires, and the reply always goes back on
+  the accepted socket (~0.1 s). The connection lookup was hardened anyway so
+  the endpoint stored on accept and the one reconstructed on recv/send are
+  byte-identical for every address family: `SOCK_Endpoint.kind` is set on
+  accept and carried in the ring header's protocol word, so the hash and
+  `MemoryMatchStruct` agree (`mac_socket.c`). A reply larger than the
+  listener's recv chunk is also reassembled by the `--ipc` client now, so
+  `state` with a full module list is no longer truncated (`raddbg_main.c`).
+  Verified by `tests/ipc_first_reply.sh` (10 fresh instances, first `state`
+  under 1 s each).
+* `raddbg --ipc --pid:<pid>` routes to a specific instance (used by
+  `raddbg/tests/raddbg_tests.c`). Each instance additionally listens on a port
+  derived from its own pid (`rd_ipc_port_from_pid`, `raddbg_main.c`), and a
+  client with `--pid` derives the same port; the default port 7423 is
+  untouched, so interactive clients are unaffected
+  (`tests/ipc_pid_routing.sh`).
+* Dynamic library load/unload events now arrive (previously the demon logged
+  "could not find _dyld_debugger_notification ... load events will be
+  synthesized at stops" and only the main executable and dyld appeared, so
+  frames in shared-cache modules had no module and no unwind info). Two causes,
+  both in `mac_demon.c`: the symbol `_dyld_debugger_notification` does not exist
+  in this macOS' dyld (the notifier is `_lldb_image_notifier`), and the
+  `dyld_all_image_infos` address captured at launch goes stale after dyld hands
+  over to its shared-cache copy. The demon now prefers the published
+  `notification` pointer and re-queries `TASK_DYLD_INFO`, reading whichever of
+  the two candidate structs lists more images. After a stop in `main`,
+  `ctrl_thread.raddbg_log` and `state` modules list libSystem.B.dylib,
+  libsystem_kernel.dylib and the rest, and a dlopen/dlclose produce LoadModule /
+  UnloadModule events (`tests/dyld_module_events.sh`). Still missing: a function
+  breakpoint in a no-DWARF shared-cache module (e.g. `write`) cannot resolve,
+  because `rdi_from_macho.c` converts only `__DWARF`, not the Mach-O symbol
+  table, into RDI procedures — a separate converter change.
 * Driving the debugger from a script: `launch_and_step_into` sent over `--ipc`
   has no target in its registers and launches nothing; send `step_into` with
-  no process instead. Fire one throwaway command in the background right
-  after the port accepts connections, to absorb the first-reply stall. `exit` over IPC does not quit an instance with a live
-  process (kill it by pid). A `step_into` at the first instruction of an
+  no process instead. `exit` over IPC now quits an instance even with a live
+  debuggee: the external-driver path force-confirms the "attached to a live
+  process" popup and tears the debuggee down like the GUI's close
+  (`tests/ipc_exit_live.sh`). A `step_into` at the first instruction of an
   inlined call only selects the next inline frame, without a run. Each IPC
   `state` renders a frame, so poll at 100ms or slower. The harness used
   (`h.sh`: launch, breakpoint, run, step, printing every stop with its inline
@@ -241,9 +279,7 @@ Open:
   function without known unwind info the unwinder falls back to the frame
   pointer chain and skips the callee's frame, so the step out returned one
   frame too far (`range` -> `entryPoint`). That unwinder weakness is itself
-  worth fixing (prefer `lr` when nothing was pushed yet); shared-cache
-  modules may also lack unwind info because dyld's notification hook is not
-  found here ("dynamic library load events will be synthesized at stops").
+  worth fixing (prefer `lr` when nothing was pushed yet).
 * `step_out` from an inlined function steps out of the concrete function; it
   could use the selected inline site's ranges (`step_out_scope` already works
   from scope ranges).

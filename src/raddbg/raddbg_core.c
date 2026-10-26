@@ -14151,6 +14151,14 @@ rd_frame(void)
                 rd_regs_fill_slot_from_string(cmd_kind_info->query.slot, cmd_kind_info->query.expr, primary_args_string);
               }
               rd_regs()->disable_addresses = 1;
+              // rjf: an external driver (e.g. `raddbg --ipc exit`) has no interactive
+              // user to answer the "still attached to a live process" confirmation
+              // popup, so it would otherwise hang the instance alive. force-confirm it:
+              // exit and tear down the debuggee, exactly like the GUI's confirmed close.
+              if(cmd_kind_info == &rd_cmd_kind_info_table[RD_CmdKind_Exit])
+              {
+                rd_regs()->force_confirm = 1;
+              }
               rd_push_cmd(cmd_kind_name, rd_regs());
             }
             else
