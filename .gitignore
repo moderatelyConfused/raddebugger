@@ -3,3 +3,6 @@
 *~
 .vs
 tags
+# torture's run outputs (build/torture_artifacts by default; -out:<path> may put them elsewhere)
+torture_artifacts/
+torture.out
