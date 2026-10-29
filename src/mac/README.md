@@ -1184,14 +1184,17 @@ codes), plus `NOTE` lines for observations without a verdict.
 
 ### Results and findings (2026-10-25, this branch)
 
-Last full run on the merged tree (2026-10-26, after all of the day's rounds):
-446 checks passed, 15 failed, 54 scenario runs in 181 s. The 15 are the open
-items recorded below and in "Status and open issues": step out of a signal
-handler and step over `longjmp` (4), the inline-sequence items `F1`/`F2`/`F4b`
-(6), `D3`'s `write` breakpoint (2: `printf` reaches `write$NOCANCEL`, and the
-unqualified name is ambiguous between dyld's and libsystem_kernel's `write`),
-and `D6`'s exec of a platform binary (2, an OS limit); `U5`'s thread-local
-read (1 then) is fixed since (TLS evaluation, below). Every failure below is a
+Last full run on the merged tree (2026-10-26, after all of the day's rounds,
+the TLS fix and the test-infrastructure consolidation): 445 checks passed, 16
+failed, 54 scenario runs in 165 s. The 16 are the open items recorded below
+and in "Status and open issues": step out of a signal handler and step over
+`longjmp` (4), the inline-sequence items `F1`/`F2`/`F4b` (7; the `F1` group
+varies between runs, see the "Run" paragraph), `threads_breakpoints`'s
+`thread_count_at_stop` (1, a timing assumption: workers that finished before
+the stop are not counted), `D3`'s `write` breakpoint (2: `printf` reaches
+`write$NOCANCEL`, and the unqualified name is ambiguous between dyld's and
+libsystem_kernel's `write`), and `D6`'s exec of a platform binary (2, an OS
+limit). Every failure below is a
 recorded bug or observation; scenarios fully passing include
 launch/kill/restart/exit, the breakpoint flows (line, inline line, dylib
 before load, address, condition, hit counts, toggle/remove, function name
