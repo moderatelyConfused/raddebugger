@@ -147,7 +147,9 @@ stop_instance   # flushes the ctrl log
 n_libsystem=$(grep -c 'libSystem.B.dylib' $L 2>/dev/null)
 n_kernel=$(grep -c 'libsystem_kernel.dylib' $L 2>/dev/null)
 n_total_load=$(grep -c 'kind:           LoadModule' $L 2>/dev/null)
-read pl_load pl_unload <<< "$(awk -v plugin="\"$DL/libplugin.dylib\"" '
+# dyld reports an image by its resolved path (/private/tmp/... for a /tmp/... scratch directory)
+DL_REAL=$(cd "$DL" && pwd -P)
+read pl_load pl_unload <<< "$(awk -v plugin="\"$DL_REAL/libplugin.dylib\"" '
   /dmn_event:/ { kind=""; module=""; str="" }
   /^ *kind: / { kind=$2 }
   /^ *module: / { module=$2 }
