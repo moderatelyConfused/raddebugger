@@ -35,11 +35,10 @@ mkdir -p "$S"
 RD_PID=${RD_PID:-}
 # a script which owns its scratch directory (lib.sh made it) removes it at exit; a caller's HARNESS_DIR is theirs.
 # zsh runs the EXIT trap in subshells too (the `( nohup ... & )` which starts an instance would remove the
-# directory under the instance), so the trap acts only in the shell which set it (its real pid; `$$` is the
-# main shell's in subshells as well).
-zmodload zsh/system 2>/dev/null
-HARNESS_OWNER_PID=${sysparams[pid]:-$$}
-remove_owned_harness_dir_at_exit() { [[ ${HARNESS_DIR_OWNED:-0} == 1 ]] && trap '[[ ${sysparams[pid]:-$$} == $HARNESS_OWNER_PID ]] && rm -rf "$S"' EXIT; return 0; }
+# directory under the instance), so the trap acts only in the main shell (`$ZSH_SUBSHELL` is 0 there).
+# An alias, not a function: in zsh an EXIT trap set inside a function runs when that function returns,
+# which removed the directory right away; the alias expands at the caller's top level.
+alias remove_owned_harness_dir_at_exit='[[ ${HARNESS_DIR_OWNED:-0} == 1 ]] && trap "[[ \$ZSH_SUBSHELL -eq 0 ]] && rm -rf \"\$S\"" EXIT; :'
 
 # -- the instance ----------------------------------------------------------------------------------
 # ipc <command...>: any `raddbg --ipc` command against the instance on $P; the reply (and errors) on stdout
