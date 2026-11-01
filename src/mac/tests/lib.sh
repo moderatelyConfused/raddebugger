@@ -124,7 +124,17 @@ bp_ids()       { echo "$1" | sed -n '/^ breakpoints:/,$p' | grep "   id:" | cut 
 # selects the next frame); echoes the state; WAIT_STOP_POLLS (default 80, 8 s) polls unless given
 wait_stop() { local before=${1:-0} depth_before=${2:-x}; for i in $(seq 1 ${3:-${WAIT_STOP_POLLS:-80}}); do st=$(ipc state); local sc=$(field "$st" stop_count); if [[ "$(field "$st" running)" == "0" && -n "$sc" ]]; then if [[ "$sc" -gt "$before" || "$(field "$st" inline_depth)" != "$depth_before" ]]; then echo "$st"; return 0; fi; fi; sleep 0.1; done; echo "$st"; return 1; }
 # go_cmd <command...>: run a command which makes the thread run and wait for the next stop; echoes the state
-go_cmd() { local st0=$(ipc state); local before=$(field "$st0" stop_count); before=${before:-0}; local depth_before=$(field "$st0" inline_depth); ipc "$@" >/dev/null; wait_stop $before ${depth_before:-x}; }
+# go_cmd <command...>: runs the command and waits for the stop it causes. A line step (step_over,
+# step_into, step_out) is sent with --prefer_disasm:0: the frontend turns steps into instruction steps
+# while a disassembly tab is selected (upstream's rule; a stop in code without source, in strlen or
+# in dyld's TLV thunk after a step into, selects one), and the flows mean line steps, as a user who
+# clicked back to the source tab gets them. step_over_inst / step_into_inst are the instruction steps.
+go_cmd() {
+  local st0=$(ipc state); local before=$(field "$st0" stop_count); before=${before:-0}; local depth_before=$(field "$st0" inline_depth)
+  local -a cmd; cmd=("$@")
+  case "$1" in (step_over|step_into|step_out) cmd[1]="$1 --prefer_disasm:0";; esac
+  ipc "${cmd[@]}" >/dev/null; wait_stop $before ${depth_before:-x}
+}
 run_stop() { go_cmd run; }
 # wait_exit: no process is left (the target ran to its end); echoes the state (15 s)
 wait_exit() { for i in $(seq 1 150); do st=$(ipc state); if [[ "$(field "$st" running)" == "0" && "$(process_count "$st")" == "0" ]]; then echo "$st"; return 0; fi; sleep 0.1; done; echo "$st"; return 1; }

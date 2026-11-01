@@ -270,22 +270,22 @@ scenario_stepping_O0() {
   st=$(go_cmd step_over); check_stop to_main_libsystem "$st" $D/basic.c main_libsystem
   st=$(go_cmd step_into); check_brace into_libsystem_call_brace "$st" $D/basic.c libsystem_call
   st=$(go_cmd step_over); check_stop into_libsystem_call "$st" $D/basic.c libsystem_call
+  # upstream's rule: the line's last call is entered even without line info, so a step into
+  # `len = strlen(s)` lands in strlen itself (its `__stubs` entry is resolved to the function it
+  # jumps to, as a Windows import call lands in the DLL's function), shown as disassembly, with
+  # the caller as frame 1. A step out returns into the middle of the line (the store of `len`
+  # follows the call), and one step over reaches the next line.
   st=$(go_cmd step_into)
-  if [[ "$(stop_file_line "$st")" != "$(tag_loc $D/basic.c libsystem_after)" ]]; then
-    note "step into on the strlen line landed in module '$(stop_module "$st")' symbol '$(stop_symbol "$st")' (stack: $(call_stack "$st" | tr '\n' ' ')); stepping out"
-    check into_strlen_frame1_is_caller "libsystem_call" "$(concrete_frames "$st" | sed -n 2p)"
-    st=$(go_cmd step_out)
-  fi
-  check_stop into_strlen_skipped "$st" $D/basic.c libsystem_after
+  note "step into on the strlen line landed in module '$(stop_module "$st")' symbol '$(stop_symbol "$st")' (stack: $(call_stack "$st" | tr '\n' ' '))"
+  check_match into_strlen_module '^libsystem' "$(stop_module "$st")"
+  check_match into_strlen_sym 'strlen' "$(stop_symbol "$st")"
+  check into_strlen_frame1_is_caller "libsystem_call" "$(concrete_frames "$st" | sed -n 2p)"
+  st=$(go_cmd step_out); check_stop out_of_strlen "$st" $D/basic.c libsystem_call
+  check out_of_strlen_sym "libsystem_call" "$(stop_symbol "$st")"
+  st=$(go_cmd step_over); check_stop after_strlen "$st" $D/basic.c libsystem_after
   check libsystem_len 11 "$(ev len)"
-  if [[ "$(stop_symbol "$st")" == "libsystem_call" ]]; then
-    st=$(go_cmd step_out); check_stop out_libsystem "$st" $D/basic.c main_libsystem
-    st=$(go_cmd step_over)
-  else
-    note "resynchronizing at main_locals with a breakpoint"
-    ipc clear_breakpoints >/dev/null; bp_tag $D/basic.c main_locals >/dev/null; st=$(run_stop)
-  fi
-  check_stop at_main_locals "$st" $D/basic.c main_locals
+  st=$(go_cmd step_out); check_stop out_libsystem "$st" $D/basic.c main_libsystem
+  st=$(go_cmd step_over); check_stop at_main_locals "$st" $D/basic.c main_locals
   # instruction steps: into the call (the line's first instruction is the `bl`: clang attributes the
   # argument setup to the previous line's row), then over an instruction inside the callee
   local sym=main; for i in $(seq 1 12); do st=$(go_cmd step_into_inst); sym=$(stop_symbol "$st"); [[ $sym == locals_frame ]] && break; done
@@ -996,13 +996,21 @@ scenario_F6_visit_qsort_O2() {
   note "F6: node at the first hit (main's inlined visit, not described by the DWARF): node='$(ev node)' msgs: $(ev_msgs node)"
   local sp0=$(ev sp) frame0=$(concrete_frames "$st" | head -1)
   ipc clear_breakpoints >/dev/null
+  # upstream's rule: the line's last call is entered even without line info, so the step into
+  # lands in libsystem's qsort_b (its stub resolved), with this visit activation as frame 1. A
+  # step out returns into the line (the return address; qsort_b tail calls qsort_r, whose
+  # callbacks recurse through this very return address with deeper stacks, see F6b), where the
+  # inlined tally follows the call; a step over then leaves the line
   st=$(go_cmd step_into)
   note "F6 step into stopped at $(stop_file_line "$st") sym=$(stop_symbol "$st") depth=$(field "$st" inline_depth) sp=$(ev sp) (sp before: $sp0) stack: $(call_stack "$st" | tr '\n' ' ')"
+  check F6_enters_qsort_b "qsort_b" "$(stop_symbol "$st")"
+  check F6_qsort_b_frame1_is_visit "visit" "$(concrete_frames "$st" | sed -n 2p)"
+  st=$(go_cmd step_out); check_stop F6_out_of_qsort_b "$st" $src visit_line
   check F6_same_recursion_level_sp "$sp0" "$(ev sp)"
-  # the root call visit(&root) is inlined into main at -O2, so the concrete frame is main's
   check F6_concrete_frame_unchanged "$frame0" "$(concrete_frames "$st" | head -1)"
-  check_stop F6_stops_in_inlined_tally "$st" $src tally_body
-  note "F6: node->value after the step into: '$(ev 'node->value')'"
+  note "F6: node->value after the step out: '$(ev 'node->value')'"
+  st=$(go_cmd step_over); check_stop F6_over_rest_of_line "$st" $src visit_after
+  check F6_tally_ran 6 "$(ev g_tally)"  # the two mid nodes' tally(2) through the callbacks, then the root's
   finish
 }
 
@@ -1026,11 +1034,16 @@ scenario_F6b_visit_qsort_recursion_O2() {
   check_stop F6b_recursive_hit_line "$st" $src visit_line
   local sp0=$(ev sp)
   ipc clear_breakpoints >/dev/null
+  # the step into enters qsort_b (see F6); the step out must come back to this activation of
+  # visit, not to the one qsort_b's callback recursion runs through the same code with
   st=$(go_cmd step_into)
   note "F6b step into stopped at $(stop_file_line "$st") sym=$(stop_symbol "$st") depth=$(field "$st" inline_depth) sp=$(ev sp) (sp before: $sp0) stack: $(call_stack "$st" | tr '\n' ' ')"
+  check F6b_enters_qsort_b "qsort_b" "$(stop_symbol "$st")"
+  check F6b_qsort_b_frame1_is_visit "visit" "$(concrete_frames "$st" | sed -n 2p)"
+  st=$(go_cmd step_out); check_stop F6b_out_of_qsort_b "$st" $src visit_line
   check F6b_same_recursion_level_sp "$sp0" "$(ev sp)"
   check F6b_concrete_frame_is_visit "visit" "$(concrete_frames "$st" | head -1)"
-  check_stop F6b_stops_in_inlined_tally "$st" $src tally_body
+  st=$(go_cmd step_over); check_stop F6b_over_rest_of_line "$st" $src visit_after
   ipc run >/dev/null; st=$(wait_exit); check F6b_exit_code 16 "$(field "$st" last_exit_code)"
   finish
 }

@@ -296,9 +296,10 @@ enum
   // NOTE: the following apply after the single step of a call or jump whose destination the trap
   // net could not know (indirect, or a tail call out of the function). see `d_ctrl_thread__run`.
   //
-  D_TrapFlag_EndSteppingIfLineInfo     = (1<<7), // end if the new pc has line info (or stays in the function the step began in); else the call went into code without line info: keep stepping, the line's traps catch the thread when it returns
-  D_TrapFlag_EndSteppingIfSameFunction = (1<<8), // end if the new pc lies in the function the step began in (jump table); else the jump left the function (tail call)
+  D_TrapFlag_EndSteppingIfSameFunction = (1<<7), // end if the new pc lies in the function the step began in (jump table); else the jump left the function (tail call)
+  D_TrapFlag_EndSteppingUnlessTLVThunk = (1<<8), // end, unless the call went into the thunk the module's thread-local accesses call (Mach-O: dyld's `_tlv_get_addr`, bound into its `__thread_vars` descriptors) - platform glue, which runs and returns into the line
   D_TrapFlag_TrapReturnAddress         = (1<<9), // when stepping does not end: trap at the return address (`lr`, or `[sp]` on x64), checked against the stack pointer the return restores, and keep stepping
+  D_TrapFlag_StackPointerCheckAtOrAbove = (1<<10), // the stack pointer check passes with sp at or above the checked value, not only equal to it: a step out's return address, which a deeper activation of the same function (recursion through a callback) returns to as well, with sp below
 };
 
 typedef struct D_Trap D_Trap;

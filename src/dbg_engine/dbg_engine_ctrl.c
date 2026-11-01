@@ -5227,6 +5227,43 @@ d_ctrl_thread__code_info_same_line(D_CtrlCodeInfo *a, D_CtrlCodeInfo *b)
   return result;
 }
 
+//- rjf: the thunk a module's thread-local accesses call: on Mach-O the `thunk` word of its
+// `__thread_vars` descriptors ({thunk, key, offset}; dyld binds it to its `_tlv_get_addr`, and
+// every `threadlocal` access is an indirect call of it). the module's RDI lists the image's
+// sections. 0 for a module without thread-locals, or whose RDI is not available yet.
+
+internal U64
+d_ctrl_thread__tlv_thunk_vaddr_from_vaddr(Access *access, D_Entity *process, U64 vaddr, U64 endt_us)
+{
+  U64 result = 0;
+  D_Entity *module = d_module_from_process_vaddr(process, vaddr);
+  if(module != &d_entity_nil)
+  {
+    RDI_Parsed *rdi = di_rdi_from_key(access, d_dbgi_key_from_module(module), 1, endt_us);
+    if(rdi != &rdi_parsed_nil)
+    {
+      U64 sections_count = 0;
+      RDI_BinarySection *sections = rdi_table_from_name(rdi, BinarySections, &sections_count);
+      for EachIndex(idx, sections_count)
+      {
+        U64 name_size = 0;
+        U8 *name = rdi_string_from_idx(rdi, sections[idx].name_string_idx, &name_size);
+        if(str8_ends_with(str8(name, name_size), str8_lit(",__thread_vars"), 0))
+        {
+          U64 descriptor_vaddr = d_vaddr_from_voff(module, sections[idx].voff_first);
+          U64 thunk = 0;
+          if(d_process_read(process->handle, r1u64(descriptor_vaddr, descriptor_vaddr+8), &thunk) == 8)
+          {
+            result = thunk;
+          }
+          break;
+        }
+      }
+    }
+  }
+  return result;
+}
+
 //- rjf: did a jump take the thread to another stack?
 //
 // a coroutine's context switch sets sp to a stack of its own; a frame growing within the
@@ -6333,7 +6370,9 @@ d_ctrl_thread__run(DMN_CtrlCtx *ctrl_ctx, D_Msg *msg)
       if(!hard_stop && use_stepping_logic && hit_trap_net_bp && dmn_handle_match(event->thread, d_dmn_from_handle(target_thread)))
       {
         U64 sp = d_sp_from_thread(target_thread);
-        stack_pointer_check_passes = ((hit_trap_flags & D_TrapFlag_IgnoreStackPointerCheck) || (sp == sp_check_value));
+        stack_pointer_check_passes = ((hit_trap_flags & D_TrapFlag_IgnoreStackPointerCheck) ||
+                                      (sp == sp_check_value) ||
+                                      ((hit_trap_flags & D_TrapFlag_StackPointerCheckAtOrAbove) && sp > sp_check_value));
       }
       
       //- rjf: trap net on on-target threads trigger trap net logic, *if* the stack pointer check passes.
@@ -6444,8 +6483,8 @@ d_ctrl_thread__run(DMN_CtrlCtx *ctrl_ctx, D_Msg *msg)
           use_trap_net_logic = 0;
         }
         else if(hit_trap_flags & (D_TrapFlag_EndSteppingUnlessStackChanged|
-                                  D_TrapFlag_EndSteppingIfLineInfo|
                                   D_TrapFlag_EndSteppingIfSameFunction|
+                                  D_TrapFlag_EndSteppingUnlessTLVThunk|
                                   D_TrapFlag_TrapReturnAddress)) LogInfoNamedBlockF("trap_net__end_step_conditional")
         {
           // NOTE: the trap's single step took a call or jump whose destination the trap net
@@ -6459,12 +6498,15 @@ d_ctrl_thread__run(DMN_CtrlCtx *ctrl_ctx, D_Msg *msg)
           //   that the line's traps stop the thread once it is switched back to.
           // - the stepped line itself (a jump table whose case lies on the line) continues
           //   the step: its traps catch the thread where it leaves the line.
-          // - code with line info (step into), or code of the function the step began in
-          //   (step over of a jump table) ends the step there.
-          // - otherwise the thread entered code the step does not stop in: a call into
-          //   code without line info returns into the line, whose traps catch it; a jump
-          //   out of the function (tail call) only comes back to the return address, so a
-          //   trap is placed there (D_TrapFlag_TrapReturnAddress). keep stepping.
+          // - code of the function the step began in (step over of a jump table) ends the
+          //   step there.
+          // - the thunk the module's thread-local accesses call (a step into of an indirect
+          //   call, on Mach-O) is platform glue: the call runs and returns into the line,
+          //   whose traps catch the thread. any other destination of an indirect call ends
+          //   the step, with or without line info, as a call's destination always does.
+          // - otherwise the thread entered code the step does not stop in: a jump out of
+          //   the function (tail call) only comes back to the return address, so a trap is
+          //   placed there (D_TrapFlag_TrapReturnAddress). keep stepping.
           //
           U64 pc_after = d_ip_from_thread(target_thread);
           U64 sp_after = d_sp_from_thread(target_thread);
@@ -6484,7 +6526,7 @@ d_ctrl_thread__run(DMN_CtrlCtx *ctrl_ctx, D_Msg *msg)
             // trap net already knew to leave the function (a tail call it steps over)
             B32 end = 1;
             B32 same_function = 0;
-            if(hit_trap_flags & (D_TrapFlag_EndSteppingIfLineInfo|D_TrapFlag_EndSteppingIfSameFunction))
+            if(hit_trap_flags & D_TrapFlag_EndSteppingIfSameFunction)
             {
               Access *access = access_open();
               U64 endt_us = now_time_us() + 100000;
@@ -6492,8 +6534,16 @@ d_ctrl_thread__run(DMN_CtrlCtx *ctrl_ctx, D_Msg *msg)
               D_CtrlCodeInfo src = d_ctrl_thread__code_info_from_vaddr(access, target_process_entity, step_start_ip, endt_us);
               same_function = d_ctrl_thread__code_info_same_function(&dst, &src);
               B32 same_line = d_ctrl_thread__code_info_same_line(&dst, &src);
-              end = ((same_function || ((hit_trap_flags & D_TrapFlag_EndSteppingIfLineInfo) && dst.has_line_info)) && !same_line);
-              log_infof("pc after: 0x%I64x (line info: %i; same function as 0x%I64x: %i, same line: %i) -> %s\n", pc_after, dst.has_line_info, step_start_ip, same_function, same_line, end ? "end" : "keep stepping");
+              end = (same_function && !same_line);
+              log_infof("pc after: 0x%I64x (same function as 0x%I64x: %i, same line: %i) -> %s\n", pc_after, step_start_ip, same_function, same_line, end ? "end" : "keep stepping");
+              access_close(access);
+            }
+            else if(hit_trap_flags & D_TrapFlag_EndSteppingUnlessTLVThunk)
+            {
+              Access *access = access_open();
+              U64 tlv_thunk_vaddr = d_ctrl_thread__tlv_thunk_vaddr_from_vaddr(access, target_process_entity, step_start_ip, now_time_us() + 100000);
+              end = (tlv_thunk_vaddr == 0 || pc_after != tlv_thunk_vaddr);
+              log_infof("pc after: 0x%I64x (the module's TLV thunk: 0x%I64x) -> %s\n", pc_after, tlv_thunk_vaddr, end ? "end" : "keep stepping");
               access_close(access);
             }
             else if(!(hit_trap_flags & D_TrapFlag_EndSteppingUnlessStackChanged))

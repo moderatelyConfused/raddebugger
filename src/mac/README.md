@@ -750,16 +750,23 @@ impact:
   their code. `D3`'s `write` breakpoint cannot hit on this macOS: `basic.c`'s
   `printf` reaches `write$NOCANCEL` (`__write_nocancel`), not `write`; the
   scenario needs a direct `write()` call, or `__write_nocancel` as the name.
-* **Step-into and code without line info: fixed** (2026-10-26, see "Stepping
-  into code without line info" under the flow suite's findings). A step into
-  no longer enters code without line info: an indirect call (`blr`; every Zig
-  `threadlocal` access calls dyld's TLV getter this way) is single-stepped
-  and ends the step only if the callee has line info, else the call runs and
-  returns into the line; a direct call to such code is skipped (as gdb and
-  lldb do; upstream enters the line's last one), after resolving a `__stubs`
-  / PLT entry to the function it jumps to (`strlen` is skipped, the weak
-  `twice<int>` behind a stub is entered); a tail call (`b` / `br` into
-  another function) is stepped over by a trap at the return address. Still
+* **Step-into and code without line info: upstream's rules** (2026-11-01, see
+  "Stepping into code without line info" under the flow suite's findings). A
+  step into follows upstream raddbg: a direct call to code without line info
+  is skipped unless it is the line's last call, which is entered (the step
+  lands in the function's disassembly, as on Windows); an indirect call is
+  entered wherever it lands; a tail call ends the step at its destination.
+  Two macOS indirections Windows has no counterpart for are treated as glue:
+  a `__stubs` / PLT entry is resolved to the function it jumps to (the trap
+  lands there, as a Windows import call lands in the DLL's function), and
+  dyld's TLV thunk (`_tlv_get_addr`, which every Zig `threadlocal` access
+  calls through `blr`) is run through, the call returning into the line. The
+  2026-10-26 round had replaced the rule with gdb/lldb's never-enter policy;
+  that is reverted. A step out of the concrete frame traps its return address
+  only, stack pointer checked (upstream also traps the scope's exits, which
+  for libsystem's tail-call chains `qsort_b -> qsort_r -> _qsort` ended the
+  step at each callee's entry, and its return trap ignored the stack pointer,
+  so recursion through a callback ended it in the wrong activation). Still
   open: step out of a signal handler, and a step over `longjmp`, run to the
   process' end (`signal_handler`, `longjmp`).
 * `step_out` from an inlined function: fixed (the trap net uses the inline
@@ -1071,8 +1078,9 @@ under `local/` and is *skipped*, naming the file and the in-tree path a reviewed
 belongs at (a run compared against nothing is not a pass; before this, a fresh checkout
 passed the three tests with whatever the debugger did that day). The in-tree records,
 checked against the sources' `/// N: at` annotations: `basic_stepping_test_step_regressions_0`
-main:49, 51, foo:33, 35, main:51, 55, 58 (the step into on the `printf` line skips the
-`_printf` stub, see "Stepping into code without line info" below), then the process
+main:49, 51, foo:33, 35, main:51, 55, 58 (the step into on the `printf` line enters
+`printf`, a stop outside the target binary, which the driver does not record and steps
+out of, onto 58; see "Stepping into code without line info" below), then the process
 exits; `_1` 49, 51, 55, 58; `step_into_for_goto` 18, 19, 21, 22, 20, 24 (clang attributes
 the loop's back-jump to the `}` on line 22). A stepping change that alters a sequence
 fails the test with a `diff` command in its output; update the in-tree file deliberately.
@@ -1184,17 +1192,17 @@ codes), plus `NOTE` lines for observations without a verdict.
 
 ### Results and findings (2026-10-25, this branch)
 
-Last full run on the merged tree (2026-10-26, after all of the day's rounds,
-the TLS fix and the test-infrastructure consolidation): 445 checks passed, 16
-failed, 54 scenario runs in 165 s. The 16 are the open items recorded below
-and in "Status and open issues": step out of a signal handler and step over
+Last full run (2026-11-01, after the return to upstream's step-into rules and
+the step-out change): 458 checks passed, 15 failed, 54 scenario runs in 156 s
+(2026-10-26, before: 445 / 16). The 15 are the open items recorded below and
+in "Status and open issues": step out of a signal handler and step over
 `longjmp` (4), the inline-sequence items `F1`/`F2`/`F4b` (7; the `F1` group
-varies between runs, see the "Run" paragraph), `threads_breakpoints`'s
-`thread_count_at_stop` (1, a timing assumption: workers that finished before
-the stop are not counted), `D3`'s `write` breakpoint (2: `printf` reaches
-`write$NOCANCEL`, and the unqualified name is ambiguous between dyld's and
-libsystem_kernel's `write`), and `D6`'s exec of a platform binary (2, an OS
-limit). Every failure below is a
+varies between runs, see the "Run" paragraph), `D3`'s `write` breakpoint (2:
+`printf` reaches `write$NOCANCEL`, and the unqualified name is ambiguous
+between dyld's and libsystem_kernel's `write`), and `D6`'s exec of a platform
+binary (2, an OS limit); `threads_breakpoints`'s `thread_count_at_stop` (a
+timing assumption: workers that finished before the stop are not counted)
+fails in some runs. Every failure below is a
 recorded bug or observation; scenarios fully passing include
 launch/kill/restart/exit, the breakpoint flows (line, inline line, dylib
 before load, address, condition, hit counts, toggle/remove, function name
@@ -1208,28 +1216,61 @@ on `macos-arm64-port` at the same time, and the merge kept that branch's
 implementation):
 
 * **Stepping into code without line info** (`stepping_O0`, `stepping_cpp`,
-  `U5`, the ReleaseFast generator). The step-into trap net
-  (`d_trap_net_from_thread__step_into_line`) never enters code without line
-  info anymore: a direct call to such code is not trapped (the line's traps
-  catch the thread when the call returns; upstream entered the line's last
-  such call, which here meant landing on a `__stubs` entry or in dyld, where
-  the UI switches to disassembly), after resolving a stub to the function it
-  jumps to (`d_stub_target_from_vaddr`: `adrp; ldr; br` / `jmp [rip+disp]`
-  and the pointer slot the loader bound), so `strlen` is skipped and the weak
-  `twice<int>` behind a stub is entered at its first line. An indirect call
-  (`blr`, `call rax`) gets `D_TrapFlag_EndSteppingIfLineInfo`: the control
-  thread single-steps it and ends the step only if the new pc has line info
-  (`d_ctrl_thread__code_info_from_vaddr`: module -> RDI -> unit line table),
-  else keeps stepping while the call runs and returns into the line. A tail
-  call (`b` into another function, `br` landing in one) is stepped over with
-  `D_TrapFlag_TrapReturnAddress`: after the single step, a trap at the return
-  address (`lr`; `[sp]` on x64), checked against the stack pointer the return
-  restores (`stepping_O2`'s `over_tail_call_returns_to_main`). A jump table
-  `br` whose case lies on the stepped line keeps stepping (the control thread
-  compares the unit's line at the new pc with the step's start). With the
-  ReleaseFast generator, 8 step-intos from `root.zig:84` now visit 86, 88, 95,
-  96, 99, 97 (the inlined contextSwitch), 102, 87 instead of 7 instructions of
-  `_tlv_get_addr`. The debug generator's 10 steps are unchanged.
+  `U5`, `F6`, the ReleaseFast generator). The step-into trap net
+  (`d_trap_net_from_thread__step_into_line`) follows upstream's rules: a
+  direct call to code without line info is not trapped unless it is the
+  line's last call (`last_call_point`), which is entered, the step ending in
+  the function's disassembly (`stepping_O0`'s `strlen`, `F6`'s `qsort_b`); an
+  indirect call (`blr`, `call rax`) is single-stepped and ends the step
+  wherever it lands; a tail call (`b` into another function) ends the step at
+  its destination. Two macOS indirections a Windows build has no counterpart
+  for are treated as platform glue, so that the experience matches Windows',
+  where an import call lands in the DLL's function and thread-locals are read
+  inline: a `__stubs` / PLT entry is resolved to the function it jumps to
+  (`d_stub_target_from_vaddr`: `adrp; ldr; br` / `jmp [rip+disp]` and the
+  pointer slot the loader bound) and the trap placed there (on the stub when
+  the slot cannot be read), so `strlen` is entered at its first instruction
+  and the weak `twice<int>` behind a stub at its first line; and an indirect
+  call whose single step lands in the module's TLV thunk
+  (`D_TrapFlag_EndSteppingUnlessTLVThunk`: the control thread compares the pc
+  with the `thunk` word of the module's `__thread_vars` descriptors, found
+  through the RDI's binary sections,
+  `d_ctrl_thread__tlv_thunk_vaddr_from_vaddr`) keeps stepping, the call
+  returning into the line, whose traps catch the thread (`U5`). The
+  2026-10-26 round had replaced upstream's rule with gdb/lldb's never-enter
+  policy (a direct call to such code skipped, an indirect one ended only with
+  line info, a tail call stepped over by a return-address trap); it is
+  reverted, so that the port steps as raddbg does on Windows rather than as
+  lldb does. A step over keeps its own rules, which do not depend on line
+  info: a tail call is stepped over with `D_TrapFlag_TrapReturnAddress` (a
+  trap at the return address, `lr` or `[sp]`, after the single step, checked
+  against the stack pointer the return restores; `stepping_O2`'s
+  `over_tail_call_returns_to_main`), a coroutine's context switch keeps
+  stepping until the thread is switched back
+  (`D_TrapFlag_EndSteppingUnlessStackChanged`, `F5d`), and a jump table `br`
+  whose case lies on the stepped line keeps stepping (the control thread
+  compares the unit's line at the new pc with the step's start). In a step
+  into both end at the destination, as upstream's do: with the ReleaseFast
+  generator, 12 step-intos from `root.zig:84` visit 86, 88, 95, 96, 99, 97
+  (the inlined contextSwitch), then follow the switch into the fiber:
+  `entryPoint` 127, 128, 129, `range` main.zig:2, 4, 4 > root.zig:50 (the
+  inlined yield); no stop lands in `_tlv_get_addr`. The flow harness sends
+  its line steps with `--prefer_disasm:0` (`go_cmd`, lib.sh): a stop in code
+  without source selects a disassembly tab, and the frontend turns steps
+  into instruction steps while one is selected (upstream's rule), where the
+  flows mean the line steps a user who clicked back to the source tab gets.
+* **Step out of the concrete frame traps its return address only, stack
+  pointer checked** (`F6`, `F6b`). Upstream's `step_out_scope` also traps the
+  function's scope exits (jump destinations outside it, and the end of its
+  code), which on macOS are libsystem's tail calls: a step out of `qsort_b`
+  ended at `qsort_r`'s entry, the next at `_qsort`'s, then `_isort`'s. Its
+  return-address trap carried `IgnoreStackPointerCheck`, so the recursion
+  through a callback (`visit` -> `qsort_b` -> block -> `visit`) returned to
+  the same address from a deeper activation first. The trap now carries
+  `D_TrapFlag_StackPointerCheckAtOrAbove`: it passes with sp at or above the
+  step's start (a return from this frame leaves it there, from the function's
+  entry exactly there), not below (a deeper activation's return). An inlined
+  frame's step out keeps its site's exits, which are its only way out.
 * **Step out from an inlined frame** steps out of the selected frame's
   function: the trap net's scope is the inline site at the selected depth, or
   the procedure's root scope, not the innermost lexical scope at pc (which
@@ -1512,13 +1553,15 @@ fixed since by the demon and unwinder work and are not repeated here):
 * `dylib_host_O0` ends with exit code 0 and without its final `printf` output
   under the debugger (natively: "host done 8", exit 8) after the second
   `dlclose` (`modules/exit_code`).
-* `U5_next_line` passes now that the step into skips the TLS getter. The
-  step over which stayed on the `t_tls_counter += 1` line after a step out of
-  the getter was an instruction step: the stop in the getter had focused a
+* `U5_next_line` passes now that the step into runs through the TLV thunk
+  (platform glue, see "Stepping into code without line info"). The step over
+  which stayed on the `t_tls_counter += 1` line after a step out of the
+  thunk was an instruction step: the stop in the thunk had focused a
   disassembly tab, and the frontend turns steps into instruction steps while
   one is focused (the UI log records `step_over` without a `step_over_line:`
-  trap net). A step over from the middle of a line otherwise reaches the
-  next line (`stepping_O0`'s step out / step over pairs).
+  trap net); the harness's line steps carry `--prefer_disasm:0` since. A step
+  over from the middle of a line otherwise reaches the next line
+  (`stepping_O0`'s step out / step over pairs).
 * Flaky: `eval signo` at the first line of a signal handler read 0 in some
   runs and 30 in others (`signal_handler/handler_signo`); not reproduced since
   (9 of 9 runs read 30). `on_sigusr1` is frameless (`DW_AT_frame_base
@@ -1534,10 +1577,10 @@ fixed since by the demon and unwinder work and are not repeated here):
   call line at depth 1), not at main's second call; identical on 20 runs.
   `F1b`: a step over `next`'s first line ends on the same line.
 * `F4b`: the breakpoint on `inl.h:3` first stops in the second inlined
-  instance (call site `inl_main.c:4`). (`F6`'s step into, which stopped in
-  `qsort_b` without line info, ends in the inlined `tally` of the same
-  activation now; `visit` is out of line in the debuggee since, so that the
-  recursion through the callback re-enters its code, `F6b`.)
+  instance (call site `inl_main.c:4`). (`F6`'s step into enters `qsort_b`, as
+  upstream's rule has it, and its step out returns to the same activation of
+  `visit`; `visit` is out of line in the debuggee, so that the recursion
+  through the callback re-enters its code, `F6b`.)
 
 ## Known gaps / follow-ups
 

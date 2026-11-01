@@ -12,7 +12,8 @@
 #   kill_test_instances            end the instance(s) on this harness' port
 # Settings: RADDBG, IPC_PORT, HARNESS_DIR (see lib.sh; the instance, the `state` readers, the waits and the
 # check reporting live there, this file adds the stepping front end).
-# Gotchas: once a disassembly tab is focused (a stop without source), steps become instruction steps.
+# Gotchas: once a disassembly tab is focused (a stop without source), steps become instruction steps;
+# `step "step_over --prefer_disasm:0"` keeps a line step (lib.sh's go_cmd, which the flows use, adds it).
 # fast IPC harness: no fixed sleeps, polls the debugger's stop counter instead.
 # usage: source h.sh; launch <project.raddbg>; bp <path:line>; go; step step_over 3; ...
 source "$(cd "$(dirname ${(%):-%x})" && pwd)/lib.sh"

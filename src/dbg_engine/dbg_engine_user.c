@@ -776,6 +776,17 @@ d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread, U64 inlin
   U64 ip_vaddr = line.ip_vaddr;
   Rng1U64 line_vaddr_rng = line.vaddr_rng;
 
+  // rjf: the line's last call (upstream's rule: a call to code without line info is not
+  // entered, unless it is the line's last one - then the step lands in it, in disassembly)
+  DASM_CtrlFlowPoint *last_call_point = 0;
+  if(line.good_machine_code) for(DASM_CtrlFlowPointNode *n = line.ctrl_flow_info.exit_points.first; n != 0; n = n->next)
+  {
+    if(n->v.inst_flags & DASM_InstFlag_Call)
+    {
+      last_call_point = &n->v;
+    }
+  }
+
   // rjf: push traps for all exit points
   if(line.good_machine_code) for(DASM_CtrlFlowPointNode *n = line.ctrl_flow_info.exit_points.first; n != 0; n = n->next)
   {
@@ -787,10 +798,11 @@ d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread, U64 inlin
     B32 jump_dest_has_line_info = 0;
     B32 jump_leaves_function = 0;
 
-    // rjf: known destination out of this line => does it lie in another function (a tail
-    // call)? for calls and unconditional jumps, resolve a stub there (a call to another
-    // image, or to a weak symbol, goes through `__stubs` / the PLT, which has no line
-    // info; the function it jumps to may), and look up whether it has line info
+    // rjf: known destination out of this line => look up whether it has line info, and
+    // whether it lies in another function (a tail call). a call to a function of another
+    // image, or to a weak symbol, goes through a stub (`__stubs`, the PLT) without line
+    // info: the trap goes where the stub jumps to, as a Windows import call lands in the
+    // DLL's function (on the stub itself when its pointer slot cannot be read)
     if(jump_dest_vaddr != 0 &&
        point->inst_flags & (DASM_InstFlag_Call|DASM_InstFlag_Branch|DASM_InstFlag_UnconditionalJump) &&
        !contains_1u64(line_vaddr_rng, jump_dest_vaddr))
@@ -812,11 +824,10 @@ d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread, U64 inlin
       jump_leaves_function = !d_vaddrs_in_same_function(process, ip_vaddr, jump_dest_vaddr);
     }
 
-    // rjf: direct call into code without line info => not stepped into (as gdb and lldb
-    // do): the line's traps catch the thread when the call returns, as for any call the
-    // step does not enter. (upstream enters the line's last such call; here that meant
-    // landing on a `__stubs` entry or in dyld, where the UI switches to disassembly.)
-    if(point->inst_flags & DASM_InstFlag_Call &&
+    // rjf: if this is not the last call instruction in the control flow,
+    // and if we have no line info for this address, then do not add.
+    if(point != last_call_point &&
+       point->inst_flags & DASM_InstFlag_Call &&
        jump_dest_vaddr != 0 &&
        !jump_dest_has_line_info)
     {
@@ -856,42 +867,22 @@ d_trap_net_from_thread__step_into_line(Arena *arena, D_Entity *thread, U64 inlin
         // rjf: a jump within the function stays in the stepped frame: check the stack
         // pointer there (a deeper activation of a recursive function, running through the
         // destination before this one gets there, must not end the step; a call's
-        // destination is another frame)
+        // destination, or a tail call's, is another frame)
         if(!(point->inst_flags & DASM_InstFlag_Call) && !jump_leaves_function)
         {
           flags &= ~D_TrapFlag_IgnoreStackPointerCheck;
         }
-
-        // rjf: tail call (jump into another function) into code without line info =>
-        // not stepped into either; the function making it is gone, so the thread can
-        // only be caught at the return address: single-step the jump (the return
-        // address is known then), trap there and keep stepping
-        if(point->inst_flags & DASM_InstFlag_UnconditionalJump && jump_leaves_function && !jump_dest_has_line_info)
-        {
-          trap_addr = point->vaddr;
-          flags &= ~D_TrapFlag_EndStepping;
-          flags |= (D_TrapFlag_SingleStepAfterHit|D_TrapFlag_TrapReturnAddress);
-        }
       }
 
-      // rjf: indirect call (`blr`, `call rax`) -> the destination is known after the
-      // single step: end there if it has line info, else let the call run and return
-      // into the line (Zig's threadlocal accesses call dyld's TLV getter this way)
+      // rjf: indirect call (`blr`, `call rax`) => entered wherever it lands, like any call
+      // - except the thunk every thread-local access calls on Mach-O (dyld's
+      // `_tlv_get_addr`, bound into the module's `__thread_vars` descriptors; a Windows
+      // build reads thread-locals inline): that is platform glue, not a function to step
+      // into, so the call runs and returns into the line, whose traps catch the thread
       else if(point->inst_flags & DASM_InstFlag_Call)
       {
         flags &= ~D_TrapFlag_EndStepping;
-        flags |= D_TrapFlag_EndSteppingIfLineInfo;
-      }
-
-      // rjf: indirect jump (not a return) -> after the single step: a coroutine's context
-      // switch jumps to another stack, and the line continues when it is switched back
-      // to (see D_TrapFlag_EndSteppingUnlessStackChanged); a jump table stays in the
-      // function, and an indirect tail call lands in another function, which is stepped
-      // into if it has line info, and run to its return otherwise
-      else if(!(point->inst_flags & DASM_InstFlag_Return))
-      {
-        flags &= ~D_TrapFlag_EndStepping;
-        flags |= (D_TrapFlag_EndSteppingUnlessStackChanged|D_TrapFlag_EndSteppingIfLineInfo|D_TrapFlag_TrapReturnAddress);
+        flags |= D_TrapFlag_EndSteppingUnlessTLVThunk;
       }
     }
 
@@ -1028,13 +1019,18 @@ d_trap_net_from_thread__step_out_scope(Arena *arena, D_Entity *thread, U64 inlin
     // rjf: ip => the stepped function's scope => list(voff_range)
     //
     // the function stepped out of is the selected frame's: the inline site at the
-    // selected depth (1 = outermost) among the sites enclosing ip, or the procedure's
-    // root scope (depth 0, as for a thread outside inlined code). a step out from an
-    // inlined function ends where its site's code is left; from the concrete function,
-    // where the function returns. (the innermost scope at ip, the lexical block the
-    // thread is in, would make a step out leave the block.)
+    // selected depth (1 = outermost) among the sites enclosing ip, or the concrete
+    // function (depth 0, as for a thread outside inlined code). an inlined function has
+    // no return: a step out from it ends where its site's code is left, so its site's
+    // exits are trapped. the concrete function returns to the return address, which the
+    // unwind gives (below); its root scope's exits are not trapped: they are its tail
+    // calls (`b other_function`, which libsystem's `qsort_b -> qsort_r -> _qsort` chains
+    // are made of; a step out ending at the callee's entry is no step out) and the end
+    // of its code. (the innermost scope at ip, the lexical block the thread is in, would
+    // make a step out leave the block.)
     //
     Rng1U64List scope_voff_rngs = {0};
+    if(inline_depth != 0)
     {
       U64 ip_voff = d_voff_from_vaddr(module, ip_vaddr);
       RDI_Parsed *rdi = di_rdi_from_key(access, dbgi_key, 1, 0);
@@ -1043,7 +1039,6 @@ d_trap_net_from_thread__step_out_scope(Arena *arena, D_Entity *thread, U64 inlin
         RDI_Scope *nil_scope = rdi_element_from_name_idx(rdi, Scopes, 0);
         RDI_Scope *inline_scopes[64] = {0};
         U64 inline_scope_count = 0;
-        RDI_Scope *root_scope = nil_scope;
         for(RDI_Scope *s = rdi_scope_from_voff(rdi, ip_voff); s != nil_scope; s = rdi_element_from_name_idx(rdi, Scopes, s->parent_scope_idx))
         {
           if(s->inline_site_idx != 0 && inline_scope_count < ArrayCount(inline_scopes))
@@ -1051,22 +1046,27 @@ d_trap_net_from_thread__step_out_scope(Arena *arena, D_Entity *thread, U64 inlin
             inline_scopes[inline_scope_count] = s;
             inline_scope_count += 1;
           }
-          root_scope = s;
         }
         U64 depth = Min(inline_depth, inline_scope_count);
-        RDI_Scope *scope = (depth == 0) ? root_scope : inline_scopes[inline_scope_count - depth];
         log_infof("step_out_scope: inline depth %I64u of %I64u\n", depth, inline_scope_count);
-        U64 all_scope_voffs_count = 0;
-        U64 *all_scope_voffs = rdi_table_from_name(rdi, ScopeVOffData, &all_scope_voffs_count);
-        for(U64 voff_idx = scope->voff_range_first; voff_idx+1 < scope->voff_range_opl; voff_idx += 1)
+        if(depth != 0)
         {
-          Rng1U64 voff_range = r1u64(all_scope_voffs[voff_idx], all_scope_voffs[voff_idx+1]);
-          rng1u64_list_push(scratch.arena, &scope_voff_rngs, voff_range);
+          RDI_Scope *scope = inline_scopes[inline_scope_count - depth];
+          U64 all_scope_voffs_count = 0;
+          U64 *all_scope_voffs = rdi_table_from_name(rdi, ScopeVOffData, &all_scope_voffs_count);
+          for(U64 voff_idx = scope->voff_range_first; voff_idx+1 < scope->voff_range_opl; voff_idx += 1)
+          {
+            Rng1U64 voff_range = r1u64(all_scope_voffs[voff_idx], all_scope_voffs[voff_idx+1]);
+            rng1u64_list_push(scratch.arena, &scope_voff_rngs, voff_range);
+          }
         }
       }
     }
-
-
+    else
+    {
+      log_infof("step_out_scope: concrete frame\n");
+    }
+    
     // rjf: place traps at all possible exit points of all scope's ranges
     result.good_read = 1;
     for EachNode(n, Rng1U64Node, scope_voff_rngs.first)
@@ -1127,11 +1127,17 @@ d_trap_net_from_thread__step_out_scope(Arena *arena, D_Entity *thread, U64 inlin
     }
     
     // rjf: use first unwind frame to generate trap
+    //
+    // the return address is checked against the stack pointer: a deeper activation of the
+    // same function returns to it as well (`visit` recursing through `qsort_b`'s callback
+    // returns to `visit`'s line 21 at every level), with its stack pointer below this
+    // frame's; the frame stepped out of returns with it at or above the step's start (at
+    // it, from the function's entry)
     if(result.good_read && callstack.concrete_frames_count > 1)
     {
       ARCH_Info *arch_info = arch_info_from_arch(thread->arch);
       U64 vaddr = arch_ip_from_reg_block(arch_info, callstack.concrete_frames[1]->regs);
-      D_Trap trap = {D_TrapFlag_EndStepping|D_TrapFlag_IgnoreStackPointerCheck, vaddr};
+      D_Trap trap = {D_TrapFlag_EndStepping|D_TrapFlag_StackPointerCheckAtOrAbove, vaddr};
       d_trap_list_push(arena, &result.traps, &trap);
     }
     else
